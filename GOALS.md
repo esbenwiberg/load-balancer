@@ -1,5 +1,16 @@
 # Goals backlog — the holistic plan
 
+## The endgame (north star)
+
+One endpoint any coding agent can `/connect` to — Claude Code, Codex, generic
+OpenAI clients — hosted in **Azure**, fronting **Foundry** plus a fleet of
+workbenches (mock ones first: mockd, or haiku-backed via cli-auth; real Sparks
+later). A **dashboard** on the balancer shows where every prompt was routed and
+why, which workbenches are subscribed with which models, and their live load.
+The same stack runs **locally in one command** — gateway in dev mode + mock
+workbenches + mock Foundry — so the agents building it can self-validate every
+change without real infra. That local stack *is* the harness: goals 10, 3, 12.
+
 Pick one and run it with the built-in **`/goal`** command. Each goal below has a
 **completion condition** written to paste straight in:
 
@@ -25,9 +36,11 @@ document reversible calls, when to stop) is defined once in
   standing assumption behind auto-merge (CLAUDE.md). Revisit when it changes.
 
 **Current focus (2026-07):** we are **not** taking in Spark workbenches yet.
-Priority is (a) completing the idea — control plane, observability — and
-(b) hardening the harness + test setup. Recommended order:
-1 → 2 → 6 → 7 → 8 → 3 → 9 → 4 → 5. Anything Spark-infra-shaped is parked.
+Priority is (a) completing the idea — control plane, observability, dashboard —
+and (b) hardening the harness + test setup. Recommended order:
+harness core (1 → 2 → 6 → 7 → 8 → 9) → dev stack (10) → observability +
+wallet guards (3 → 11) → dashboard v1 (12) → Ollama (4) → control plane (5) →
+dashboard v2 (13) → Azure IaC (14). Anything Spark-infra-shaped is parked.
 
 Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 [`docs/06`](docs/06-recommendation.md) (decision), [`docs/03`](docs/03-open-questions-and-risks.md) (risks).
@@ -129,6 +142,62 @@ interleaved SSE chunks) would be catastrophic and is currently invisible.
 an e2e test fires concurrent streaming requests across different model aliases with a fault injected on one of them, asserts every response carries the correct served_model stamp and terminates its stream cleanly, e2e/run.sh is green, and it's merged to main
 ```
 
+### 10. Dev-mode stack — the self-validation fleet — risk: low
+**Why:** the endgame's harness. Agents building features must be able to spin
+up the full topology locally — gateway + **two separate mock workbench
+containers** + a **mock-Foundry container** — leave it running, and point a
+real client at it. Today the e2e compose runs ONE mockd serving every alias:
+you can't tell instances apart, exercise per-instance load/faults, or use it
+as a standing dev fixture.
+**Completion condition:**
+```
+a documented dev profile brings up the gateway plus two distinct mock workbench containers and a mock-foundry container (each stamping its own instance identity in served_model), stays up until explicitly torn down, a smoke script proves all three client surfaces (anthropic messages, chat completions, responses) route through it, the README documents how to point Claude Code and Codex at it (base url + key), e2e/run.sh is still green, and it's merged to main
+```
+*Note: keep a documented variant where a workbench slot is backed by real
+haiku via the existing cli-auth borrow (e2e/borrow_creds.sh) — variant, not
+default: default stays keyless and offline.*
+
+### 11. Budgets + rate limits per virtual key — vacation-proof the wallet — risk: low
+**Why:** unattended goal runs + (eventually) a hosted endpoint = runaway-spend
+risk, and the whole point is burning *subscription*, not invoice. LiteLLM
+supports `max_budget` / tpm / rpm per key; nothing configures or tests it.
+**Completion condition:**
+```
+every virtual key the gateway issues gets a default budget and rate limit from config, an e2e test proves an over-budget key and an over-limit key are refused with a clean 4xx (no hang, no 5xx), the knobs and how to raise them are documented, e2e/run.sh is green, and it's merged to main
+```
+
+### 12. Routing dashboard v1 — "where did my prompt go?" — risk: medium
+**Why:** the endgame's visible face: per-request {alias asked, backend served,
+fallback hit?, latency, tokens} you can actually look at. Build-vs-reuse is a
+real fork (LiteLLM ships an admin UI; a thin read-only page over goal-3 data
+may serve better) — it's *reversible*, so decide and document per CLAUDE.md.
+**Depends on:** goal 3 (the data), goal 10 (the stack to demo it on).
+**Completion condition:**
+```
+with the dev stack up, a dashboard (LiteLLM's UI configured, or a small read-only page) shows per-request routing records for prompts just sent through the gateway, an e2e assertion covers the data endpoint feeding it, the build-vs-reuse choice is documented with reasons, e2e/run.sh is green, and it's merged to main
+```
+
+### 13. Fleet dashboard v2 — who's subscribed, with what, under what load — risk: medium
+**Why:** the other half of the vision: which workbenches are registered, which
+models they carry, warm/healthy/in-flight right now. Reads from the
+control-plane skeleton — the *display* is autonomy-friendly even though the
+routing policy behind it isn't.
+**Depends on:** goal 5 (registry), goal 12 (dashboard shell).
+**Completion condition:**
+```
+the dashboard shows the control-plane registry live for the dev stack (per-workbench models, health, in-flight/load), an assertion covers the registry-to-dashboard data path, e2e/run.sh is green, and it's merged to main
+```
+
+### 14. Azure IaC skeleton — code only, no deploy — risk: medium
+**Why:** the balancer must end up Azure-hosted, but a real deploy needs creds
+and a network-exposure decision (§ Needs-a-human). The IaC itself is just
+code: author it, validate it offline, and pin local↔cloud parity so the dev
+stack stays a faithful miniature.
+**Completion condition:**
+```
+IaC (bicep or terraform — decide and document) describes the gateway container, its persistent store, key-vault wiring for secrets, and networking parameters; it validates in CI with offline tooling only (bicep build / terraform validate, no cloud calls); a parity doc maps every dev-stack component to its Azure counterpart; e2e/run.sh is green; and it's merged to main
+```
+
 ---
 
 ## § Needs-a-human (do NOT run unattended)
@@ -147,6 +216,19 @@ decision is made.
   the whole router. Decide with a human, *then* the implementation becomes an
   autonomy-friendly goal.
 - **LiteLLM-only vs `archgw` evaluation** — architecture fork; research + a call.
+- **First Azure deploy + exposure model** (after goal 14) — subscription/resource
+  choices, private endpoint vs public + IP allowlist, TLS, dashboard auth, who
+  gets keys and how they rotate. A hosted OpenAI-compatible proxy with Foundry
+  creds behind it is a *target*; a leaked master key is someone else's free LLM.
+  Creds + security + outward-facing. **Decide the release model first ⤵**
+- **Release model BEFORE anything deploys from `main`** — the moment the
+  balancer deploys from `main`, CLAUDE.md's tripwire kills auto-merge and
+  vacation autonomy with it. Decide *in advance*: manual promotion, a release
+  branch, or tagged deploys — so unattended runs keep merging to `main` while
+  deploys stay a deliberate human act.
+- **Real-Foundry traffic through the hosted balancer** — extends the DISCO item
+  above: vacation prompts routed to Foundry are real data through a real model
+  path. Governance sign-off gates the endgame, not just Phase 0.
 - **Verify prompt-caching on the Azure/Anthropic route** ([docs/03 risk 5](docs/03-open-questions-and-risks.md))
   — needs real Foundry creds. Infra.
 
