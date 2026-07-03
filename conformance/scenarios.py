@@ -78,20 +78,38 @@ TOOLS = [
 
 TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
 
+# Same tools in the OpenAI *Responses* API shape (name/parameters flattened to
+# the top level, not nested under "function"). Used when driving /v1/responses
+# — the endpoint Codex speaks and the one that exercises LiteLLM's
+# Responses->ChatCompletions bridge (Blocker A).
+RESPONSES_TOOLS = [
+    {
+        "type": "function",
+        "name": t["function"]["name"],
+        "description": t["function"]["description"],
+        "parameters": t["function"]["parameters"],
+    }
+    for t in TOOLS
+]
+
 
 # --- Virtual workspace ------------------------------------------------------
 # Stateful so tool results depend on what the model actually did — a model that
 # runs the tests before editing gets a failing result, exactly like real life.
 
 CONFIG_PATH = "app/config.py"
+MAIN_PATH = "app/main.py"
 INITIAL_CONFIG = "PORT = 8000\nDEBUG = True\nWORKERS = 4\n"
+INITIAL_MAIN = "from app.config import PORT\n\ndef main():\n    serve(port=PORT)\n"
 
 
 @dataclass
 class VirtualEnv:
     """A tiny mutable filesystem + fake test runner the tools act on."""
 
-    files: dict = field(default_factory=lambda: {CONFIG_PATH: INITIAL_CONFIG})
+    files: dict = field(
+        default_factory=lambda: {CONFIG_PATH: INITIAL_CONFIG, MAIN_PATH: INITIAL_MAIN}
+    )
 
     def read_file(self, path: str) -> str:
         if path not in self.files:
@@ -146,6 +164,18 @@ TASK_PROMPT = (
     "value from 8000 to 9000. Then run the test suite with `pytest -q` and tell me "
     "whether it passes. Do not modify anything else."
 )
+
+# Single-turn probe: invites the model to emit MULTIPLE tool calls in ONE turn.
+# Parallel tool calls are a known translation hazard (doc 04) and the LiteLLM
+# Responses bridge specifically had a parallel-call index-collision bug (#21331).
+PARALLEL_PROBE_PROMPT = (
+    "Before doing anything else, read BOTH app/config.py and app/main.py so you "
+    "have full context. Issue both reads now, together, in a single step."
+)
+
+# Single-turn probe: forces a tool call. Qwen3 + reasoning + tool_choice:required
+# is a known HTTP-400 in vLLM (doc 04) — this smokes it out.
+TOOL_CHOICE_PROBE_PROMPT = "Read app/config.py."
 
 
 @dataclass

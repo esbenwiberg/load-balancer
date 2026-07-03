@@ -29,20 +29,51 @@ on when it drifts.
 
 Grading is split: **tool-call mechanics** (the error rate above) vs **task
 progress** (did it actually read → correctly edit 8000→9000 → run tests → report).
-`agent_capable` requires both: a low error rate *and* the model can finish.
+`agent_capable` requires both: a low error rate *and* the model can finish *and*
+no probe defect (below).
+
+### Two single-turn probes (on by default; `--no-probes` to skip)
+
+- **parallel** — invites two tool calls in one turn. A model that reads serially
+  is fine (not a defect), but if it *does* parallelize, the calls must survive
+  with distinct ids + valid known names. Catches the LiteLLM Responses-bridge
+  **index-collision bug (#21331)** that collapses parallel calls.
+- **tool_choice:required** — forces a tool call. Catches the **Qwen3 + reasoning
+  + `tool_choice:"required"` HTTP-400** (doc 04) and models that ignore `required`.
+
+A probe defect forces `agent_capable=false`.
+
+### Recovery
+
+When a tool call returns an `error:` result, the harness tracks whether the model
+recovers and still finishes (`recoveries` in the summary). A backend that can't
+recover from a bad edit is fragile in real agent use.
 
 ## Install & run
 
 ```bash
 pip install -r requirements.txt
 
-# Point at a Spark's vLLM endpoint (OpenAI-compatible), or at LiteLLM in front.
+# Chat Completions, straight at a Spark's vLLM endpoint (the Claude Code path):
 python conformance.py \
   --base-url http://spark-a.internal:8000/v1 \
   --model Qwen/Qwen3-Coder-30B-A3B-Instruct \
   --runs 5 \
   --json-out report.json
+
+# Responses API THROUGH LiteLLM — validates the Codex→Spark bridge end-to-end
+# (Blocker A). Point at the LiteLLM proxy, not vLLM directly:
+python conformance.py \
+  --base-url http://litellm.internal:4000/v1 \
+  --api responses \
+  --model qwen3-coder \
+  --api-key "$LITELLM_VIRTUAL_KEY" \
+  --runs 5
 ```
+
+`--api chat` (default) speaks Chat Completions; `--api responses` speaks the
+OpenAI Responses API — the endpoint Codex uses and the one that exercises
+LiteLLM's Responses→ChatCompletions bridge.
 
 Exit code is `0` if `agent_capable`, `1` otherwise — wire it into CI / a cron so
 the flag is *continuously* measured, not earned once.

@@ -25,8 +25,9 @@ Fill these in before you start; they're the values `.env` needs:
 - [ ] **Azure AI Foundry:** resource name, the `/anthropic` base URL, the Claude
       **deployment names**, and how creds are provided (API key vs Entra ID).
 - [ ] **Azure OpenAI (GPT):** resource base URL, deployment name, `api-version`, key.
-- [ ] **Scope:** Claude Code only, or Codex too? (Codex→Spark carries the Blocker-A
-      caveat below; Codex→Foundry-OpenAI is unaffected.)
+- [x] **Scope:** Codex IS in scope for Phase 0 (decided 2026-07-03). This commits us to a
+      vetted **1.83.x-stable** LiteLLM (for the Responses→Chat bridge) and makes the
+      Codex→Spark smoke test a release gate — see the Blocker-A caveat below.
 - [ ] **Data governance:** confirmed with DISCO that Foundry usage is OK for the
       intended work (Context& / Delegate / Projectum / Consit; **no personal or
       customer data**). Sparks are local/private; Foundry is Azure — verify
@@ -118,9 +119,22 @@ wire_api = "responses"          # Codex dropped "chat"; MUST be responses
 `/v1/responses` → Chat-Completions bridge (enabled by `use_chat_completions_api`
 in the config) supports streaming + tool calls *per source*, but the feature is
 young and has a bug history. Confirmed on paper, **not** by an observed round
-trip. Before relying on it, smoke-test: streaming, parallel tool calls, and mixed
-text+tool-call output against the actual vLLM model. Codex→Foundry-OpenAI (`gpt`)
-is unaffected and works today.
+trip. Smoke-test it with the conformance harness pointed at LiteLLM's Responses
+endpoint (this is the Codex path — streaming + parallel-tool + tool_choice probes
+all run):
+
+```bash
+cd ../conformance && pip install -r requirements.txt
+python conformance.py \
+  --base-url http://localhost:4000/v1 \
+  --api responses \
+  --model qwen3-coder \
+  --api-key "$LITELLM_VIRTUAL_KEY" \
+  --runs 5
+```
+
+Green here = the Responses→ChatCompletions bridge (Blocker A) holds for this
+model end-to-end. Codex→Foundry-OpenAI (`gpt`) is unaffected and works today.
 
 ## 6. Earn `agent_capable` for the Spark model
 

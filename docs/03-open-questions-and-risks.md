@@ -60,7 +60,11 @@ backend (incl. streaming + tool calls)? If not, Codex→Spark may be off the tab
 > fixed; `developer`-role #24664; a `file_search` flag-drop P1 on #24783). **All evidence is
 > source/doc reading, not an observed Codex↔vLLM round-trip** → smoke-test streaming +
 > parallel tools + mixed text/tool output before committing Codex→Spark. Codex→Foundry-OpenAI
-> is unaffected. The conformance harness (`conformance/`) is the tool to run that smoke test.
+> is unaffected. The conformance harness (`conformance/`) can now run that smoke test directly:
+> `conformance.py --api responses --base-url <litellm>/v1` drives LiteLLM's `/v1/responses`
+> endpoint through the bridge, with parallel-tool and `tool_choice:required` probes for the
+> exact bug classes above (#21331, the Qwen3 400). **Decision: Codex IS in scope for Phase 0**
+> (2026-07-03), so this smoke test is a release gate, not optional.
 
 ### 5. Anthropic models on Azure AI Foundry — wire format
 We assume Foundry serves Anthropic models. Need to confirm the exact API surface and that

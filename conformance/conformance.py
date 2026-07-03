@@ -3,22 +3,22 @@
 Tool-calling conformance harness — the gate that earns `agent_capable`.
 
 Drives a model through a real multi-tool coding task (Read -> Edit -> Bash)
-UNDER STREAMING against any OpenAI-compatible base_url (a vLLM Spark today, or
-LiteLLM in front of it), and measures how reliably it emits *clean, structured*
-tool calls. Emits pass/fail + a tool-call-error-rate.
+UNDER STREAMING and measures how reliably it emits *clean, structured* tool
+calls. Emits pass/fail + a tool-call-error-rate.
+
+Two transports:
+  --api chat       OpenAI Chat Completions (vLLM Spark direct, or LiteLLM).
+  --api responses  OpenAI Responses API — the endpoint Codex speaks. Point this
+                   at LiteLLM to exercise the Responses->ChatCompletions bridge
+                   end-to-end (Blocker A / docs/03 risk 4).
+
+Plus two single-turn probes for known failure modes:
+  * parallel tool calls (LiteLLM bridge index-collision bug #21331, doc 04)
+  * tool_choice:"required" (Qwen3 + reasoning HTTP-400, doc 04)
 
 Why this exists: see docs/04-tool-calling.md. A model can chat fine and still be
 useless as a coding-agent backend because its tool calls leak into plain text,
-carry malformed JSON, name tools that don't exist, or run away (`!!!!`). Those
-are the failure modes this harness hunts for. The output sets `agent_capable`
-in the control-plane registry; the running error-rate is the OpenRouter-style
-"tool call error rate" you deprioritize a backend on when it drifts.
-
-Usage:
-    python conformance.py \
-        --base-url http://spark-a.internal:8000/v1 \
-        --model Qwen/Qwen3-Coder-30B-A3B-Instruct \
-        --runs 5
+carry malformed JSON, name tools that don't exist, or run away (`!!!!`).
 
 Nothing here writes to disk or shells out — the "filesystem" and "bash" are a
 virtual workspace (scenarios.py). Only the model endpoint is live.
@@ -34,8 +34,11 @@ import sys
 from dataclasses import asdict, dataclass, field
 
 from scenarios import (
+    PARALLEL_PROBE_PROMPT,
+    RESPONSES_TOOLS,
     SYSTEM_PROMPT,
     TASK_PROMPT,
+    TOOL_CHOICE_PROBE_PROMPT,
     TOOL_NAMES,
     TOOLS,
     Grade,
@@ -88,13 +91,9 @@ def detect_runaway(content: str, cap: int = 20000) -> str | None:
     """Detect degenerate generation (e.g. the Qwen `!!!!!!` infinite stream)."""
     if not content:
         return None
-    # A single character repeated many times in a row.
     m = re.search(r"(.)\1{40,}", content)
     if m:
-        ch = m.group(1)
-        display = repr(ch)
-        return f"runaway repetition of {display}"
-    # Pathologically long output with almost no character diversity.
+        return f"runaway repetition of {m.group(1)!r}"
     if len(content) > cap and len(set(content)) < 12:
         return "runaway low-entropy generation"
     return None
@@ -117,112 +116,214 @@ class AssistantTurn:
     finish_reason: str | None
 
 
-def _call_streaming(client, model, messages, temperature) -> AssistantTurn:
-    """Reassemble a streamed chat completion into one AssistantTurn.
+# --- Transports -------------------------------------------------------------
+# A transport owns the conversation state in its native wire format and knows
+# how to (a) fetch the next assistant turn (normalized to AssistantTurn) and
+# (b) append tool results. The run loop is protocol-agnostic.
 
-    Streaming is the point of the test: several open vLLM bugs (hermes parser,
-    qwen3_coder) only manifest under streaming, which is how coding agents run.
+
+class ChatTransport:
+    """OpenAI Chat Completions. What vLLM speaks; LiteLLM exposes it too."""
+
+    name = "chat"
+
+    def __init__(self, client, model):
+        self.client = client
+        self.model = model
+        self.messages: list = []
+
+    def reset(self, system: str, user: str) -> None:
+        self.messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+    def get_turn(self, stream, temperature, tool_choice="auto") -> AssistantTurn:
+        if stream:
+            turn = self._stream(temperature, tool_choice)
+        else:
+            turn = self._block(temperature, tool_choice)
+        return turn
+
+    def record_assistant(self, turn: AssistantTurn) -> None:
+        self.messages.append(
+            {
+                "role": "assistant",
+                "content": turn.content or None,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.name, "arguments": tc.arguments_raw},
+                    }
+                    for tc in turn.tool_calls
+                ]
+                or None,
+            }
+        )
+
+    def record_tool_result(self, call_id, name, content) -> None:
+        self.messages.append({"role": "tool", "tool_call_id": call_id, "content": content})
+
+    def _stream(self, temperature, tool_choice) -> AssistantTurn:
+        stream = self.client.chat.completions.create(
+            model=self.model, messages=self.messages, tools=TOOLS,
+            tool_choice=tool_choice, temperature=temperature, stream=True,
+        )
+        parts: list[str] = []
+        acc: dict[int, dict] = {}
+        finish = None
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            ch = chunk.choices[0]
+            if ch.finish_reason:
+                finish = ch.finish_reason
+            d = ch.delta
+            if getattr(d, "content", None):
+                parts.append(d.content)
+            for tc in getattr(d, "tool_calls", None) or []:
+                slot = acc.setdefault(tc.index, {"id": None, "name": "", "arguments": ""})
+                if tc.id:
+                    slot["id"] = tc.id
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        slot["name"] = fn.name
+                    if getattr(fn, "arguments", None):
+                        slot["arguments"] += fn.arguments
+        calls = [
+            ToolCall(slot["id"] or f"call_{i}", slot["name"], slot["arguments"])
+            for i, slot in sorted(acc.items())
+        ]
+        return AssistantTurn("".join(parts), calls, finish)
+
+    def _block(self, temperature, tool_choice) -> AssistantTurn:
+        resp = self.client.chat.completions.create(
+            model=self.model, messages=self.messages, tools=TOOLS,
+            tool_choice=tool_choice, temperature=temperature, stream=False,
+        )
+        ch = resp.choices[0]
+        calls = [
+            ToolCall(tc.id or f"call_{i}", tc.function.name, tc.function.arguments or "")
+            for i, tc in enumerate(ch.message.tool_calls or [])
+        ]
+        return AssistantTurn(ch.message.content or "", calls, ch.finish_reason)
+
+
+class ResponsesTransport:
+    """OpenAI Responses API — the endpoint Codex requires (wire_api=responses).
+
+    Kept stateless (resends the full `input` list each turn instead of using
+    previous_response_id) so it behaves like a translating proxy would and stays
+    deterministic. Assistant tool calls are `function_call` items; results go
+    back as `function_call_output` items.
     """
-    stream = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        tools=TOOLS,
-        tool_choice="auto",
-        temperature=temperature,
-        stream=True,
-    )
-    content_parts: list[str] = []
-    # Reassemble tool-call deltas by index.
-    acc: dict[int, dict] = {}
-    finish_reason = None
-    for chunk in stream:
-        if not chunk.choices:
-            continue
-        choice = chunk.choices[0]
-        delta = choice.delta
-        if choice.finish_reason:
-            finish_reason = choice.finish_reason
-        if getattr(delta, "content", None):
-            content_parts.append(delta.content)
-        for tc in getattr(delta, "tool_calls", None) or []:
-            slot = acc.setdefault(tc.index, {"id": None, "name": "", "arguments": ""})
-            if tc.id:
-                slot["id"] = tc.id
-            fn = getattr(tc, "function", None)
-            if fn is not None:
-                if getattr(fn, "name", None):
-                    slot["name"] = fn.name
-                if getattr(fn, "arguments", None):
-                    slot["arguments"] += fn.arguments
-    tool_calls = [
-        ToolCall(
-            id=slot["id"] or f"call_{i}",
-            name=slot["name"],
-            arguments_raw=slot["arguments"],
-        )
-        for i, slot in sorted(acc.items())
-    ]
-    return AssistantTurn("".join(content_parts), tool_calls, finish_reason)
 
+    name = "responses"
 
-def _call_blocking(client, model, messages, temperature) -> AssistantTurn:
-    resp = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        tools=TOOLS,
-        tool_choice="auto",
-        temperature=temperature,
-        stream=False,
-    )
-    choice = resp.choices[0]
-    msg = choice.message
-    tool_calls = [
-        ToolCall(
-            id=tc.id or f"call_{i}",
-            name=tc.function.name,
-            arguments_raw=tc.function.arguments or "",
-        )
-        for i, tc in enumerate(msg.tool_calls or [])
-    ]
-    return AssistantTurn(msg.content or "", tool_calls, choice.finish_reason)
+    def __init__(self, client, model):
+        self.client = client
+        self.model = model
+        self.instructions = ""
+        self.input: list = []
 
+    def reset(self, system: str, user: str) -> None:
+        self.instructions = system
+        self.input = [{"role": "user", "content": user}]
 
-# --- Per-run result ---------------------------------------------------------
+    def get_turn(self, stream, temperature, tool_choice="auto") -> AssistantTurn:
+        if stream:
+            return self._stream(temperature, tool_choice)
+        return self._block(temperature, tool_choice)
 
+    def record_assistant(self, turn: AssistantTurn) -> None:
+        if turn.content:
+            self.input.append({"role": "assistant", "content": turn.content})
+        for tc in turn.tool_calls:
+            self.input.append(
+                {
+                    "type": "function_call",
+                    "call_id": tc.id,
+                    "name": tc.name,
+                    "arguments": tc.arguments_raw,
+                }
+            )
 
-@dataclass
-class RunMetrics:
-    turns: int = 0
-    structured_calls: int = 0        # tool calls emitted as structured tool_calls
-    valid_calls: int = 0             # structured + parseable + known + schema-ok
-    leaked_in_content: int = 0       # tool call leaked into plain text
-    invalid_json_args: int = 0
-    unknown_tool: int = 0
-    missing_required_arg: int = 0
-    runaway: int = 0
-    api_error: int = 0
-    error_detail: list = field(default_factory=list)
-    grade: dict = field(default_factory=dict)
-    completed: bool = False
-
-    @property
-    def attempts(self) -> int:
-        # Every intent to call a tool, whether structured or leaked.
-        return self.structured_calls + self.leaked_in_content + self.runaway
-
-    @property
-    def errored(self) -> int:
-        return (
-            self.leaked_in_content
-            + self.invalid_json_args
-            + self.unknown_tool
-            + self.missing_required_arg
-            + self.runaway
+    def record_tool_result(self, call_id, name, content) -> None:
+        self.input.append(
+            {"type": "function_call_output", "call_id": call_id, "output": content}
         )
 
-    @property
-    def error_rate(self) -> float:
-        return self.errored / self.attempts if self.attempts else 0.0
+    def _create(self, temperature, tool_choice, stream):
+        return self.client.responses.create(
+            model=self.model, input=self.input, instructions=self.instructions,
+            tools=RESPONSES_TOOLS, tool_choice=tool_choice, temperature=temperature,
+            stream=stream,
+        )
+
+    def _stream(self, temperature, tool_choice) -> AssistantTurn:
+        events = self._create(temperature, tool_choice, stream=True)
+        text_parts: list[str] = []
+        acc: dict[str, dict] = {}   # keyed by output index
+        order: list[str] = []
+        finish = None
+        for ev in events:
+            etype = getattr(ev, "type", "")
+            if etype == "response.output_text.delta":
+                text_parts.append(getattr(ev, "delta", "") or "")
+            elif etype == "response.output_item.added":
+                item = getattr(ev, "item", None)
+                if item is not None and getattr(item, "type", "") == "function_call":
+                    key = str(getattr(ev, "output_index", len(order)))
+                    acc[key] = {
+                        "id": getattr(item, "call_id", None) or getattr(item, "id", None),
+                        "name": getattr(item, "name", "") or "",
+                        "arguments": getattr(item, "arguments", "") or "",
+                    }
+                    order.append(key)
+            elif etype == "response.function_call_arguments.delta":
+                key = str(getattr(ev, "output_index", order[-1] if order else "0"))
+                slot = acc.setdefault(key, {"id": None, "name": "", "arguments": ""})
+                slot["arguments"] += getattr(ev, "delta", "") or ""
+                if key not in order:
+                    order.append(key)
+            elif etype in ("response.completed", "response.incomplete", "response.failed"):
+                finish = etype.split(".")[-1]
+        calls = [
+            ToolCall(acc[k]["id"] or f"call_{i}", acc[k]["name"], acc[k]["arguments"])
+            for i, k in enumerate(order)
+        ]
+        return AssistantTurn("".join(text_parts), calls, finish)
+
+    def _block(self, temperature, tool_choice) -> AssistantTurn:
+        resp = self._create(temperature, tool_choice, stream=False)
+        text_parts: list[str] = []
+        calls: list[ToolCall] = []
+        for i, item in enumerate(getattr(resp, "output", []) or []):
+            itype = getattr(item, "type", "")
+            if itype == "function_call":
+                calls.append(
+                    ToolCall(
+                        getattr(item, "call_id", None) or f"call_{i}",
+                        getattr(item, "name", "") or "",
+                        getattr(item, "arguments", "") or "",
+                    )
+                )
+            elif itype == "message":
+                for c in getattr(item, "content", []) or []:
+                    if getattr(c, "type", "") in ("output_text", "text"):
+                        text_parts.append(getattr(c, "text", "") or "")
+        return AssistantTurn("".join(text_parts), calls, getattr(resp, "status", None))
+
+
+def make_transport(api: str, client, model):
+    if api == "responses":
+        return ResponsesTransport(client, model)
+    return ChatTransport(client, model)
+
+
+# --- Argument validation ----------------------------------------------------
 
 
 def _validate_args(name: str, raw: str) -> tuple[dict | None, str | None]:
@@ -241,20 +342,56 @@ def _validate_args(name: str, raw: str) -> tuple[dict | None, str | None]:
     return args, None
 
 
-def run_once(client, model, temperature, max_turns, stream, verbose) -> RunMetrics:
+# --- Per-run result ---------------------------------------------------------
+
+
+@dataclass
+class RunMetrics:
+    turns: int = 0
+    structured_calls: int = 0
+    valid_calls: int = 0
+    leaked_in_content: int = 0
+    invalid_json_args: int = 0
+    unknown_tool: int = 0
+    missing_required_arg: int = 0
+    runaway: int = 0
+    api_error: int = 0
+    tool_errors_fed: int = 0     # tool results we returned as "error: ..."
+    recovered: bool = False      # model finished the task despite a tool error
+    error_detail: list = field(default_factory=list)
+    grade: dict = field(default_factory=dict)
+    completed: bool = False
+
+    @property
+    def attempts(self) -> int:
+        return self.structured_calls + self.leaked_in_content + self.runaway
+
+    @property
+    def errored(self) -> int:
+        return (
+            self.leaked_in_content
+            + self.invalid_json_args
+            + self.unknown_tool
+            + self.missing_required_arg
+            + self.runaway
+        )
+
+    @property
+    def error_rate(self) -> float:
+        return self.errored / self.attempts if self.attempts else 0.0
+
+
+def run_once(transport, temperature, max_turns, stream, verbose) -> RunMetrics:
     env = VirtualEnv()
     grade = Grade()
     m = RunMetrics()
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": TASK_PROMPT},
-    ]
-    caller = _call_streaming if stream else _call_blocking
+    transport.reset(SYSTEM_PROMPT, TASK_PROMPT)
+    saw_tool_error = False
 
     for _ in range(max_turns):
         m.turns += 1
         try:
-            turn = caller(client, model, messages, temperature)
+            turn = transport.get_turn(stream, temperature)
         except Exception as exc:  # network / 400 from a broken parser config, etc.
             m.api_error += 1
             m.error_detail.append(f"api_error: {type(exc).__name__}: {exc}")
@@ -269,27 +406,13 @@ def run_once(client, model, temperature, max_turns, stream, verbose) -> RunMetri
             break
 
         if turn.tool_calls:
-            # Record the assistant turn (with its tool_calls) into history.
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": turn.content or None,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {"name": tc.name, "arguments": tc.arguments_raw},
-                        }
-                        for tc in turn.tool_calls
-                    ],
-                }
-            )
+            transport.record_assistant(turn)
             for tc in turn.tool_calls:
                 m.structured_calls += 1
                 if tc.name not in TOOL_NAMES:
                     m.unknown_tool += 1
                     m.error_detail.append(f"unknown_tool: {tc.name!r}")
-                    messages.append(_tool_result(tc.id, f"error: unknown tool {tc.name}"))
+                    transport.record_tool_result(tc.id, tc.name, f"error: unknown tool {tc.name}")
                     if verbose:
                         print(f"    [unknown_tool] {tc.name!r}")
                     continue
@@ -297,14 +420,14 @@ def run_once(client, model, temperature, max_turns, stream, verbose) -> RunMetri
                 if err == "invalid_json_args":
                     m.invalid_json_args += 1
                     m.error_detail.append(f"invalid_json_args for {tc.name}: {tc.arguments_raw[:120]!r}")
-                    messages.append(_tool_result(tc.id, "error: arguments were not valid JSON"))
+                    transport.record_tool_result(tc.id, tc.name, "error: arguments were not valid JSON")
                     if verbose:
                         print(f"    [invalid_json] {tc.name}: {tc.arguments_raw[:80]!r}")
                     continue
                 if err == "missing_required_arg":
                     m.missing_required_arg += 1
                     m.error_detail.append(f"missing_required_arg for {tc.name}: {args}")
-                    messages.append(_tool_result(tc.id, f"error: missing required argument(s) for {tc.name}"))
+                    transport.record_tool_result(tc.id, tc.name, f"error: missing required argument(s) for {tc.name}")
                     if verbose:
                         print(f"    [missing_arg] {tc.name}: {args}")
                     continue
@@ -312,12 +435,15 @@ def run_once(client, model, temperature, max_turns, stream, verbose) -> RunMetri
                 m.valid_calls += 1
                 grade.observe_call(tc.name, args, env)
                 result = env.dispatch(tc.name, args)
-                messages.append(_tool_result(tc.id, result))
+                if result.startswith("error:"):
+                    m.tool_errors_fed += 1
+                    saw_tool_error = True
+                transport.record_tool_result(tc.id, tc.name, result)
                 if verbose:
                     print(f"    [ok] {tc.name}({_short(args)}) -> {result[:60]!r}")
             continue
 
-        # No structured tool calls in this turn.
+        # No structured tool calls this turn.
         leak = detect_content_toolcall_leak(turn.content)
         if leak:
             m.leaked_in_content += 1
@@ -326,7 +452,6 @@ def run_once(client, model, temperature, max_turns, stream, verbose) -> RunMetri
                 print(f"    [leak] {leak}")
             break  # a leaking model will keep leaking; the run is a fail.
 
-        # Clean plain-text turn == the model's final answer.
         grade.produced_final_text = True
         if verbose:
             print(f"    [final] {turn.content[:100]!r}")
@@ -334,21 +459,72 @@ def run_once(client, model, temperature, max_turns, stream, verbose) -> RunMetri
 
     m.grade = grade.summary()
     m.completed = grade.task_completed
+    # Recovery: task completed even though a tool call errored along the way.
+    m.recovered = m.completed and saw_tool_error
     return m
-
-
-def _tool_result(tool_call_id: str, content: str) -> dict:
-    return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
 
 
 def _short(args: dict) -> str:
     return ", ".join(f"{k}={str(v)[:20]!r}" for k, v in args.items())
 
 
-# --- Aggregation across runs ------------------------------------------------
+# --- Single-turn probes -----------------------------------------------------
 
 
-def aggregate(runs: list, fail_threshold: float, min_completion: float) -> dict:
+def probe_parallel(transport, stream, temperature, verbose) -> dict:
+    """One turn inviting two tool calls. Not a hard gate (a model that reads
+    serially is fine), BUT if it *does* parallelize, the calls must survive with
+    distinct ids and valid, known names — the bridge #21331 bug collapses them.
+    """
+    transport.reset(SYSTEM_PROMPT, PARALLEL_PROBE_PROMPT)
+    try:
+        turn = transport.get_turn(stream, temperature)
+    except Exception as exc:
+        return {"ran": False, "error": f"{type(exc).__name__}: {exc}"}
+    ids = [tc.id for tc in turn.tool_calls]
+    names_ok = all(tc.name in TOOL_NAMES for tc in turn.tool_calls)
+    args_ok = all(_validate_args(tc.name, tc.arguments_raw)[1] is None
+                  for tc in turn.tool_calls if tc.name in TOOL_NAMES)
+    distinct_ids = len(set(ids)) == len(ids)
+    parallelized = len(turn.tool_calls) >= 2
+    # A defect only if it parallelized AND something is wrong with the calls.
+    defect = parallelized and not (distinct_ids and names_ok and args_ok)
+    if verbose:
+        print(f"  [parallel probe] calls={len(turn.tool_calls)} distinct_ids={distinct_ids} "
+              f"names_ok={names_ok} args_ok={args_ok}")
+    return {
+        "ran": True,
+        "num_calls": len(turn.tool_calls),
+        "parallelized": parallelized,
+        "distinct_ids": distinct_ids,
+        "names_ok": names_ok,
+        "args_ok": args_ok,
+        "defect": defect,
+    }
+
+
+def probe_tool_choice_required(transport, stream, temperature, verbose) -> dict:
+    """Force a tool call. Catches the Qwen3 + reasoning + tool_choice:required
+    HTTP-400 (doc 04), and whether the model honors 'required' at all."""
+    transport.reset(SYSTEM_PROMPT, TOOL_CHOICE_PROBE_PROMPT)
+    try:
+        turn = transport.get_turn(stream, temperature, tool_choice="required")
+    except Exception as exc:
+        if verbose:
+            print(f"  [tool_choice=required] HTTP/API error: {exc}")
+        return {"ran": True, "http_error": f"{type(exc).__name__}: {exc}",
+                "honored": False, "defect": True}
+    honored = len(turn.tool_calls) >= 1 and all(tc.name in TOOL_NAMES for tc in turn.tool_calls)
+    if verbose:
+        print(f"  [tool_choice=required] honored={honored} calls={len(turn.tool_calls)}")
+    return {"ran": True, "http_error": None, "honored": honored, "defect": not honored}
+
+
+# --- Aggregation ------------------------------------------------------------
+
+
+def aggregate(runs: list, fail_threshold: float, min_completion: float,
+              probes: dict | None = None) -> dict:
     total_attempts = sum(r.attempts for r in runs)
     total_errored = sum(r.errored for r in runs)
     total_api_errors = sum(r.api_error for r in runs)
@@ -356,12 +532,15 @@ def aggregate(runs: list, fail_threshold: float, min_completion: float) -> dict:
     completions = sum(1 for r in runs if r.completed)
     completion_rate = completions / len(runs) if runs else 0.0
 
-    # agent_capable: clean tool mechanics AND the model can actually finish the
-    # task, with no hard API errors (a broken parser config throws 400s).
+    probes = probes or {}
+    probe_defect = bool(probes.get("parallel", {}).get("defect")) or \
+        bool(probes.get("tool_choice_required", {}).get("defect"))
+
     agent_capable = (
         overall_rate <= fail_threshold
         and completion_rate >= min_completion
         and total_api_errors == 0
+        and not probe_defect
     )
     return {
         "runs": len(runs),
@@ -372,6 +551,7 @@ def aggregate(runs: list, fail_threshold: float, min_completion: float) -> dict:
         "total_tool_call_attempts": total_attempts,
         "total_errored": total_errored,
         "total_api_errors": total_api_errors,
+        "recoveries": sum(1 for r in runs if r.recovered),
         "error_breakdown": {
             "leaked_in_content": sum(r.leaked_in_content for r in runs),
             "invalid_json_args": sum(r.invalid_json_args for r in runs),
@@ -380,6 +560,7 @@ def aggregate(runs: list, fail_threshold: float, min_completion: float) -> dict:
             "runaway": sum(r.runaway for r in runs),
             "api_error": total_api_errors,
         },
+        "probes": probes,
         "agent_capable": agent_capable,
     }
 
@@ -395,10 +576,12 @@ def main() -> int:
                    help="API key/token. vLLM often ignores it; LiteLLM wants a virtual key.")
     p.add_argument("--model", default=os.environ.get("CONFORMANCE_MODEL"),
                    help="Model name/alias to target (required).")
+    p.add_argument("--api", choices=["chat", "responses"],
+                   default=os.environ.get("CONFORMANCE_API", "chat"),
+                   help="Wire protocol. 'responses' targets /v1/responses (the Codex path).")
     p.add_argument("--runs", type=int, default=int(os.environ.get("CONFORMANCE_RUNS", "5")),
                    help="Repeat the scenario N times for a stable error rate.")
-    p.add_argument("--max-turns", type=int, default=12,
-                   help="Max assistant turns before giving up on a run.")
+    p.add_argument("--max-turns", type=int, default=12, help="Max assistant turns per run.")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--fail-threshold", type=float, default=0.02,
                    help="Max tool-call-error-rate to still count as agent_capable.")
@@ -407,6 +590,8 @@ def main() -> int:
     no_stream_default = os.environ.get("CONFORMANCE_NO_STREAM") == "1"
     p.add_argument("--no-stream", action="store_true", default=no_stream_default,
                    help="Disable streaming (streaming is the realistic path — keep it on).")
+    p.add_argument("--no-probes", action="store_true",
+                   help="Skip the parallel + tool_choice:required probes.")
     p.add_argument("--json-out", help="Write the full JSON report to this path.")
     p.add_argument("-v", "--verbose", action="store_true", help="Print each tool call.")
     args = p.parse_args()
@@ -423,24 +608,30 @@ def main() -> int:
     stream = not args.no_stream
 
     print(f"Conformance: model={args.model!r} base_url={args.base_url!r} "
-          f"stream={stream} runs={args.runs}")
+          f"api={args.api} stream={stream} runs={args.runs}")
     print("-" * 72)
 
     runs: list[RunMetrics] = []
     for i in range(args.runs):
         print(f"Run {i + 1}/{args.runs}:")
-        m = run_once(client, args.model, args.temperature, args.max_turns, stream, args.verbose)
+        transport = make_transport(args.api, client, args.model)
+        m = run_once(transport, args.temperature, args.max_turns, stream, args.verbose)
         runs.append(m)
         print(f"  turns={m.turns} valid_calls={m.valid_calls} errored={m.errored} "
               f"completed={m.completed} run_error_rate={m.error_rate:.3f}")
 
-    summary = aggregate(runs, args.fail_threshold, args.min_completion)
+    probes = {}
+    if not args.no_probes:
+        print("Probes:")
+        probes["parallel"] = probe_parallel(
+            make_transport(args.api, client, args.model), stream, args.temperature, True)
+        probes["tool_choice_required"] = probe_tool_choice_required(
+            make_transport(args.api, client, args.model), stream, args.temperature, True)
+
+    summary = aggregate(runs, args.fail_threshold, args.min_completion, probes)
     report = {
-        "model": args.model,
-        "base_url": args.base_url,
-        "streaming": stream,
-        "summary": summary,
-        "runs": [asdict(r) for r in runs],
+        "model": args.model, "base_url": args.base_url, "api": args.api,
+        "streaming": stream, "summary": summary, "runs": [asdict(r) for r in runs],
     }
 
     print("=" * 72)
