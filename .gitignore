@@ -1,0 +1,22 @@
+# Secrets — never commit
+.env
+.env.*
+*.key
+*.pem
+secrets/
+*credentials*
+
+# LiteLLM / local config that may hold keys
+litellm-config.local.yaml
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Python (if we add tooling later)
+__pycache__/
+*.pyc
+.venv/
+venv/
