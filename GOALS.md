@@ -265,5 +265,14 @@ decision is made.
 
 ## Done
 
+**How to mark a goal complete** (do this in the same PR that finishes it):
+1. *Delete* the goal's entry from its section above — don't leave a tombstone.
+2. Add one line here: `- ✅ <goal number + title> — PR #<n> (<yyyy-mm>)`, plus
+   any follow-up goals discovered, added above as new numbered entries.
+3. The completion condition itself is the tag: a goal is "complete" only when
+   its condition literally holds on `main` — if in doubt, re-check it, don't
+   trust the checkmark.
+
 - ✅ Phase-0 groundwork (blockers A & B, conformance harness, deploy scaffold) — PR #1
 - ✅ E2E test harness (mock + cli-auth profiles) — PR #2
+- ✅ Goal-driven workflow (GOALS.md backlog + unattended contract) — PR #3
