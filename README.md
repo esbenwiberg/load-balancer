@@ -1,6 +1,6 @@
-# LLM Load Balancer / Task-Aware Router — Research
+# LLM Load Balancer / Task-Aware Router
 
-**Status:** research & investigation (no code yet)
+**Status:** research complete → Phase-0 groundwork built (scaffold + conformance harness)
 **Owner:** ewi@projectum.com
 **Started:** 2026-07-03
 
@@ -33,6 +33,23 @@ is lost between sessions.
 | [docs/05-prior-art-github.md](docs/05-prior-art-github.md) | How others do it — `claude-code-router` (35k★) and friends. |
 | [docs/06-recommendation.md](docs/06-recommendation.md) | **The decision:** what to build, phased, with a Phase-0 config. |
 | [docs/07-next-session-prompt.md](docs/07-next-session-prompt.md) | Copy-paste handoff prompt to continue in a clean session. |
+
+## What's built (Phase-0 groundwork)
+
+| Dir | What's in it |
+|-----|--------------|
+| [conformance/](conformance/) | Tool-calling **conformance harness** — drives a model through Read→Edit→Bash under streaming, counts leaked/malformed/unknown/runaway tool calls, emits pass/fail + a tool-call-error-rate. Sets `agent_capable`. Has an offline self-test. |
+| [deploy/](deploy/) | Runnable **Phase-0 scaffold** — `litellm-config.yaml` (env-parameterised, both blockers wired in), `docker-compose.yaml` (vetted version pin), `.env.example`, `run.sh`, and `RUNBOOK.md`. |
+
+**Blockers resolved this round** (details in docs/03 risks 4 & 5):
+- **A — Codex→Spark:** LiteLLM *does* bridge Responses→Chat-Completions (streaming + tool
+  calls) via `use_chat_completions_api: true` on 1.83.x-stable. Confirmed from source; live
+  smoke test still pending.
+- **B — Claude-on-Foundry:** use the **`azure_ai/`** provider with a `/anthropic` base URL
+  (not `azure/`, not `anthropic/`).
+
+**Still needs a human:** real Spark inventory + Azure Foundry endpoints/deployments/creds,
+and the Codex-in-scope decision. See `deploy/RUNBOOK.md` step 0.
 
 ## The one-line takeaway so far
 

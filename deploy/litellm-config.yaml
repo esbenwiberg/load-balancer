@@ -1,0 +1,95 @@
+# =============================================================================
+# Phase-0 LiteLLM config — passthrough gateway with Foundry fallback.
+#
+# Proves protocol translation + fallback + auth for BOTH Claude Code (Anthropic
+# /v1/messages) and Codex (OpenAI /v1/responses). No smart routing yet: the
+# client asks for a model alias, the alias resolves to a Spark or Foundry, and
+# Foundry is the tail of every fallback chain. See ../docs/06-recommendation.md.
+#
+# Everything environment-specific is parameterised via os.environ/... — real
+# values live in .env (never committed). See .env.example + RUNBOOK.md.
+#
+# ⚠️ VERSION: pin a vetted LiteLLM in docker-compose.yaml, NOT here.
+#   - 1.82.7 / 1.82.8 shipped credential-stealing malware — never use them.
+#   - The Codex→Spark Responses→ChatCompletions bridge (use_chat_completions_api)
+#     requires the 1.83.x-stable line (>= ~1.83.14), which POST-DATES the malware
+#     incident. So you cannot both pin pre-incident 1.82.6 AND get Codex→Spark.
+#     Run a vetted 1.83.x-stable and verify the wheel hash. (Blocker A, docs/03.)
+# =============================================================================
+
+model_list:
+  # ---- Spark workbench: qwen3-coder (OpenAI-compatible, via vLLM) ----------
+  - model_name: qwen3-coder                       # alias clients request
+    litellm_params:
+      model: openai/${SPARK_A_MODEL}              # e.g. Qwen/Qwen3-Coder-30B-A3B-Instruct
+      api_base: os.environ/SPARK_A_API_BASE       # e.g. http://spark-a.internal:8000/v1
+      api_key: os.environ/SPARK_A_API_KEY         # "dummy" if vLLM has no auth
+      # Codex speaks the Responses API only. This flag makes LiteLLM bridge a
+      # /v1/responses request down to this Chat-Completions backend, preserving
+      # streaming + tool calls. (Blocker A — verify with a real smoke test.)
+      use_chat_completions_api: true
+    model_info:
+      tier: local
+      # agent_capable is earned by the conformance harness, not asserted here.
+      # Run: conformance/conformance.py --base-url $SPARK_A_API_BASE --model ...
+      agent_capable: true
+
+  # ---- Foundry: Anthropic / Claude family (Azure AI Foundry) ---------------
+  # Blocker B: Claude on Azure AI Foundry is served as the NATIVE Anthropic
+  # Messages API at https://<resource>.services.ai.azure.com/anthropic, and the
+  # correct LiteLLM provider is azure_ai/ (NOT azure/, NOT anthropic/). Only the
+  # auth differs from anthropic-direct; tool calls + streaming are identical.
+  # `model:` must be your Foundry DEPLOYMENT name. api_version is NOT required
+  # (versioning is via the anthropic-version header LiteLLM injects).
+  - model_name: claude-sonnet
+    litellm_params:
+      model: azure_ai/${FOUNDRY_CLAUDE_SONNET_DEPLOYMENT}
+      api_base: os.environ/FOUNDRY_ANTHROPIC_API_BASE   # .../services.ai.azure.com/anthropic
+      api_key: os.environ/AZURE_API_KEY
+    model_info:
+      tier: foundry
+      agent_capable: true
+
+  - model_name: claude-opus
+    litellm_params:
+      model: azure_ai/${FOUNDRY_CLAUDE_OPUS_DEPLOYMENT}
+      api_base: os.environ/FOUNDRY_ANTHROPIC_API_BASE
+      api_key: os.environ/AZURE_API_KEY
+    model_info:
+      tier: foundry
+      agent_capable: true
+
+  # ---- Foundry: OpenAI / GPT family (Azure OpenAI Service) -----------------
+  # This is the azure/ provider (Azure OpenAI), distinct from azure_ai/ above.
+  # It DOES require api_version. `model:` is your Azure OpenAI deployment name.
+  - model_name: gpt
+    litellm_params:
+      model: azure/${FOUNDRY_GPT_DEPLOYMENT}
+      api_base: os.environ/AZURE_API_BASE               # https://<resource>.openai.azure.com
+      api_key: os.environ/AZURE_OPENAI_API_KEY
+      api_version: os.environ/AZURE_OPENAI_API_VERSION  # e.g. 2024-10-21
+    model_info:
+      tier: foundry
+      agent_capable: true
+
+router_settings:
+  # Spark unhealthy / busy / timing out → fall through to Foundry. Keep the
+  # coding-agent request inside the SAME model family first (Anthropic→Claude)
+  # so tool-call format + reasoning blocks stay consistent, then GPT as a last
+  # resort. Foundry is the floor of quality and ceiling of capacity.
+  fallbacks:
+    - qwen3-coder: ["claude-sonnet", "claude-opus", "gpt"]
+    - claude-sonnet: ["claude-opus"]
+  num_retries: 2
+  timeout: 600            # long: local big-model streams are single-digit tok/s
+  allowed_fails: 2
+  cooldown_time: 30       # ~OpenRouter's outage-window instinct
+
+litellm_settings:
+  drop_params: true       # tolerate params a given backend doesn't support
+  # request_timeout, num_retries etc. can also live here; keep router_settings authoritative.
+
+general_settings:
+  # Master key mints per-user virtual keys (attribution + revocation). NEVER
+  # commit it — it comes from the environment.
+  master_key: os.environ/LITELLM_MASTER_KEY

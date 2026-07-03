@@ -1,0 +1,2 @@
+# Pin the OpenAI SDK; it's the only runtime dep. Any recent 1.x works.
+openai>=1.40,<2

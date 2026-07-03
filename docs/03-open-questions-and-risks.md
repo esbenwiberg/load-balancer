@@ -46,10 +46,41 @@ Routing Codex → a Spark needs a **Responses ↔ Chat-Completions bridge**.
 backend (incl. streaming + tool calls)? If not, Codex→Spark may be off the table initially
 (Codex→Foundry-OpenAI still fine).
 
+> **✅ RESOLVED (Phase-0 research) — YES, on paper; validate by smoke test.**
+> LiteLLM has an **opt-in** `/v1/responses → /chat/completions` bridge: set
+> `use_chat_completions_api: true` on the `model_list` entry (or encode `openai/chat_completions/<model>`).
+> Source (`litellm/responses/litellm_completion_transformation/`) shows it translates
+> **streaming** (SSE deltas → Responses events) **and tool calls both directions**
+> (`transform_responses_api_tools_to_chat_completion_tools`, `_queue_tool_call_delta_events`).
+> Requested specifically for the Codex use case (issue #23716; PRs #24783, #25346).
+> **Caveats:** (a) the flag ships only in the **1.83.x-stable** line (≈1.83.14+), which
+> **post-dates** the 1.82.7/1.82.8 malware — you can't pin pre-incident 1.82.6 *and* get
+> this bridge; run a vetted 1.83.x-stable and verify the digest. (b) Bridge is young with a
+> bug history (parallel-tool index collision #21331, mixed text+tool drop #17246 — both
+> fixed; `developer`-role #24664; a `file_search` flag-drop P1 on #24783). **All evidence is
+> source/doc reading, not an observed Codex↔vLLM round-trip** → smoke-test streaming +
+> parallel tools + mixed text/tool output before committing Codex→Spark. Codex→Foundry-OpenAI
+> is unaffected. The conformance harness (`conformance/`) is the tool to run that smoke test.
+
 ### 5. Anthropic models on Azure AI Foundry — wire format
 We assume Foundry serves Anthropic models. Need to confirm the exact API surface and that
 LiteLLM has a first-class provider entry for it (vs Azure OpenAI, which it clearly does).
 **Open:** verify and pin the LiteLLM provider config.
+
+> **✅ RESOLVED (Phase-0 research).** Claude on Azure AI Foundry is **GA** (~June 2026),
+> served as the **native Anthropic Messages API** at
+> `https://<resource>.services.ai.azure.com/anthropic`. The correct LiteLLM provider is
+> **`azure_ai/`** — *not* `azure/` (that's Azure OpenAI / GPT) and *not* `anthropic/`
+> (that's Anthropic-direct). LiteLLM has a purpose-built page
+> (`/providers/azure/azure_anthropic`, PR #17104). Config:
+> `model: azure_ai/<deployment-name>` + `api_base: .../anthropic` + `api_key: os.environ/AZURE_API_KEY`.
+> **No `api_version`** needed (versioning is via the `anthropic-version` header LiteLLM
+> injects). `max_tokens` is required by the Azure Anthropic API (LiteLLM defaults 4096).
+> Only auth differs from `anthropic/`-direct; **tool calls, streaming, thinking are
+> identical**. Route on the **deployment name**, not the catalog ID (fast-moving). Some
+> newest models are **Entra-ID-only** (use `AZURE_TENANT_ID/CLIENT_ID/CLIENT_SECRET`).
+> Now wired into `deploy/litellm-config.yaml`. Prompt-caching on the Azure route is
+> inferred (LiteLLM claims feature parity) but **unconfirmed** — verify before relying on it.
 
 ### 6. Cold-start / model-swap on the hot path
 llama-swap cold start = seconds to tens of seconds. If routing sends an interactive request
@@ -93,9 +124,11 @@ depend on a flaky component.
 ## Questions for the team / next research
 
 - [ ] Confirm the exact Spark inventory: how many boxes, which models pinned where, memory
-      headroom per box.
-- [ ] Verify Codex Responses↔ChatCompletions bridging in LiteLLM (blocking for Codex→Spark).
-- [ ] Verify Anthropic-on-Foundry API surface + LiteLLM provider support.
+      headroom per box. **(still needs a human — see deploy/RUNBOOK.md step 0)**
+- [x] Verify Codex Responses↔ChatCompletions bridging in LiteLLM (blocking for Codex→Spark).
+      **→ risk 4: YES on paper via `use_chat_completions_api` (1.83.x-stable); smoke-test pending.**
+- [x] Verify Anthropic-on-Foundry API surface + LiteLLM provider support.
+      **→ risk 5: `azure_ai/<deployment>` + `/anthropic` base URL; wired into the scaffold.**
 - [ ] Decide routing granularity: session-only (safe) vs allow-one-escalation (riskier).
 - [ ] Decide what "belongs" on a Spark vs always-Foundry (latency-driven, not just size).
 - [ ] Evaluate LiteLLM-only vs Arch(`archgw`) for the routing layer.

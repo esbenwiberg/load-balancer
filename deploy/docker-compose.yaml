@@ -1,0 +1,33 @@
+# =============================================================================
+# Phase-0 gateway: a single pinned LiteLLM proxy in front of 1 Spark + Foundry.
+#
+# ⚠️ VERSION PIN (docs/03 risk 8): 1.82.7 / 1.82.8 shipped credential-stealing
+# malware. Do NOT use them. The Codex→Spark Responses bridge needs 1.83.x-stable
+# (>= ~1.83.14). Pin an EXACT vetted tag below and verify its digest against
+# LiteLLM's post-incident security guidance before first run. Update the pin
+# deliberately, never with :latest.
+# =============================================================================
+
+services:
+  litellm:
+    # Pin an exact, vetted stable tag. Replace with the digest-verified version
+    # you cleared. Example (VERIFY before using):
+    image: ghcr.io/berriai/litellm:v1.83.14-stable
+    # Belt-and-braces: pin by digest once you've verified it, e.g.
+    # image: ghcr.io/berriai/litellm@sha256:<verified-digest>
+    container_name: litellm-gateway
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+    env_file:
+      - .env
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
+    healthcheck:
+      # LiteLLM exposes /health/liveliness (no auth) for liveness.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
