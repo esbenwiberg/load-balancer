@@ -1,0 +1,82 @@
+# =============================================================================
+# E2E LiteLLM config — the SAME gateway (SUT), but every backend points at the
+# mockd daemon instead of a real Spark or Foundry. Proves protocol translation
+# + fallback + auth + streaming with ZERO external dependencies.
+#
+# DELIBERATE SIMPLIFICATION vs deploy/litellm-config.yaml:
+#   Every alias uses the `openai/` provider against mockd's OpenAI-compatible
+#   surface — including the claude-* aliases. In production those use `azure_ai/`
+#   (native Anthropic wire format on Foundry). The azure_ai/anthropic BACKEND
+#   serialization cannot be faithfully mocked without reverse-engineering Azure's
+#   surface, so it is validated ONLY against real Foundry (deploy/RUNBOOK.md).
+#   What THIS config exercises is the balancer's own logic — CLIENT-side
+#   translation (Anthropic-in, Responses-in), fallback, cooldown, key scoping,
+#   streaming — which is provider-agnostic. That's the 90% you want in CI.
+#
+# The downstream `model:` names equal the client aliases on purpose: mockd keys
+# its fault directives on the model it RECEIVES, so tests inject faults by the
+# same name they request.
+# =============================================================================
+
+model_list:
+  # ---- "Workbench" stand-in (a Spark serving a small model) ----------------
+  - model_name: qwen3-coder
+    litellm_params:
+      model: openai/qwen3-coder
+      api_base: http://mockd:9100/v1
+      api_key: dummy
+      # Bridge /v1/responses (Codex path) down to mockd's chat surface. This is
+      # exactly Blocker A — with mockd it becomes a deterministic CI gate for
+      # the bridge MECHANICS (streaming + tool-call translation both ways).
+      use_chat_completions_api: true
+    model_info:
+      backend_tier: local
+      agent_capable: true
+
+  # ---- "Foundry" stand-ins (the always-up fallback tier) -------------------
+  - model_name: claude-sonnet
+    litellm_params:
+      model: openai/claude-sonnet
+      api_base: http://mockd:9100/v1
+      api_key: dummy
+      use_chat_completions_api: true
+    model_info:
+      backend_tier: foundry
+      agent_capable: true
+
+  - model_name: claude-opus
+    litellm_params:
+      model: openai/claude-opus
+      api_base: http://mockd:9100/v1
+      api_key: dummy
+      use_chat_completions_api: true
+    model_info:
+      backend_tier: foundry
+      agent_capable: true
+
+  - model_name: gpt
+    litellm_params:
+      model: openai/gpt
+      api_base: http://mockd:9100/v1
+      api_key: dummy
+      use_chat_completions_api: true
+    model_info:
+      backend_tier: foundry
+      agent_capable: true
+
+router_settings:
+  # Same shape as prod: workbench falls through to the Foundry tier, Anthropic
+  # family first (tool-call format consistency), GPT last.
+  fallbacks:
+    - qwen3-coder: ["claude-sonnet", "claude-opus", "gpt"]
+    - claude-sonnet: ["claude-opus"]
+  num_retries: 1          # low so fallback tests are fast + deterministic
+  timeout: 30             # mockd is instant; no need for the prod 600s
+  allowed_fails: 2
+  cooldown_time: 5        # short so a cooldown test doesn't stall CI
+
+litellm_settings:
+  drop_params: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

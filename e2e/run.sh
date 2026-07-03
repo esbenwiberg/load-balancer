@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# =============================================================================
+# One-shot e2e: bring up the mock stack, wait healthy, run the pytest suite AND
+# the conformance harness THROUGH the gateway (the Blocker-A plumbing gate),
+# then tear down. Exit non-zero if anything fails.
+#
+#   ./run.sh              # up -> test -> down
+#   ./run.sh --keep       # leave the stack running afterwards (for poking)
+#   ./run.sh --no-down    # alias for --keep
+# =============================================================================
+set -euo pipefail
+cd "$(dirname "$0")"
+
+KEEP=0
+for arg in "$@"; do
+  case "$arg" in
+    --keep|--no-down) KEEP=1 ;;
+  esac
+done
+
+COMPOSE="docker compose -f docker-compose.e2e.yaml"
+export LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-sk-e2e-master-test-key}"
+export GATEWAY_URL="${GATEWAY_URL:-http://localhost:4000}"
+export MOCKD_URL="${MOCKD_URL:-http://localhost:9100}"
+
+cleanup() {
+  if [[ "$KEEP" -eq 0 ]]; then
+    echo "--- tearing down ---"
+    $COMPOSE down -v --remove-orphans >/dev/null 2>&1 || true
+  else
+    echo "--- leaving stack up (--keep). Tear down with: $COMPOSE down -v ---"
+  fi
+}
+trap cleanup EXIT
+
+# --- venv for the test tooling (openai + httpx + pytest) --------------------
+VENV="../.venv-e2e"
+if [[ ! -x "$VENV/bin/python" ]]; then
+  echo "--- creating venv $VENV ---"
+  python3 -m venv "$VENV"
+fi
+"$VENV/bin/pip" install -q --disable-pip-version-check -r requirements.txt
+
+# --- up + wait for health ---------------------------------------------------
+echo "--- bringing up stack ---"
+$COMPOSE up -d
+
+echo "--- waiting for gateway health ---"
+for i in $(seq 1 60); do
+  if curl -sf "$GATEWAY_URL/health/liveliness" >/dev/null 2>&1; then
+    echo "gateway healthy"
+    break
+  fi
+  if [[ "$i" -eq 60 ]]; then
+    echo "ERROR: gateway did not become healthy" >&2
+    $COMPOSE logs --tail=50 litellm >&2 || true
+    exit 1
+  fi
+  sleep 2
+done
+
+# --- pytest suite (raw-HTTP client emulation) -------------------------------
+echo "--- pytest e2e suite ---"
+"$VENV/bin/python" -m pytest test_e2e.py -v
+
+# --- conformance THROUGH the gateway: the Blocker-A plumbing gate -----------
+# Responses -> Chat bridge (Codex path) end-to-end, deterministically green
+# because mockd plays the scenario by the rules. Proves the bridge mechanics,
+# not a real model's quality.
+echo "--- conformance harness through the gateway (Responses bridge) ---"
+"$VENV/bin/python" ../conformance/conformance.py \
+  --base-url "$GATEWAY_URL/v1" \
+  --api responses \
+  --model qwen3-coder \
+  --api-key "$LITELLM_MASTER_KEY" \
+  --runs 3
+
+echo
+echo "ALL E2E CHECKS PASSED"

@@ -1,0 +1,47 @@
+# =============================================================================
+# CLI-AUTH stack: the LiteLLM gateway in front of REAL hosted models (no mockd).
+# Backends are keyed from .env.cliauth (written by ./borrow_creds.sh).
+#
+#   docker compose --env-file .env.cliauth -f docker-compose.cliauth.yaml up -d
+#
+# Reaches the public internet. Org policy applies (no personal/customer data;
+# Context& / Delegate / Projectum / Consit only). See README.md.
+# =============================================================================
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: litellm-cliauth-db
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: litellm
+      POSTGRES_DB: litellm
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.83.14-stable
+    container_name: litellm-cliauth
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./litellm-config.cliauth.yaml:/app/config.yaml:ro
+    environment:
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:?set in .env.cliauth — run ./borrow_creds.sh}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      DATABASE_URL: "postgresql://litellm:litellm@db:5432/litellm"
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
