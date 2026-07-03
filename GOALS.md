@@ -39,8 +39,8 @@ document reversible calls, when to stop) is defined once in
 Priority is (a) completing the idea — control plane, observability, dashboard —
 and (b) hardening the harness + test setup. Recommended order:
 harness core (1 → 2 → 6 → 7 → 8 → 9) → dev stack (10) → observability +
-wallet guards (3 → 11) → dashboard v1 (12) → Ollama (4) → control plane (5) →
-dashboard v2 (13) → Azure IaC (14). Anything Spark-infra-shaped is parked.
+wallet guards (3 → 11 → 11b) → dashboard v1 (12) → Ollama (4) → control plane
+(5) → dashboard v2 (13) → Azure IaC (14). Spark-infra-shaped work is parked.
 
 Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 [`docs/06`](docs/06-recommendation.md) (decision), [`docs/03`](docs/03-open-questions-and-risks.md) (risks).
@@ -166,6 +166,19 @@ supports `max_budget` / tpm / rpm per key; nothing configures or tests it.
 every virtual key the gateway issues gets a default budget and rate limit from config, an e2e test proves an over-budget key and an over-limit key are refused with a clean 4xx (no hang, no 5xx), the knobs and how to raise them are documented, e2e/run.sh is green, and it's merged to main
 ```
 
+### 11b. Users, teams, and spend audit — who spent what — risk: medium
+**Why:** budgets (goal 11) cap the damage; this makes spend *attributable*:
+every key belongs to a user, users group into teams, and spend is queryable
+per key/user/team after the fact. LiteLLM has all of it natively (internal
+users, teams, spend logs) — but it needs a real Postgres behind the gateway,
+which today runs stateless. That's also where the open persistence question
+(do keys survive a restart?) gets answered for good.
+**Depends on:** goal 10 (the stack gains a Postgres container), pairs with 11.
+**Completion condition:**
+```
+the dev/e2e stack includes a Postgres the gateway uses, keys are issued bound to a user and users can be grouped into teams, per-model costs are configured so mockd traffic produces nonzero spend, an e2e test proves spend for a request is attributed to the right key+user+team and survives a gateway restart, the audit queries are documented, e2e/run.sh is green, and it's merged to main
+```
+
 ### 12. Routing dashboard v1 — "where did my prompt go?" — risk: medium
 **Why:** the endgame's visible face: per-request {alias asked, backend served,
 fallback hit?, latency, tokens} you can actually look at. Build-vs-reuse is a
@@ -220,15 +233,17 @@ decision is made.
   choices, private endpoint vs public + IP allowlist, TLS, dashboard auth, who
   gets keys and how they rotate. A hosted OpenAI-compatible proxy with Foundry
   creds behind it is a *target*; a leaked master key is someone else's free LLM.
-  Creds + security + outward-facing. **Decide the release model first ⤵**
+  Creds + security + outward-facing. *(Noted for later — build phase is
+  local/test only, nothing hosted yet. Decide the release model first ⤵)*
 - **Release model BEFORE anything deploys from `main`** — the moment the
   balancer deploys from `main`, CLAUDE.md's tripwire kills auto-merge and
   vacation autonomy with it. Decide *in advance*: manual promotion, a release
-  branch, or tagged deploys — so unattended runs keep merging to `main` while
-  deploys stay a deliberate human act.
-- **Real-Foundry traffic through the hosted balancer** — extends the DISCO item
-  above: vacation prompts routed to Foundry are real data through a real model
-  path. Governance sign-off gates the endgame, not just Phase 0.
+  branch, or tagged deploys. *(Decision 2026-07: fine as-is for now — nothing
+  deploys, it's all testing. Revisit at the first real deploy, not before.)*
+- **Real-Foundry traffic through the hosted balancer** — *(build phase: nothing
+  is live and nothing routes to Foundry during unattended runs — mock/synthetic
+  only, per the CLAUDE.md guardrail.)* When the balancer goes live for real
+  prompts, the DISCO sign-off above gates it.
 - **Verify prompt-caching on the Azure/Anthropic route** ([docs/03 risk 5](docs/03-open-questions-and-risks.md))
   — needs real Foundry creds. Infra.
 
