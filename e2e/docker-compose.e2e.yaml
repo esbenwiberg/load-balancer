@@ -1,0 +1,74 @@
+# =============================================================================
+# E2E stack: the real LiteLLM gateway (SUT) in front of the mockd backend.
+# No Spark, no Foundry, no external network. Self-contained — `docker compose
+# -f docker-compose.e2e.yaml up`.
+#
+#   :4000  LiteLLM gateway   — clients + the pytest suite hit this
+#   :9100  mockd             — published so tests can POST /__control to inject
+#                              faults; LiteLLM reaches it in-network at mockd:9100
+# =============================================================================
+
+services:
+  # Postgres backs LiteLLM's virtual-key store — required to mint/scope per-user
+  # keys (the attribution + revocation story). Test-only creds; ephemeral volume.
+  db:
+    image: postgres:16-alpine
+    container_name: litellm-e2e-db
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: litellm
+      POSTGRES_DB: litellm
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  mockd:
+    # Stdlib-only daemon: any modern python image works, no pip install.
+    image: python:3.12-slim
+    container_name: mockd
+    working_dir: /app
+    volumes:
+      - ./mockd.py:/app/mockd.py:ro
+    environment:
+      MOCKD_PORT: "9100"
+      MOCKD_HOST: "0.0.0.0"
+      MOCKD_DEBUG: "${MOCKD_DEBUG:-}"
+    command: ["python", "mockd.py"]
+    ports:
+      - "9100:9100"        # host-published so the test suite can drive /__control
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9100/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
+  litellm:
+    # Same pinned, vetted image as deploy/ (docs/03 risk 8 — never 1.82.7/1.82.8).
+    image: ghcr.io/berriai/litellm:v1.83.14-stable
+    container_name: litellm-e2e
+    depends_on:
+      mockd:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./litellm-config.e2e.yaml:/app/config.yaml:ro
+    environment:
+      # Test-only master key — NOT a secret. Overridable via .env.e2e.
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-e2e-master-test-key}"
+      # LiteLLM runs its prisma migrations against this on boot; enables the
+      # /key/generate virtual-key store.
+      DATABASE_URL: "postgresql://litellm:litellm@db:5432/litellm"
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s

@@ -1,0 +1,59 @@
+# =============================================================================
+# CLI-AUTH profile — the SAME gateway, but backends are REAL hosted models so
+# you can drive real Claude Code / Codex through the balancer end-to-end. The
+# "workbench" (a Spark in prod) is stood in by a small real model — Haiku — and
+# the "Foundry" fallback tier by bigger models.
+#
+# CREDENTIALS: keyed from env vars written by ./borrow_creds.sh into
+# .env.cliauth (gitignored). See README.md > "Profile: cli-auth" for the
+# clean-key vs subscription-OAuth split and the ToS caveat. NOTHING real is
+# committed here — only os.environ/ references.
+#
+# This profile hits the public internet and real models. Per org policy: only
+# Context& / Delegate / Projectum / Consit work, and NO personal/customer data
+# through it. Keep smoke prompts synthetic. If in doubt -> DISCO.
+# =============================================================================
+
+model_list:
+  # ---- "Workbench" stand-in: a small model (Haiku) ------------------------
+  - model_name: haiku
+    litellm_params:
+      model: anthropic/claude-haiku-4-5-20251001
+      api_key: os.environ/ANTHROPIC_API_KEY
+    model_info:
+      backend_tier: workbench-standin
+      agent_capable: true
+
+  # ---- "Foundry" fallback tier: bigger, always-up models ------------------
+  - model_name: claude-sonnet
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+    model_info:
+      backend_tier: foundry-standin
+      agent_capable: true
+
+  # OpenAI side — the Codex-native path. gpt-5-mini is the small stand-in.
+  - model_name: gpt
+    litellm_params:
+      model: openai/gpt-5-mini
+      api_key: os.environ/OPENAI_API_KEY
+    model_info:
+      backend_tier: foundry-standin
+      agent_capable: true
+
+router_settings:
+  # Small workbench model falls through to the bigger tier, Anthropic family
+  # first (tool-call format consistency for the Claude Code path), GPT last.
+  fallbacks:
+    - haiku: ["claude-sonnet", "gpt"]
+  num_retries: 2
+  timeout: 120
+  allowed_fails: 2
+  cooldown_time: 30
+
+litellm_settings:
+  drop_params: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

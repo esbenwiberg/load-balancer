@@ -1,8 +1,9 @@
 # Secrets — never commit
 .env
 .env.*
-# but DO commit the template (no secrets in it):
+# but DO commit the templates (no secrets in them):
 !.env.example
+!.env.e2e.example
 *.key
 *.pem
 secrets/
@@ -21,4 +22,6 @@ litellm-config.local.yaml
 __pycache__/
 *.pyc
 .venv/
+.venv-e2e/
 venv/
+.pytest_cache/

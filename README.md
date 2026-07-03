@@ -33,6 +33,7 @@ is lost between sessions.
 | [docs/05-prior-art-github.md](docs/05-prior-art-github.md) | How others do it — `claude-code-router` (35k★) and friends. |
 | [docs/06-recommendation.md](docs/06-recommendation.md) | **The decision:** what to build, phased, with a Phase-0 config. |
 | [docs/07-next-session-prompt.md](docs/07-next-session-prompt.md) | Copy-paste handoff prompt to continue in a clean session. |
+| [docs/08-e2e-testing.md](docs/08-e2e-testing.md) | **E2E design:** test the balancer without Foundry/Sparks — mock + cli-auth profiles, trade-offs. |
 
 ## What's built (Phase-0 groundwork)
 
@@ -40,6 +41,7 @@ is lost between sessions.
 |-----|--------------|
 | [conformance/](conformance/) | Tool-calling **conformance harness** — drives a model through Read→Edit→Bash under streaming, counts leaked/malformed/unknown/runaway tool calls, emits pass/fail + a tool-call-error-rate. Sets `agent_capable`. Has an offline self-test. |
 | [deploy/](deploy/) | Runnable **Phase-0 scaffold** — `litellm-config.yaml` (env-parameterised, both blockers wired in), `docker-compose.yaml` (vetted version pin), `.env.example`, `run.sh`, and `RUNBOOK.md`. |
+| [e2e/](e2e/) | **E2E test harness** — test the balancer with no Foundry/Sparks. `mockd` (a controllable fake backend + scripted agent) drives a full `./run.sh` (pytest + conformance-through-the-gateway); `cli-auth` profile drives real Claude Code/Codex via provisioned keys. See [docs/08](docs/08-e2e-testing.md). |
 
 **Blockers resolved this round** (details in docs/03 risks 4 & 5):
 - **A — Codex→Spark:** LiteLLM *does* bridge Responses→Chat-Completions (streaming + tool

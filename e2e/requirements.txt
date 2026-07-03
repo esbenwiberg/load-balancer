@@ -1,0 +1,6 @@
+# E2E test tooling. mockd itself is stdlib-only (no deps); these are for the
+# test DRIVER (raw-HTTP suite + the conformance harness through the gateway).
+httpx>=0.27,<1
+pytest>=8,<9
+# conformance.py needs the OpenAI SDK (Responses API landed in 1.66).
+openai>=1.66,<2

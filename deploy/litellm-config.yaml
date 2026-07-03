@@ -29,7 +29,7 @@ model_list:
       # streaming + tool calls. (Blocker A — verify with a real smoke test.)
       use_chat_completions_api: true
     model_info:
-      tier: local
+      backend_tier: local
       # agent_capable is earned by the conformance harness, not asserted here.
       # Run: conformance/conformance.py --base-url $SPARK_A_API_BASE --model ...
       agent_capable: true
@@ -47,7 +47,7 @@ model_list:
       api_base: os.environ/FOUNDRY_ANTHROPIC_API_BASE   # .../services.ai.azure.com/anthropic
       api_key: os.environ/AZURE_API_KEY
     model_info:
-      tier: foundry
+      backend_tier: foundry
       agent_capable: true
 
   - model_name: claude-opus
@@ -56,7 +56,7 @@ model_list:
       api_base: os.environ/FOUNDRY_ANTHROPIC_API_BASE
       api_key: os.environ/AZURE_API_KEY
     model_info:
-      tier: foundry
+      backend_tier: foundry
       agent_capable: true
 
   # ---- Foundry: OpenAI / GPT family (Azure OpenAI Service) -----------------
@@ -69,7 +69,7 @@ model_list:
       api_key: os.environ/AZURE_OPENAI_API_KEY
       api_version: os.environ/AZURE_OPENAI_API_VERSION  # e.g. 2024-10-21
     model_info:
-      tier: foundry
+      backend_tier: foundry
       agent_capable: true
 
 router_settings:
