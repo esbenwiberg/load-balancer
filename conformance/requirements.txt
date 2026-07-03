@@ -1,0 +1,3 @@
+# Pin the OpenAI SDK; it's the only runtime dep. Responses API (client.responses)
+# landed in 1.66, and --api responses needs it.
+openai>=1.66,<2

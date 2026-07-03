@@ -61,10 +61,13 @@ model_list:
       api_version: "2024-10-21"                  # ⚠️ confirm
 
   # ---- Foundry: Anthropic family ----
-  - model_name: claude-opus                      # ⚠️ confirm Anthropic-on-Foundry wire fmt
+  # ✅ RESOLVED (docs/03 risk 5): Claude-on-Foundry = azure_ai/ + /anthropic base URL,
+  # keyed by AZURE_API_KEY, no api_version. NOT anthropic/ (that's Anthropic-direct).
+  - model_name: claude-opus
     litellm_params:
-      model: anthropic/claude-opus-4-8           # or azure_ai/… if served via Azure
-      api_key: os.environ/ANTHROPIC_API_KEY
+      model: azure_ai/<your-claude-opus-deployment>   # deployment name, not catalog id
+      api_base: os.environ/FOUNDRY_ANTHROPIC_API_BASE  # https://<res>.services.ai.azure.com/anthropic
+      api_key: os.environ/AZURE_API_KEY
 
 router_settings:
   # Spark unhealthy/busy/timeout → fall through to Foundry
@@ -99,9 +102,16 @@ base_url  = "http://litellm.internal:4000/v1"
 wire_api  = "responses"            # ⚠️ Codex dropped "chat"; MUST be responses
 # OPENAI_API_KEY / OPENAI_BASE_URL via env
 ```
-⚠️ **Blocker to verify first:** does LiteLLM's Responses endpoint fully bridge to a
-Chat-Completions Spark backend (streaming + tool calls)? If not, Codex→Spark is out for
-Phase 0; Codex→Foundry-OpenAI still works. (doc 03 risk 4, doc 04.)
+✅ **Blocker resolved (docs/03 risk 4):** LiteLLM *does* bridge Responses→Chat-Completions
+with streaming + tool calls — opt in with `use_chat_completions_api: true` on the Spark
+model entry (needs 1.83.x-stable). Confirmed from source, **not yet smoke-tested** — run the
+conformance harness through LiteLLM before trusting Codex→Spark. Codex→Foundry-OpenAI works
+regardless.
+
+> **The illustrative YAML above is superseded by the runnable, env-parameterised scaffold in
+> [`deploy/`](../deploy/) — `litellm-config.yaml`, `docker-compose.yaml`, `.env.example`,
+> `run.sh`, and `RUNBOOK.md`.** That scaffold has both blocker fixes wired in and pins a
+> vetted LiteLLM version. The conformance harness lives in [`conformance/`](../conformance/).
 
 ## Control-plane sketch (Phase 1+)
 
@@ -112,8 +122,12 @@ Router consults it and applies: *prefer warm + unsaturated + agent_capable Spark
 Foundry; never cold-swap on the interactive path.*
 
 ## Immediate next actions
-- [ ] Verify Codex Responses↔ChatCompletions bridge in LiteLLM (blocker).
-- [ ] Confirm Anthropic-on-Foundry wire format + LiteLLM provider entry.
-- [ ] Confirm real Spark inventory (boxes, pinned models, memory headroom).
-- [ ] Build the multi-tool **streaming** conformance test → sets `agent_capable` (doc 04).
+- [x] Verify Codex Responses↔ChatCompletions bridge in LiteLLM (blocker). → docs/03 risk 4:
+      YES via `use_chat_completions_api` (1.83.x-stable); live smoke test still pending.
+- [x] Confirm Anthropic-on-Foundry wire format + LiteLLM provider entry. → docs/03 risk 5:
+      `azure_ai/<deployment>` + `/anthropic` base; wired into `deploy/litellm-config.yaml`.
+- [ ] Confirm real Spark inventory (boxes, pinned models, memory headroom). **← needs a human**
+- [x] Build the multi-tool **streaming** conformance test → sets `agent_capable`. → `conformance/`.
 - [ ] Stand up Phase-0 LiteLLM with 1 Spark + Foundry fallback; drive Claude Code through it.
+      **← scaffold is ready in `deploy/`; needs the real Spark + Foundry values (RUNBOOK step 0).**
+- [ ] Smoke-test Codex→Spark end-to-end (streaming + parallel tools) via the harness through LiteLLM.

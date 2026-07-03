@@ -145,12 +145,18 @@ market leader routes *around* bad tool-callers rather than fixing them.
 - Normalize `finish_reason` and tool schemas centrally (LiteLLM) — one client contract.
 
 ## Open items
-- [ ] Verify LiteLLM's Anthropic↔OpenAI **and** Responses↔ChatCompletions tool mapping under
-      streaming, incl. parallel tool calls and `tool_choice`.
+- [~] Verify LiteLLM's Anthropic↔OpenAI **and** Responses↔ChatCompletions tool mapping under
+      streaming, incl. parallel tool calls and `tool_choice`. **Responses↔Chat mapping confirmed
+      from source (docs/03 risk 4): tool defs + `tool_choice` + tool-call output translated both
+      ways, streaming included. Still needs a live round-trip — run the conformance harness
+      through LiteLLM (not just direct at vLLM) to close it.**
 - [ ] Pin & validate the tool-call parser per Spark model (start: Qwen3-Coder → `qwen3_xml`).
-- [ ] Build the multi-tool streaming conformance test as the gate for `agent_capable`.
-- [ ] Decide client-by-client: is Codex→Spark viable given Responses-API tool bridging, or
-      Codex→Foundry-only initially?
+- [x] Build the multi-tool streaming conformance test as the gate for `agent_capable`.
+      **→ `conformance/` (README + `conformance.py` + offline `selftest.py`). Detects leaked/
+      malformed/unknown/runaway tool calls, emits pass/fail + tool_call_error_rate.**
+- [~] Decide client-by-client: is Codex→Spark viable given Responses-API tool bridging, or
+      Codex→Foundry-only initially? **Viable on paper via `use_chat_completions_api`
+      (docs/03 risk 4); gated on the smoke test above. Codex→Foundry-OpenAI works regardless.**
 
 ## Sources
 - [vLLM tool calling docs](https://docs.vllm.ai/en/stable/features/tool_calling/)
