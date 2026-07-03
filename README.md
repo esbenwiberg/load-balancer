@@ -32,6 +32,7 @@ is lost between sessions.
 | [docs/04-tool-calling.md](docs/04-tool-calling.md) | Why tool calls are make-or-break, and the 3 layers where they break. |
 | [docs/05-prior-art-github.md](docs/05-prior-art-github.md) | How others do it — `claude-code-router` (35k★) and friends. |
 | [docs/06-recommendation.md](docs/06-recommendation.md) | **The decision:** what to build, phased, with a Phase-0 config. |
+| [docs/07-next-session-prompt.md](docs/07-next-session-prompt.md) | Copy-paste handoff prompt to continue in a clean session. |
 
 ## The one-line takeaway so far
 
