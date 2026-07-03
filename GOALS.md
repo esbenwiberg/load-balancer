@@ -20,9 +20,14 @@ document reversible calls, when to stop) is defined once in
 - **At the keyboard → anything.** The § Needs-a-human goals require real infra,
   external sign-off, or an irreversible design decision that is *yours* to make.
 - Respect dependencies (noted per goal). Lower number ≈ higher priority / fewer
-  prerequisites.
+  prerequisites — but see **Current focus** below, which overrides raw numbering.
 - Blast radius today is "the repo" — nothing deploys from `main` yet. That's the
   standing assumption behind auto-merge (CLAUDE.md). Revisit when it changes.
+
+**Current focus (2026-07):** we are **not** taking in Spark workbenches yet.
+Priority is (a) completing the idea — control plane, observability — and
+(b) hardening the harness + test setup. Recommended order:
+1 → 2 → 6 → 7 → 8 → 3 → 9 → 4 → 5. Anything Spark-infra-shaped is parked.
 
 Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 [`docs/06`](docs/06-recommendation.md) (decision), [`docs/03`](docs/03-open-questions-and-risks.md) (risks).
@@ -59,8 +64,9 @@ the LiteLLM config captures per-request backend/latency/token/fallback data (log
 
 ### 4. Add a local-model (Ollama) e2e profile — risk: medium
 **Why:** [docs/08 decision 1](docs/08-e2e-testing.md) — the one thing the mock
-profile can't give is *real* tool-calling with no keys/ToS. Ollama serving a
-small coding model is the closest offline analog to a Spark workbench.
+profile can't give is *real* tool-calling with no keys/ToS. With Spark intake
+parked, Ollama serving a small coding model isn't just the closest analog to a
+workbench — it's the stand-in until real Sparks arrive.
 **Completion condition:**
 ```
 e2e has a documented 'local' profile (compose + config) running Ollama with a small coding model as the workbench, conformance.py can be pointed at it, the mock profile still passes e2e/run.sh, and it's merged to main
@@ -79,6 +85,50 @@ a minimal control-plane service exists (SQLite or Redis + a heartbeat interface)
 *Note: build the registry + state + tests only. Do NOT bake in the routing
 policy or session-stickiness rule — those are Needs-a-human decisions.*
 
+### 6. Exercise mockd's remaining fault modes + pin retry-vs-fallback order — risk: low
+**Why:** mockd can already inject 429, latency, count-limited transient faults,
+and malformed tool calls ([e2e/mockd.py](e2e/mockd.py)) — but `test_e2e.py`
+only ever uses a persistent 503. Worse, LiteLLM's retry-before-fallback order
+is unpinned: a config change could silently turn one backend fault into N
+duplicate upstream requests and nothing would catch it.
+**Completion condition:**
+```
+e2e/test_e2e.py has passing tests for (a) 429 -> fallback/cooldown behaviour, (b) a count-limited transient 5xx that documents whether LiteLLM retries the same backend before advancing the fallback chain, and (c) a malformed tool-call surfaced through the Responses bridge; the observed retry/fallback order is written into docs/03; e2e/run.sh is green; and it's merged to main
+```
+*Note: overlaps goal 2 (hangup) — fine to tackle together in one PR, but the
+conditions are checked independently.*
+
+### 7. Tool-calling coverage on the Anthropic surface — risk: medium
+**Why:** Claude Code's real path is `/v1/messages` **with tools**, streaming.
+e2e only proves plain-text translation there; the conformance harness speaks
+`chat` and `responses` but has no `anthropic` transport. Our single biggest
+client path has no tool-call gate at all.
+**Completion condition:**
+```
+conformance.py gains an --api anthropic transport (or e2e gains an equivalent full read->edit->bash tool round-trip over streaming /v1/messages), it passes through the gateway against mockd, run.sh executes it as part of the suite, e2e/run.sh is green, and it's merged to main
+```
+*Note: mockd needs no changes — the gateway translates anthropic→chat toward
+the backend. The new transport targets the gateway's `/v1/messages`.*
+
+### 8. Harness self-checks + guardrail automation — risk: low
+**Why:** run.sh only tests *through* the gateway, so a mockd regression is
+indistinguishable from a gateway regression. And the LiteLLM digest pin
+([docs/03 risk 8](docs/03-open-questions-and-risks.md) — the malware one) is a
+hard guardrail enforced only by eyeball.
+**Completion condition:**
+```
+run.sh gains a mockd-direct conformance step (isolates mockd regressions from gateway regressions), e2e gains negative-path tests (malformed JSON body and unknown model alias -> clean 4xx, no hang), CI fails if the LiteLLM image tag/digest deviates from the vetted pin, e2e/run.sh is green, and it's merged to main
+```
+
+### 9. Concurrency smoke — parallel streams must not cross-talk — risk: low
+**Why:** every e2e test runs serially, but the gateway's whole job is serving
+concurrent agents. A cross-request bleed (wrong `served_model` stamp,
+interleaved SSE chunks) would be catastrophic and is currently invisible.
+**Completion condition:**
+```
+an e2e test fires concurrent streaming requests across different model aliases with a fault injected on one of them, asserts every response carries the correct served_model stamp and terminates its stream cleanly, e2e/run.sh is green, and it's merged to main
+```
+
 ---
 
 ## § Needs-a-human (do NOT run unattended)
@@ -87,7 +137,8 @@ These block on real infra, external sign-off, or an irreversible call. Bring
 them up when you're present; several become autonomy-friendly *after* the
 decision is made.
 
-- **Real Spark inventory** ([RUNBOOK step 0](deploy/RUNBOOK.md)) — needs actual
+- **Real Spark inventory** ([RUNBOOK step 0](deploy/RUNBOOK.md)) — ⏸ **parked**:
+  we're not taking in Spark workbenches yet (see Current focus). Needs actual
   boxes, pinned models, memory headroom, vLLM tool-call parser. Infra.
 - **Data-governance sign-off with DISCO** ([docs/03 risk 10](docs/03-open-questions-and-risks.md))
   — is Foundry OK for the intended work; residency/retention. External.
