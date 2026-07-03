@@ -38,7 +38,7 @@ document reversible calls, when to stop) is defined once in
 **Current focus (2026-07):** we are **not** taking in Spark workbenches yet.
 Priority is (a) completing the idea — control plane, observability, dashboard —
 and (b) hardening the harness + test setup. Recommended order:
-harness core (1 → 2 → 6 → 7 → 8 → 9) → dev stack (10) → observability +
+harness core (0 → 1 → 2 → 6 → 7 → 8 → 9) → dev stack (10) → observability +
 wallet guards (3 → 11 → 11b) → dashboard v1 (12) → Ollama (4) → control plane
 (5) → dashboard v2 (13) → Azure IaC (14). Spark-infra-shaped work is parked.
 
@@ -48,6 +48,20 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 ---
 
 ## § Autonomy-friendly (safe to run unattended)
+
+### 0. One check script + githooks + agent self-validation — risk: low
+**Why:** today the only arbiter is `e2e/run.sh`, which costs a full docker
+stack — there is nothing between "save file" and a multi-minute e2e run, so
+agents get zero cheap feedback and the no-secrets guardrail is enforced by
+vibes. One `scripts/check.sh` that hooks, CI (goal 1), and agents all call
+means the definition of "green" can never drift between them.
+**Completion condition:**
+```
+scripts/check.sh exists with a --fast tier (ruff lint+format, shellcheck, docker compose config validation for all compose files, conformance/selftest.py, gitleaks secret scan — no docker containers) and a full tier that adds e2e/run.sh; checked-in .githooks/pre-commit runs the fast tier via a scripts/setup-dev.sh that sets core.hooksPath and reports missing tools; a Claude Code Stop hook in .claude/settings.json runs the fast tier; missing tools warn-and-skip locally but the script hard-fails on real findings; both tiers pass on the repo's current HEAD; and it's merged to main
+```
+*Note: NO docker in any git hook — slow hooks train everyone to `--no-verify`.
+Full e2e stays the merge gate (CI, goal 1), not the commit gate. Goal 1's
+workflow should call this script rather than duplicating the steps.*
 
 ### 1. Wire the e2e harness into CI — risk: low
 **Why:** `e2e/run.sh` is exit-code clean but nothing runs it automatically; a
@@ -251,5 +265,14 @@ decision is made.
 
 ## Done
 
+**How to mark a goal complete** (do this in the same PR that finishes it):
+1. *Delete* the goal's entry from its section above — don't leave a tombstone.
+2. Add one line here: `- ✅ <goal number + title> — PR #<n> (<yyyy-mm>)`, plus
+   any follow-up goals discovered, added above as new numbered entries.
+3. The completion condition itself is the tag: a goal is "complete" only when
+   its condition literally holds on `main` — if in doubt, re-check it, don't
+   trust the checkmark.
+
 - ✅ Phase-0 groundwork (blockers A & B, conformance harness, deploy scaffold) — PR #1
 - ✅ E2E test harness (mock + cli-auth profiles) — PR #2
+- ✅ Goal-driven workflow (GOALS.md backlog + unattended contract) — PR #3
