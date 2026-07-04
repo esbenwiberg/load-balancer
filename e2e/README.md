@@ -5,7 +5,8 @@ Test the balancer (the LiteLLM gateway now; router + control plane later) with
 
 | Profile | Backends | Proves | Cost / deps |
 |---|---|---|---|
-| **mock** (default, CI) | `mockd` — a controllable fake speaking OpenAI Chat + Responses | protocol translation, the Responses bridge, fallback, cooldown, virtual-key scoping, streaming | free, offline, deterministic |
+| **mock** (default, CI) | ONE `mockd` — a controllable fake speaking OpenAI Chat + Responses, serving every alias | protocol translation, the Responses bridge, fallback, cooldown, virtual-key scoping, streaming | free, offline, deterministic |
+| **dev** (standing fixture) | THREE `mockd` containers — two distinct workbench slots + a mock-Foundry, each stamping its own instance identity | the full local topology as a leave-it-running dev target you point a real client at; per-instance load/faults | free, offline; stays up until torn down |
 | **cli-auth** (opt-in, manual) | REAL hosted models — Haiku as the "workbench", bigger models as "Foundry" | the real Claude Code / Codex client path end-to-end | needs API keys; hits the internet |
 
 Both leave the **system under test** — the gateway + its config — identical to
@@ -89,6 +90,122 @@ found).
 
 ---
 
+## Profile: dev — the standing self-validation fleet (goal 10)
+
+The mock profile above is a CI gate: one `mockd`, up → test → **down**. The **dev
+profile** is a *leave-it-running* fixture — the gateway in front of **three
+distinct mock containers** — so an agent building features (or a real Claude
+Code / Codex) can point at it, iterate, and inject per-instance faults. It's the
+local miniature of the endgame topology.
+
+```bash
+cd e2e
+docker compose -f docker-compose.dev.yaml up -d      # bring up, stays up
+./dev_smoke.sh                                        # prove all 3 surfaces route
+docker compose -f docker-compose.dev.yaml down -v     # explicit teardown
+```
+
+Topology (`docker-compose.dev.yaml`):
+
+| Service | Host port | Instance identity | Role |
+|---|---|---|---|
+| `litellm` | `:4000` | — | the gateway (SUT, same config shape as `deploy/`) |
+| `workbench-a` | `:9101` | `workbench-a` | a Spark workbench slot (`qwen3-coder-a`) |
+| `workbench-b` | `:9102` | `workbench-b` | a second, distinct workbench slot (`qwen3-coder-b`) |
+| `foundry` | `:9103` | `mock-foundry` | the always-up fallback tier (`claude-sonnet` / `claude-opus` / `gpt`) |
+| `db` | (internal) | — | Postgres — the virtual-key store |
+
+Each `mockd` sets a distinct `MOCKD_INSTANCE`, so its reply stamps
+`served_model=<model>@<instance>` — that's how you tell two otherwise-identical
+containers apart. The single-mockd mock profile leaves `MOCKD_INSTANCE` unset, so
+its stamp stays the bare `served_model=<model>` the CI suite asserts.
+
+**`dev_smoke.sh`** mints a scoped virtual key, then drives **all three client
+surfaces** through the gateway, each to a *different* container, and asserts the
+instance stamp:
+
+- Anthropic `/v1/messages` (streaming, Claude Code's path) → `qwen3-coder-a` → `workbench-a`
+- OpenAI `/v1/chat/completions` → `qwen3-coder-b` → `workbench-b`
+- OpenAI `/v1/responses` (Codex's path, via the bridge) → `claude-sonnet` → `mock-foundry`
+
+Each host-published `mockd` port (`:9101/2/3`) takes `/__control` independently,
+so you can fault **one** instance and watch the gateway fall back while the
+other stays up:
+
+```bash
+curl localhost:9101/__control -d '{"model":"*","status":503}'  # fault workbench-a only
+curl localhost:9101/v1/chat/completions -d '{"model":"qwen3-coder-a","messages":[{"role":"user","content":"hi"}]}'  # -> 503
+curl localhost:9102/v1/chat/completions -d '{"model":"qwen3-coder-b","messages":[{"role":"user","content":"hi"}]}'  # -> 200 (unaffected)
+curl -X POST localhost:9101/__reset                             # clear it
+```
+
+### Point a real client at the dev stack
+
+The gateway is OpenAI- **and** Anthropic-compatible on `:4000`. First mint a key
+(or use the master key `sk-dev-master-test-key` directly — test-only, not a
+secret):
+
+```bash
+MASTER=sk-dev-master-test-key    # test-only default, not a secret
+KEY=$(curl -s -X POST localhost:4000/key/generate \
+  -H "Authorization: Bearer $MASTER" -H "Content-Type: application/json" \
+  -d '{"models":["qwen3-coder-a","qwen3-coder-b","claude-sonnet","claude-opus","gpt"],"user_id":"me"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['key'])")
+```
+
+**Claude Code** → the Anthropic surface:
+
+```bash
+ANTHROPIC_BASE_URL="http://localhost:4000" \
+ANTHROPIC_AUTH_TOKEN="$KEY" \
+ANTHROPIC_MODEL="qwen3-coder-a" \
+  claude -p "Reply with exactly: PONG"
+```
+
+**Codex** → the OpenAI Responses surface (Codex speaks `/v1/responses`, bridged
+to the mock chat backend via `use_chat_completions_api`):
+
+```bash
+OPENAI_BASE_URL="http://localhost:4000/v1" \
+OPENAI_API_KEY="$KEY" \
+  codex exec --model claude-sonnet "Reply with exactly: PONG"
+```
+
+Against the default (keyless, offline) dev stack a real client gets mockd's
+canned stamp back, not a model's reasoning — enough to confirm the *plumbing*
+(auth, routing, translation, streaming) works. For real model output, use the
+haiku variant below.
+
+### Variant: one workbench slot backed by real Haiku (NOT the default)
+
+The default dev stack is **keyless and offline** — every backend is a `mockd`.
+If you want one slot to return *real* model output (a closer stand-in for a Spark
+until real ones arrive), back it with Haiku via the existing cli-auth borrow —
+this is a **documented option, deliberately not the default**, because it needs a
+real key and hits the internet (org data-governance applies — synthetic prompts
+only, Context& / Delegate / Projectum / Consit work, in doubt → DISCO):
+
+```bash
+./borrow_creds.sh     # discover a clean ANTHROPIC_API_KEY -> .env.cliauth (gitignored)
+```
+
+Then run the **cli-auth** profile below (its `haiku` alias is real Haiku). The
+dev stack stays the keyless default; the cli-auth stack is the real-model path.
+Keeping the two separate is deliberate: the default must never need a key or the
+network, so an unattended run can always bring the fleet up.
+
+### Load-balanced workbench alias — a future knob
+
+The two workbenches are given **distinct** aliases (`qwen3-coder-a` /
+`qwen3-coder-b`) pinned one-to-one to a container, so each is individually
+addressable — the point of goal 10 is to *tell instances apart* and fault them
+independently. LiteLLM also supports one `model_name` with *two* deployments for
+real load-balancing; that hides which instance served (bad for the smoke) but is
+the right shape once the control plane (goal 5) drives placement. Add it as a
+third deployment in `litellm-config.dev.yaml` when that lands.
+
+---
+
 ## Profile: cli-auth (real models, opt-in)
 
 Drive **real** Claude Code / Codex through the balancer, with a small model
@@ -149,13 +266,17 @@ data** through it. Keep smoke prompts synthetic. If in doubt → **DISCO**.
 ## Files
 
 ```
-mockd.py                     controllable mock backend (stdlib, no deps)
-litellm-config.e2e.yaml      mock-profile gateway config (all aliases -> mockd)
+mockd.py                     controllable mock backend (stdlib, no deps; MOCKD_INSTANCE stamps identity)
+litellm-config.e2e.yaml      mock-profile gateway config (all aliases -> one mockd)
 docker-compose.e2e.yaml      mock stack: litellm + mockd + postgres
 test_e2e.py                  raw-HTTP pytest suite (the CI driver)
 run.sh                       up -> test -> conformance gate -> teardown
 requirements.txt             test-driver deps (httpx, pytest, openai)
 .env.e2e.example             mock-profile env (test-only, safe to commit)
+
+litellm-config.dev.yaml      dev-profile config (workbench-a/-b + foundry, distinct instances)
+docker-compose.dev.yaml      dev stack: litellm + 2 workbenches + foundry + postgres (stays up)
+dev_smoke.sh                 dev-profile smoke: all 3 surfaces -> 3 distinct containers
 
 litellm-config.cliauth.yaml  cli-auth gateway config (real providers, env-keyed)
 docker-compose.cliauth.yaml  cli-auth stack: litellm + postgres (no mockd)

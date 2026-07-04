@@ -89,18 +89,6 @@ isn't (see § Needs-a-human).
 a minimal control-plane service exists (SQLite or Redis + a heartbeat interface) exposing per-model {warm, in_flight, healthy, agent_capable}; it has unit tests that pass, with the passing output surfaced in the conversation; its open design decisions are documented in a new docs file; hard constraint: build the registry + state + tests ONLY — do NOT implement the routing policy or session-stickiness rule, those are Needs-a-human decisions; e2e/run.sh exits 0 with its passing output surfaced; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 40 turns and leave a draft PR describing the decision needed
 ```
 
-### 10. Dev-mode stack — the self-validation fleet — risk: low
-**Why:** the endgame's harness. Agents building features must be able to spin
-up the full topology locally — gateway + **two separate mock workbench
-containers** + a **mock-Foundry container** — leave it running, and point a
-real client at it. Today the e2e compose runs ONE mockd serving every alias:
-you can't tell instances apart, exercise per-instance load/faults, or use it
-as a standing dev fixture.
-**Completion condition:**
-```
-a documented dev profile brings up the gateway plus two distinct mock workbench containers and a mock-foundry container (each stamping its own instance identity in served_model), staying up until explicitly torn down; a smoke script proves all three client surfaces (anthropic messages, chat completions, responses) route through it, with its passing output surfaced in the conversation; the README documents how to point Claude Code and Codex at it (base url + key); constraint: a variant where one workbench slot is backed by real haiku via the existing cli-auth borrow (e2e/borrow_creds.sh) is documented but is NOT the default — the default stays keyless and offline; e2e/run.sh exits 0 with its passing output surfaced; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 50 turns and leave a draft PR describing the decision needed
-```
-
 ### 11. Budgets + rate limits per virtual key — vacation-proof the wallet — risk: low
 **Why:** unattended goal runs + (eventually) a hosted endpoint = runaway-spend
 risk, and the whole point is burning *subscription*, not invoice. LiteLLM
@@ -210,3 +198,4 @@ decision is made.
 - ✅ 7. Tool-calling coverage on the Anthropic surface (`conformance.py --api anthropic`: /v1/messages tools+streaming, full read→edit→bash round-trip + probes, wired into run.sh) — PR #14 (2026-07)
 - ✅ 8. Harness self-checks + guardrail automation (mockd-direct conformance step in run.sh; negative-path e2e tests — malformed JSON + unknown alias → clean 4xx on all three surfaces; LiteLLM image-pin guard in check.sh enforced by pre-commit/Stop/CI) — PR #15 (2026-07)
 - ✅ 9. Concurrency smoke — parallel streams across 4 aliases with a 503-fault forcing a fallback mid-fleet; asserts each response keeps its own served_model stamp (no cross-request bleed) + clean stream termination, plus a mixed chat/responses/messages variant for interleaved-SSE-across-protocols — PR #16 (2026-07)
+- ✅ 10. Dev-mode stack — standing dev profile (docker-compose.dev.yaml): gateway + two distinct mock workbench containers (workbench-a/-b) + mock-foundry, each stamping served_model=<model>@<instance>; dev_smoke.sh proves all 3 surfaces (messages/chat/responses) route to distinct containers; per-instance /__control faults; README wires Claude Code + Codex; real-haiku variant documented but keyless-offline stays default — PR #17 (2026-07)

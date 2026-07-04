@@ -1,0 +1,111 @@
+# =============================================================================
+# DEV-STACK LiteLLM config (goal 10) — the standing self-validation fleet.
+#
+# Unlike litellm-config.e2e.yaml (ONE mockd serving every alias, for the CI
+# gate), this fronts THREE distinct mock backends so you can tell instances
+# apart, drive per-instance load/faults, and leave it up as a dev fixture:
+#
+#   workbench-a   (mockd, MOCKD_INSTANCE=workbench-a)   -> a "Spark" slot
+#   workbench-b   (mockd, MOCKD_INSTANCE=workbench-b)   -> a second "Spark" slot
+#   foundry       (mockd, MOCKD_INSTANCE=mock-foundry)  -> the always-up tier
+#
+# Each stamps its identity into served_model (served_model=<model>@<instance>),
+# so a client can prove WHICH container answered — the thing the single-mockd
+# profile can't show.
+#
+# DESIGN CALL (reversible — documented per CLAUDE.md): the two workbenches get
+# DISTINCT addressable aliases (qwen3-coder-a / qwen3-coder-b) pinned one-to-one
+# to a container, rather than one load-balanced `qwen3-coder` with two
+# deployments. Why: the whole point of goal 10 is to *tell instances apart* and
+# *exercise per-instance faults* — that needs each container individually
+# addressable and deterministic. A load-balanced alias hides which instance
+# served, which is exactly what we're trying to escape. (A load-balanced alias
+# is a documented future knob in README > dev profile.)
+#
+# Same deliberate simplification as the e2e config: every backend is reached via
+# the `openai/` provider against mockd's OpenAI-compatible surface, including the
+# claude-* aliases. The azure_ai/ Anthropic BACKEND wire format is validated only
+# against real Foundry (deploy/RUNBOOK.md); what this exercises is the balancer's
+# own CLIENT-side translation + fallback + routing, which is provider-agnostic.
+# =============================================================================
+
+model_list:
+  # ---- Workbench slot A (a Spark stand-in on its own container) ------------
+  - model_name: qwen3-coder-a
+    litellm_params:
+      model: openai/qwen3-coder-a
+      api_base: http://workbench-a:9100/v1
+      api_key: dummy
+      # Bridge /v1/responses (Codex path) down to the chat surface.
+      use_chat_completions_api: true
+    model_info:
+      backend_tier: local
+      instance: workbench-a
+      agent_capable: true
+
+  # ---- Workbench slot B (a SECOND, distinct Spark stand-in) ----------------
+  - model_name: qwen3-coder-b
+    litellm_params:
+      model: openai/qwen3-coder-b
+      api_base: http://workbench-b:9100/v1
+      api_key: dummy
+      use_chat_completions_api: true
+    model_info:
+      backend_tier: local
+      instance: workbench-b
+      agent_capable: true
+
+  # ---- Foundry stand-ins (the always-up fallback tier, one container) ------
+  - model_name: claude-sonnet
+    litellm_params:
+      model: openai/claude-sonnet
+      api_base: http://foundry:9100/v1
+      api_key: dummy
+      use_chat_completions_api: true
+    model_info:
+      backend_tier: foundry
+      instance: mock-foundry
+      agent_capable: true
+
+  - model_name: claude-opus
+    litellm_params:
+      model: openai/claude-opus
+      api_base: http://foundry:9100/v1
+      api_key: dummy
+      use_chat_completions_api: true
+    model_info:
+      backend_tier: foundry
+      instance: mock-foundry
+      agent_capable: true
+
+  - model_name: gpt
+    litellm_params:
+      model: openai/gpt
+      api_base: http://foundry:9100/v1
+      api_key: dummy
+      use_chat_completions_api: true
+    model_info:
+      backend_tier: foundry
+      instance: mock-foundry
+      agent_capable: true
+
+router_settings:
+  # Both workbench slots fall through to the Foundry tier, Anthropic family
+  # first (tool-call format consistency), GPT last — same shape as prod/e2e.
+  fallbacks:
+    - qwen3-coder-a: ["claude-sonnet", "claude-opus", "gpt"]
+    - qwen3-coder-b: ["claude-sonnet", "claude-opus", "gpt"]
+    - claude-sonnet: ["claude-opus"]
+  num_retries: 1
+  timeout: 30
+  # Standing dev fixture: keep prod-like cooldown so you can watch a faulted
+  # workbench get parked and fall back, then recover. (The e2e profile disables
+  # cooldown for serial-test determinism; the dev stack is poked by hand.)
+  allowed_fails: 2
+  cooldown_time: 30
+
+litellm_settings:
+  drop_params: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

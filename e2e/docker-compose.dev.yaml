@@ -1,0 +1,126 @@
+# =============================================================================
+# DEV STACK (goal 10) — the standing self-validation fleet. Unlike the e2e
+# stack (ONE mockd, up-test-down), this brings up the gateway in front of THREE
+# distinct mock backends and STAYS UP until you tear it down, so an agent
+# building features (or a real Claude Code / Codex) can point at it and iterate.
+#
+#   docker compose -f docker-compose.dev.yaml up -d      # bring up, detached
+#   ./dev_smoke.sh                                        # prove all 3 surfaces
+#   docker compose -f docker-compose.dev.yaml down -v     # explicit teardown
+#
+# Topology:
+#   :4000  litellm gateway   — clients + dev_smoke.sh hit this (SUT, unchanged)
+#   :9101  workbench-a        — mockd, instance "workbench-a"  (a Spark slot)
+#   :9102  workbench-b        — mockd, instance "workbench-b"  (2nd Spark slot)
+#   :9103  foundry            — mockd, instance "mock-foundry" (always-up tier)
+#   db     postgres           — LiteLLM virtual-key store (in-network only)
+#
+# Each mockd is host-published on a DISTINCT port so you can drive /__control at
+# one instance without touching the others (per-instance faults). The gateway
+# reaches them in-network by service name (workbench-a:9100, etc.).
+# =============================================================================
+
+x-mockd: &mockd
+  # Stdlib-only daemon: any modern python image works, no pip install. The three
+  # workbench/foundry services share this base and differ only by MOCKD_INSTANCE.
+  image: python:3.12-slim
+  working_dir: /app
+  volumes:
+    - ./mockd.py:/app/mockd.py:ro
+  command: ["python", "mockd.py"]
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: litellm-dev-db
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: litellm
+      POSTGRES_DB: litellm
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  workbench-a:
+    <<: *mockd
+    container_name: dev-workbench-a
+    environment:
+      MOCKD_PORT: "9100"
+      MOCKD_HOST: "0.0.0.0"
+      MOCKD_INSTANCE: "workbench-a"
+      MOCKD_DEBUG: "${MOCKD_DEBUG:-}"
+    ports:
+      - "9101:9100"        # host-published so you can drive /__control per-instance
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9100/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
+  workbench-b:
+    <<: *mockd
+    container_name: dev-workbench-b
+    environment:
+      MOCKD_PORT: "9100"
+      MOCKD_HOST: "0.0.0.0"
+      MOCKD_INSTANCE: "workbench-b"
+      MOCKD_DEBUG: "${MOCKD_DEBUG:-}"
+    ports:
+      - "9102:9100"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9100/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
+  foundry:
+    <<: *mockd
+    container_name: dev-foundry
+    environment:
+      MOCKD_PORT: "9100"
+      MOCKD_HOST: "0.0.0.0"
+      MOCKD_INSTANCE: "mock-foundry"
+      MOCKD_DEBUG: "${MOCKD_DEBUG:-}"
+    ports:
+      - "9103:9100"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9100/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
+  litellm:
+    # Same pinned, vetted image as deploy/ + e2e/ (docs/03 risk 8 — never
+    # 1.82.7/1.82.8). The check.sh pin guard enforces this exact tag.
+    image: ghcr.io/berriai/litellm:v1.83.14-stable
+    container_name: litellm-dev
+    depends_on:
+      workbench-a:
+        condition: service_healthy
+      workbench-b:
+        condition: service_healthy
+      foundry:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./litellm-config.dev.yaml:/app/config.yaml:ro
+    environment:
+      # Test-only master key — NOT a secret. Overridable via .env.e2e / your env.
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-dev-master-test-key}"
+      DATABASE_URL: "postgresql://litellm:litellm@db:5432/litellm"
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
