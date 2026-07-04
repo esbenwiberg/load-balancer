@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
@@ -601,3 +602,208 @@ def test_streaming_chat_integrity():
             chunks.append(data)
     assert len(chunks) >= 1, "expected at least one streamed chunk"
     assert saw_done, "stream did not terminate with [DONE]"
+
+
+# --- concurrency: parallel streams must not cross-talk (goal 9) --------------
+#
+# Every other test runs serially, but the gateway's whole job is serving
+# concurrent agents. Two catastrophic-but-invisible bugs live here:
+#   1. a WRONG served_model stamp — request A's backend identity bleeding into
+#      request B's response (per-request router/translation state shared across
+#      workers or coroutines);
+#   2. INTERLEAVED SSE — chunks from two open streams spliced into one wire.
+# The gateway runs with --num_workers 2 (see docker-compose.e2e.yaml), so these
+# requests genuinely fan out across worker processes, which is exactly where
+# such state bleed would hide. A fault is injected on ONE alias so a fallback
+# hop happens IN THE MIDDLE of the concurrent fleet: if fallback leaked state,
+# a sibling stream would pick up the Foundry-tier stamp.
+
+# The full set of backend stamps mockd can emit. Used to prove NO foreign stamp
+# bleeds into a response that didn't ask for it.
+ALL_SERVED = ("qwen3-coder", "claude-sonnet", "claude-opus", "gpt")
+
+
+def _stream_chat(alias):
+    """Drive one streaming chat completion to completion. Returns
+    (status, served_text, done_seen). served_text is the concatenated content,
+    which carries mockd's `served_model=<backend>` stamp."""
+    text, done_seen, status = "", False, None
+    with httpx.stream(
+        "POST",
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": alias,
+            "stream": True,
+            "messages": [{"role": "user", "content": "ping"}],
+        },
+        timeout=TIMEOUT,
+    ) as resp:
+        status = resp.status_code
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            data = line[len("data: ") :] if line.startswith("data: ") else line
+            if data.strip() == "[DONE]":
+                done_seen = True
+                continue
+            try:
+                ev = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            for ch in ev.get("choices", []):
+                text += (ch.get("delta", {}) or {}).get("content") or ""
+    return status, text, done_seen
+
+
+def _assert_clean_stamped(alias, expected, status, text, done_seen):
+    """Every concurrent response must: be a 200, terminate cleanly with [DONE],
+    carry EXACTLY its own expected backend stamp, and carry NO foreign stamp."""
+    assert status == 200, "%s: expected 200, got %s" % (alias, status)
+    assert done_seen, "%s: stream did not terminate cleanly with [DONE]" % alias
+    assert ("served_model=%s" % expected) in text, (
+        "%s: wrong/absent served_model stamp — expected %s, got: %r"
+        % (alias, expected, text)
+    )
+    for other in ALL_SERVED:
+        if other == expected:
+            continue
+        assert ("served_model=%s" % other) not in text, (
+            "%s: FOREIGN stamp %s bled into this response — concurrent "
+            "cross-talk. Got: %r" % (alias, other, text)
+        )
+
+
+def test_concurrent_chat_streams_no_crosstalk():
+    """Fire a fleet of concurrent streaming requests across FOUR distinct model
+    aliases, with a persistent 503 on qwen3-coder so its requests fall back to
+    claude-sonnet mid-fleet. Assert every response carries the correct
+    served_model stamp (the backend that actually answered — the fallback target
+    for the faulted alias, itself for the rest), no foreign stamp bled in, and
+    every stream terminated cleanly with [DONE].
+
+    This is the goal-9 smoke: the discriminator is that four different backends
+    answer at once and their identity stamps must not swap. If per-request state
+    were shared across the two gateway workers, a claude-opus request could come
+    back stamped qwen3-coder (or vice-versa) and this goes red.
+    """
+    _inject({"model": "qwen3-coder", "status": 503})  # persistent -> fallback
+
+    # (requested alias, backend expected to actually serve it). qwen3-coder is
+    # faulted so it falls back to the first Foundry-tier entry, claude-sonnet;
+    # the others serve themselves. Repeated to raise contention across workers.
+    fleet = [
+        ("qwen3-coder", "claude-sonnet"),
+        ("claude-sonnet", "claude-sonnet"),
+        ("claude-opus", "claude-opus"),
+        ("gpt", "gpt"),
+    ] * 3  # 12 concurrent streams
+
+    with ThreadPoolExecutor(max_workers=len(fleet)) as ex:
+        results = list(ex.map(lambda pair: _stream_chat(pair[0]), fleet))
+
+    for (alias, expected), (status, text, done_seen) in zip(fleet, results):
+        _assert_clean_stamped(alias, expected, status, text, done_seen)
+
+
+# --- cross-surface concurrency: interleaved SSE across protocols -------------
+
+
+def _stream_responses(alias):
+    """Drive one streaming /v1/responses (Codex bridge). Clean termination is
+    response.completed (LiteLLM's Responses terminator)."""
+    text, done_seen, status = "", False, None
+    with httpx.stream(
+        "POST",
+        GATEWAY + "/v1/responses",
+        headers=AUTH,
+        json={
+            "model": alias,
+            "stream": True,
+            "input": [{"role": "user", "content": "ping"}],
+        },
+        timeout=TIMEOUT,
+    ) as resp:
+        status = resp.status_code
+        for line in resp.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            data = line[len("data: ") :].strip()
+            if data == "[DONE]":
+                continue
+            try:
+                ev = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "response.output_text.delta":
+                text += ev.get("delta", "") or ""
+            elif ev.get("type") == "response.completed":
+                done_seen = True
+    return status, text, done_seen
+
+
+def _stream_anthropic(alias):
+    """Drive one streaming /v1/messages (Claude Code's native surface). Clean
+    termination is the message_stop event."""
+    text, done_seen, status = "", False, None
+    with httpx.stream(
+        "POST",
+        GATEWAY + "/v1/messages",
+        headers={**AUTH, "anthropic-version": "2023-06-01"},
+        json={
+            "model": alias,
+            "max_tokens": 128,
+            "stream": True,
+            "messages": [{"role": "user", "content": "ping"}],
+        },
+        timeout=TIMEOUT,
+    ) as resp:
+        status = resp.status_code
+        for line in resp.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            data = line[len("data: ") :].strip()
+            if data == "[DONE]":
+                continue
+            try:
+                ev = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            t = ev.get("type")
+            if t == "content_block_delta":
+                text += ev.get("delta", {}).get("text", "") or ""
+            elif t == "message_stop":
+                done_seen = True
+    return status, text, done_seen
+
+
+def test_concurrent_mixed_surface_streams_no_crosstalk():
+    """The nastier variant: all THREE client surfaces streaming at once, each
+    asking for a different alias, with the fault still on qwen3-coder. This is
+    the interleaved-SSE-across-protocols probe — an Anthropic content_block_delta
+    must never end up spliced into a Responses or Chat stream, and every surface
+    must still deliver its own backend's stamp and its own clean terminator.
+
+    Each (surface, alias) pair is fired concurrently and repeated so multiple
+    streams of each protocol are open simultaneously.
+    """
+    _inject({"model": "qwen3-coder", "status": 503})  # persistent -> fallback
+
+    # (drain fn, requested alias, expected served backend)
+    jobs = [
+        (_stream_chat, "claude-opus", "claude-opus"),
+        (_stream_responses, "gpt", "gpt"),
+        (_stream_anthropic, "claude-sonnet", "claude-sonnet"),
+        (_stream_chat, "qwen3-coder", "claude-sonnet"),  # faulted -> fallback
+        (_stream_responses, "claude-opus", "claude-opus"),
+        (_stream_anthropic, "gpt", "gpt"),
+    ] * 2  # 12 concurrent streams, mixed across the three surfaces
+
+    with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        results = list(ex.map(lambda j: j[0](j[1]), jobs))
+
+    for (fn, alias, expected), (status, text, done_seen) in zip(jobs, results):
+        surface = fn.__name__.replace("_stream_", "")
+        _assert_clean_stamped(
+            "%s[%s]" % (surface, alias), expected, status, text, done_seen
+        )
