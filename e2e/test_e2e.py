@@ -572,6 +572,94 @@ def test_missing_auth_rejected():
     assert r.status_code in (401, 403), r.text
 
 
+# --- budgets + rate limits (goal 11) -----------------------------------------
+# Config defaults live in litellm-config.e2e.yaml -> litellm_settings.
+# default_key_generate_params. Keep these mirrored with that file.
+DEFAULT_MAX_BUDGET = 100.0
+DEFAULT_RPM_LIMIT = 60
+DEFAULT_TPM_LIMIT = 200000
+
+_CHAT = {"model": "qwen3-coder", "messages": [{"role": "user", "content": "ping"}]}
+
+
+def _generate_key(**params):
+    """Mint a virtual key via the master key; return (key_string, full_response)."""
+    r = httpx.post(
+        GATEWAY + "/key/generate", headers=AUTH, json=params, timeout=TIMEOUT
+    )
+    assert r.status_code == 200, "key/generate failed: " + r.text
+    return r.json()["key"], r.json()
+
+
+def test_issued_key_inherits_default_budget_and_limits():
+    """The wallet guardrail: a key minted with NO budget/limit fields must still
+    come back carrying the config defaults (default_key_generate_params). This is
+    the 'every key the gateway issues gets a default' half of goal 11 — without
+    it, a bare /key/generate would mint an unlimited key and the backstop leaks.
+    """
+    _, resp = _generate_key(models=["qwen3-coder"], user_id="e2e-default-budget")
+    assert resp.get("max_budget") == DEFAULT_MAX_BUDGET, (
+        "issued key missing default max_budget: %r" % resp.get("max_budget")
+    )
+    assert resp.get("rpm_limit") == DEFAULT_RPM_LIMIT, (
+        "issued key missing default rpm_limit: %r" % resp.get("rpm_limit")
+    )
+    assert resp.get("tpm_limit") == DEFAULT_TPM_LIMIT, (
+        "issued key missing default tpm_limit: %r" % resp.get("tpm_limit")
+    )
+
+
+def test_over_budget_key_refused_clean_4xx():
+    """An over-budget key is refused with a clean 4xx — no hang, no 5xx.
+
+    Uses an explicit max_budget:0 key so the `spend >= max_budget` gate trips on
+    the FIRST request (0 >= 0), which is deterministic: it needs neither async
+    spend-flush nor a costed model, both of which would make a CI gate flaky.
+    An explicit value overrides the config default, so the guardrail's plumbing
+    (config default) and its teeth (this refusal) are proven independently.
+    """
+    key, _ = _generate_key(
+        models=["qwen3-coder"], max_budget=0, user_id="e2e-over-budget"
+    )
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers={"Authorization": "Bearer " + key},
+        json=_CHAT,
+        timeout=TIMEOUT,  # a hang would raise ReadTimeout -> test fails, not stalls
+    )
+    assert 400 <= r.status_code < 500, (
+        "over-budget key must get a clean 4xx, got %s: %s" % (r.status_code, r.text)
+    )
+    assert "budget" in r.text.lower(), "expected a budget-exceeded reason: " + r.text
+
+
+def test_over_rate_limit_key_refused_clean_4xx():
+    """An over-rate-limit key is refused with a clean 4xx (429) — no hang, no 5xx.
+
+    Mints an rpm_limit:1 key and fires a rapid burst. LiteLLM's limiter resets on
+    the UTC-minute boundary, so we do NOT assert 'every request after the first is
+    429' (a burst straddling the boundary would see a fresh 200) — that would be
+    flaky. The robust contract: the first request succeeds, at least one request
+    in the burst is refused with 429, and NOTHING returns a 5xx or hangs.
+    """
+    key, _ = _generate_key(models=["qwen3-coder"], rpm_limit=1, user_id="e2e-over-rpm")
+    codes = []
+    with httpx.Client(timeout=TIMEOUT) as client:
+        for _ in range(6):
+            resp = client.post(
+                GATEWAY + "/v1/chat/completions",
+                headers={"Authorization": "Bearer " + key},
+                json=_CHAT,
+            )
+            codes.append(resp.status_code)
+
+    assert codes[0] == 200, "first request under the limit should pass: %r" % codes
+    assert 429 in codes, "an over-limit burst must yield at least one 429: %r" % codes
+    assert all(c in (200, 429) for c in codes), (
+        "rate limiting must be a clean 200/429 split, never a 5xx: %r" % codes
+    )
+
+
 # --- streaming ---------------------------------------------------------------
 
 
