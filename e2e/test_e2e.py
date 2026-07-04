@@ -75,7 +75,7 @@ def test_anthropic_messages_streaming_translation():
         for line in resp.iter_lines():
             if not line.startswith("data: "):
                 continue
-            payload = line[len("data: "):].strip()
+            payload = line[len("data: ") :].strip()
             if payload == "[DONE]":
                 continue
             try:
@@ -165,7 +165,10 @@ def test_fallback_to_foundry_on_5xx():
     r = httpx.post(
         GATEWAY + "/v1/chat/completions",
         headers=AUTH,
-        json={"model": "qwen3-coder", "messages": [{"role": "user", "content": "ping"}]},
+        json={
+            "model": "qwen3-coder",
+            "messages": [{"role": "user", "content": "ping"}],
+        },
         timeout=TIMEOUT,
     )
     assert r.status_code == 200, r.text
@@ -183,7 +186,10 @@ def test_fallback_cascades_when_first_fallback_also_down():
     r = httpx.post(
         GATEWAY + "/v1/chat/completions",
         headers=AUTH,
-        json={"model": "qwen3-coder", "messages": [{"role": "user", "content": "ping"}]},
+        json={
+            "model": "qwen3-coder",
+            "messages": [{"role": "user", "content": "ping"}],
+        },
         timeout=TIMEOUT,
     )
     assert r.status_code == 200, r.text
@@ -218,7 +224,10 @@ def test_virtual_key_model_scoping():
     denied = httpx.post(
         GATEWAY + "/v1/chat/completions",
         headers={"Authorization": "Bearer " + scoped},
-        json={"model": "qwen3-coder", "messages": [{"role": "user", "content": "ping"}]},
+        json={
+            "model": "qwen3-coder",
+            "messages": [{"role": "user", "content": "ping"}],
+        },
         timeout=TIMEOUT,
     )
     assert denied.status_code in (400, 401, 403), (
@@ -230,7 +239,10 @@ def test_virtual_key_model_scoping():
 def test_missing_auth_rejected():
     r = httpx.post(
         GATEWAY + "/v1/chat/completions",
-        json={"model": "qwen3-coder", "messages": [{"role": "user", "content": "ping"}]},
+        json={
+            "model": "qwen3-coder",
+            "messages": [{"role": "user", "content": "ping"}],
+        },
         timeout=TIMEOUT,
     )
     assert r.status_code in (401, 403), r.text
@@ -259,7 +271,7 @@ def test_streaming_chat_integrity():
         for line in resp.iter_lines():
             if not line:
                 continue
-            data = line[len("data: "):] if line.startswith("data: ") else line
+            data = line[len("data: ") :] if line.startswith("data: ") else line
             if data.strip() == "[DONE]":
                 saw_done = True
                 continue
