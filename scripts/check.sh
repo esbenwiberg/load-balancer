@@ -126,6 +126,43 @@ else
   skip "docker" "not installed — compose files not validated"
 fi
 
+# --- litellm image pin guard (docs/03 risk 8 — the malware tags) ------------
+# 1.82.7/1.82.8 shipped credential-stealing malware; the bridge needs a vetted
+# 1.83.x-stable. That pin was enforced ONLY by eyeball. Here it's machine-checked
+# everywhere check.sh runs (pre-commit, Stop hook, CI): every ACTIVE reference to
+# the litellm image across compose files must be EXACTLY the vetted tag. Comments
+# (the digest-example line) and doc prose (the malware warnings) are not image
+# references, so they're ignored. If you deliberately move the pin — a new vetted
+# stable, or a verified @sha256 digest — bump VETTED_LITELLM here in the SAME
+# change, so the guard and the compose files can never silently diverge.
+step "litellm image pin (docs/03 risk 8 — never 1.82.7/1.82.8)"
+VETTED_LITELLM="ghcr.io/berriai/litellm:v1.83.14-stable"
+PINF=()
+while IFS= read -r f; do PINF+=("$f"); done < <(
+  find . -path ./.venv-e2e -prune -o -path ./.git -prune -o \
+    \( -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' \
+       -o -name 'compose*.yml' -o -name 'compose*.yaml' \) -print | sort)
+if [ "${#PINF[@]}" -eq 0 ]; then
+  ok "no compose files to check"
+else
+  PIN_BAD=0
+  # file:line:content for every litellm image mention, minus comment lines,
+  # minus the exact vetted pin -> whatever remains is an offending reference.
+  while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    PIN_BAD=1
+    printf '      offending: %s\n' "$hit"
+  done < <(
+    grep -nE 'ghcr\.io/berriai/litellm' "${PINF[@]}" 2>/dev/null \
+      | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' \
+      | grep -vF "$VETTED_LITELLM" || true)
+  if [ "$PIN_BAD" -eq 0 ]; then
+    ok "litellm pin ($VETTED_LITELLM)"
+  else
+    fail "litellm image pin deviates from vetted $VETTED_LITELLM"
+  fi
+fi
+
 # --- conformance self-test (offline, no network) ----------------------------
 step "conformance/selftest.py"
 if have python3; then

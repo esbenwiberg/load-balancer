@@ -50,7 +50,7 @@ unattended run.
 **Current focus (2026-07):** we are **not** taking in Spark workbenches yet.
 Priority is (a) completing the idea — control plane, observability, dashboard —
 and (b) hardening the harness + test setup. Recommended order:
-harness core (0 → 1 → 2 → 6 → 7 → 8 → 9) → dev stack (10) → observability +
+harness core (0 → 1 → 2 → 6 → 7 → 9) → dev stack (10) → observability +
 wallet guards (3 → 11 → 11b) → dashboard v1 (12) → Ollama (4) → control plane
 (5) → dashboard v2 (13) → Azure IaC (14). Spark-infra-shaped work is parked.
 
@@ -87,16 +87,6 @@ isn't (see § Needs-a-human).
 **Completion condition:**
 ```
 a minimal control-plane service exists (SQLite or Redis + a heartbeat interface) exposing per-model {warm, in_flight, healthy, agent_capable}; it has unit tests that pass, with the passing output surfaced in the conversation; its open design decisions are documented in a new docs file; hard constraint: build the registry + state + tests ONLY — do NOT implement the routing policy or session-stickiness rule, those are Needs-a-human decisions; e2e/run.sh exits 0 with its passing output surfaced; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 40 turns and leave a draft PR describing the decision needed
-```
-
-### 8. Harness self-checks + guardrail automation — risk: low
-**Why:** run.sh only tests *through* the gateway, so a mockd regression is
-indistinguishable from a gateway regression. And the LiteLLM digest pin
-([docs/03 risk 8](docs/03-open-questions-and-risks.md) — the malware one) is a
-hard guardrail enforced only by eyeball.
-**Completion condition:**
-```
-run.sh gains a mockd-direct conformance step (isolating mockd regressions from gateway regressions); e2e gains negative-path tests (malformed JSON body and unknown model alias -> clean 4xx, no hang); CI fails if the LiteLLM image tag/digest deviates from the vetted pin; e2e/run.sh exits 0 with its passing output surfaced in the conversation; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR describing the decision needed
 ```
 
 ### 9. Concurrency smoke — parallel streams must not cross-talk — risk: low
@@ -227,3 +217,4 @@ decision is made.
 - ✅ 2. Mid-stream-death fallback test + pinned retry/stream semantics (risk 7) — PR #11 (2026-07)
 - ✅ 6. mockd fault modes (429, transient 5xx, malformed tool-call) + pinned retry-before-fallback order + fixed cross-test cooldown flake — PR #13 (2026-07)
 - ✅ 7. Tool-calling coverage on the Anthropic surface (`conformance.py --api anthropic`: /v1/messages tools+streaming, full read→edit→bash round-trip + probes, wired into run.sh) — PR #14 (2026-07)
+- ✅ 8. Harness self-checks + guardrail automation (mockd-direct conformance step in run.sh; negative-path e2e tests — malformed JSON + unknown alias → clean 4xx on all three surfaces; LiteLLM image-pin guard in check.sh enforced by pre-commit/Stop/CI) — PR #15 (2026-07)
