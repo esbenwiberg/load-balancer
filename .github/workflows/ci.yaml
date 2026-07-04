@@ -1,0 +1,75 @@
+name: CI
+
+# The merge gate for goal 1: every PR to main runs the repo's ONE definition of
+# green — scripts/check.sh --full — which itself runs the fast tier (ruff,
+# shellcheck, docker compose config, conformance/selftest.py, gitleaks) AND the
+# full docker e2e stack (e2e/run.sh). We call check.sh rather than duplicating
+# its steps, so the bar can never drift between the pre-commit hook, the Stop
+# hook, and CI. See scripts/check.sh header.
+on:
+  pull_request:
+    branches: [main]
+
+# One in-flight run per PR; a new push cancels the stale one.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: check.sh --full (fast tier + e2e docker stack)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # check.sh SKIPS a missing tool (warns, never fails) so a dev can commit
+      # without every tool — but its contract says "CI installs everything, so
+      # there nothing is skipped." Honour that: install the lint/scan tools.
+      # docker, docker compose, and python3 are already on ubuntu-latest.
+      - name: Install lint/scan tools
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install ruff
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+          GITLEAKS_VERSION=8.30.1
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            -o /tmp/gitleaks.tgz
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          sudo install /tmp/gitleaks /usr/local/bin/gitleaks
+          echo "--- tool versions ---"
+          ruff --version
+          shellcheck --version | head -2
+          gitleaks version
+          docker --version
+          docker compose version
+
+      # Call the repo's own gate. Guard on existence per goal 1's wording
+      # ("calling scripts/check.sh if it exists on main"): if a future main
+      # drops it, fall back to the two named scripts directly rather than
+      # silently passing.
+      - name: Run the gate (scripts/check.sh --full)
+        env:
+          NO_COLOR: '1'
+        run: |
+          set -euo pipefail
+          if [ -x scripts/check.sh ]; then
+            scripts/check.sh --full
+          else
+            echo "scripts/check.sh not found — running the two named scripts directly"
+            python3 conformance/selftest.py
+            e2e/run.sh
+          fi
