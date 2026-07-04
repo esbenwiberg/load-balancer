@@ -72,8 +72,19 @@ router_settings:
     - claude-sonnet: ["claude-opus"]
   num_retries: 1          # low so fallback tests are fast + deterministic
   timeout: 30             # mockd is instant; no need for the prod 600s
-  allowed_fails: 2
-  cooldown_time: 5        # short so a cooldown test doesn't stall CI
+  # DELIBERATELY DISABLED for the e2e suite (goal 6). Cooldown is in-memory,
+  # time-based router state: once a deployment trips `allowed_fails`, the router
+  # skips it for `cooldown_time`. Our fault tests intentionally flap qwen3-coder
+  # (429/503), and the suite runs SERIALLY against ONE shared gateway — so that
+  # cooldown bleeds into the *next* test, silently rerouting a request the next
+  # test expected qwen3-coder to serve (mid-stream hangup, translation). mockd's
+  # /__reset clears the backend fault but CANNOT clear gateway-side cooldown, so
+  # the tests became order/timing-dependent and flaky. Cooldown is a latency
+  # OPTIMIZATION, not a client-visible correctness contract; the contract we
+  # actually assert is FALLBACK, which is exercised per-request via num_retries +
+  # `fallbacks` above, independent of cooldown. So we disable cooldown here for
+  # determinism. (Prod keeps it — see deploy/litellm-config.yaml.)
+  disable_cooldowns: true
 
 litellm_settings:
   drop_params: true

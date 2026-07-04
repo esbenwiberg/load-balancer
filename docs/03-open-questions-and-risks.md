@@ -140,6 +140,50 @@ fallback.
 > mid-stream death costing a full turn, routing could prefer the always-up
 > Foundry tier for requests expected to stream a lot (ties into risk 3).
 
+> **✅ OBSERVED (retry-vs-fallback ORDER, e2e — 2026-07).** With
+> `num_retries: 1` and the fallback chain
+> `qwen3-coder → claude-sonnet → claude-opus → gpt`, the pinned order is:
+> **LiteLLM spends its `num_retries` retrying the SAME backend BEFORE the
+> fallback chain is consulted.** Proven by observation with mockd's
+> count-limited fault (`test_transient_5xx_retries_same_backend_before_fallback`
+> in [e2e/test_e2e.py](../e2e/test_e2e.py)):
+> - A transient 5xx **shorter than the retry budget** (one 503, then the fault
+>   clears) is **absorbed on the original backend** — the single retry lands on
+>   qwen3-coder again and succeeds; `served_model` stays `qwen3-coder` and the
+>   fallback chain is never touched.
+> - A fault that **outlasts the retry budget** (first attempt *and* its retry
+>   both 503) exhausts retries first, and **only then** advances the chain, so
+>   `claude-sonnet` answers.
+>
+> **Why this matters (the config tripwire this test guards):** the retry is a
+> re-send to the *same* deployment, so a single backend fault can become up to
+> `num_retries + 1` upstream requests to that backend before any failover. That
+> is safe for *idempotent, non-streamed* attempts (the retry only fires before
+> the first byte reaches the client — see the mid-stream block above), but it
+> means raising `num_retries` multiplies backend load under fault, and any config
+> change that reordered this to *fallback-before-retry* would silently change
+> which tier serves a flapping workbench.
+>
+> **Cooldown, and why the e2e harness disables it:** in production a deployment
+> that trips `allowed_fails` is put in *cooldown* — the router pre-emptively skips
+> it for `cooldown_time` seconds, so a flapping workbench stops eating the
+> retry-then-fallback tax on every request. This is a latency optimization layered
+> ON TOP of fallback, not a distinct client-visible contract. It is **deliberately
+> disabled in the e2e config (`disable_cooldowns: true`)**: cooldown is in-memory,
+> time-based gateway state that mockd's `/__reset` cannot clear, so when the fault
+> tests flap qwen3-coder that state **bled into the next serially-run test** and
+> silently rerouted a request the next test expected qwen3-coder to serve — an
+> order/timing-dependent flake. Since every assertion in the suite is about
+> fallback (which is cooldown-independent), disabling cooldown removes the flake
+> without losing coverage. Prod (`deploy/litellm-config.yaml`) keeps cooldown on.
+>
+> **429 (rate-limit) behaves as a fallback-triggering fault**, identical to 5xx —
+> a persistent 429 on the workbench advances to the Foundry tier rather than
+> surfacing to the client (`test_fallback_on_429`). And a **malformed tool call**
+> (truncated JSON arguments) is passed through the Responses bridge **verbatim**,
+> not repaired or rejected — the bridge is a transport, JSON validation is the
+> client's job (`test_malformed_tool_call_through_responses_bridge`).
+
 ## 🟡 Operational / security
 
 ### 8. LiteLLM supply-chain
