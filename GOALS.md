@@ -61,14 +61,6 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 
 ## § Autonomy-friendly (safe to run unattended)
 
-### 1. Wire the e2e harness into CI — risk: low
-**Why:** `e2e/run.sh` is exit-code clean but nothing runs it automatically; a
-regression (like the `tier`→`backend_tier` bug) could sneak back in.
-**Completion condition:**
-```
-a GitHub Actions workflow runs e2e/run.sh and conformance/selftest.py on every PR to main — calling scripts/check.sh if it exists on main rather than duplicating its steps; the workflow passes on this repo's current HEAD, proven by surfacing the green check run (gh pr checks or gh run view output) in the conversation; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR describing the decision needed
-```
-
 ### 2. Add a mid-stream-death fallback test + pin retry/stream semantics — risk: low
 **Why:** [docs/03 risk 7](docs/03-open-questions-and-risks.md) — a retry that
 re-sends a partially-streamed request is a correctness bug; mockd already has a
@@ -261,3 +253,4 @@ decision is made.
 - ✅ E2E test harness (mock + cli-auth profiles) — PR #2
 - ✅ Goal-driven workflow (GOALS.md backlog + unattended contract) — PR #3
 - ✅ 0. One check script + githooks + agent self-validation — PR #7 (2026-07)
+- ✅ 1. Wire the e2e harness into CI — PR #9 (2026-07)
