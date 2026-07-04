@@ -61,15 +61,6 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 
 ## § Autonomy-friendly (safe to run unattended)
 
-### 2. Add a mid-stream-death fallback test + pin retry/stream semantics — risk: low
-**Why:** [docs/03 risk 7](docs/03-open-questions-and-risks.md) — a retry that
-re-sends a partially-streamed request is a correctness bug; mockd already has a
-`hangup` mode to exercise it.
-**Completion condition:**
-```
-e2e/test_e2e.py has a passing test that injects mockd hangup mid-stream and asserts the gateway's behaviour (clean fallback, or a documented reason it can't); the observed retry/stream semantics per hop are written into docs/03-open-questions-and-risks.md; e2e/run.sh exits 0 with its passing output surfaced in the conversation; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR describing the decision needed
-```
-
 ### 3. Observability & cost attribution — risk: low
 **Why:** [docs/03 risk 11](docs/03-open-questions-and-risks.md) — without
 per-request {chosen backend, why, latency, tokens, fallback-hit} we can't tune
@@ -254,3 +245,4 @@ decision is made.
 - ✅ Goal-driven workflow (GOALS.md backlog + unattended contract) — PR #3
 - ✅ 0. One check script + githooks + agent self-validation — PR #7 (2026-07)
 - ✅ 1. Wire the e2e harness into CI — PR #9 (2026-07)
+- ✅ 2. Mid-stream-death fallback test + pinned retry/stream semantics (risk 7) — PR #11 (2026-07)
