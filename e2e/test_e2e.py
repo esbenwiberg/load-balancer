@@ -197,6 +197,107 @@ def test_fallback_cascades_when_first_fallback_also_down():
     assert "served_model=claude-opus" in content, content
 
 
+# --- mid-stream backend death (docs/03 risk 7) ------------------------------
+
+
+def _drain_stream(url, payload, read_timeout=5.0):
+    """Open an SSE stream and drain it, classifying HOW it terminated.
+
+    Returns (status, chunks, done_seen, truncated):
+      * done_seen  -> the stream ended with a clean terminator ([DONE])
+      * truncated  -> the stream stopped WITHOUT one (connection died or went
+                      silent past `read_timeout`) — the mid-stream-death
+                      signature we're probing for.
+    A tight read timeout bounds the post-hangup hang: mockd answers instantly,
+    so the only long read is the one that never completes after the backend dies.
+    """
+    chunks, done_seen, truncated, status = [], False, False, None
+    timeout = httpx.Timeout(TIMEOUT, read=read_timeout)
+    try:
+        with httpx.stream(
+            "POST",
+            url,
+            headers={**AUTH, "anthropic-version": "2023-06-01"},
+            json=payload,
+            timeout=timeout,
+        ) as resp:
+            status = resp.status_code
+            try:
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    data = line[len("data: ") :] if line.startswith("data: ") else line
+                    if data.strip() == "[DONE]":
+                        done_seen = True
+                        continue
+                    chunks.append(data)
+            except (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError):
+                truncated = True
+    except (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError):
+        truncated = True
+    return status, chunks, done_seen, truncated
+
+
+def test_chat_stream_backend_hangup_midstream():
+    """docs/03 risk 7: the backend dies mid-stream AFTER the gateway has already
+    committed HTTP 200 + forwarded bytes to the client.
+
+    Observed behaviour (documented reason it CANNOT cleanly fall back): the
+    response line is already on the wire, so LiteLLM cannot re-route — the client
+    receives the partial pre-hangup content and then a truncated stream that
+    never emits [DONE]. Crucially the gateway does NOT silently re-send to
+    another backend (no Foundry-tier stamp leaks in), so there's no
+    duplicate-request / spliced-reply corruption — the failure is a clean
+    truncation the client must detect via a missing terminator, not a bad merge.
+    """
+    _inject({"model": "qwen3-coder", "mode": "hangup"})
+    status, chunks, done_seen, truncated = _drain_stream(
+        GATEWAY + "/v1/chat/completions",
+        {
+            "model": "qwen3-coder",
+            "stream": True,
+            "messages": [{"role": "user", "content": "ping"}],
+        },
+    )
+    blob = " ".join(chunks)
+    assert status == 200, "200 is committed before the mid-stream death"
+    assert "partial ..." in blob, "expected the partial pre-hangup chunk, got: " + blob
+    assert not done_seen, "stream unexpectedly terminated cleanly with [DONE]"
+    assert truncated, "expected a truncated, non-terminating stream on mid-stream death"
+    # No mid-stream fallback: a Foundry-tier backend must NOT have answered into
+    # the same already-open response (that would splice two replies together).
+    assert "served_model=claude" not in blob, (
+        "gateway fell back mid-stream — would corrupt an already-streamed reply: "
+        + blob
+    )
+
+
+def test_responses_stream_backend_hangup_midstream():
+    """Same mid-stream death over Codex's /v1/responses bridge. Same verdict:
+    the partial output_text.delta reaches the client, then the stream truncates
+    with no response.completed / [DONE] and no fallback stamp."""
+    _inject({"model": "qwen3-coder", "mode": "hangup"})
+    status, chunks, done_seen, truncated = _drain_stream(
+        GATEWAY + "/v1/responses",
+        {
+            "model": "qwen3-coder",
+            "stream": True,
+            "input": [{"role": "user", "content": "ping"}],
+        },
+    )
+    blob = " ".join(chunks)
+    assert status == 200, "200 is committed before the mid-stream death"
+    assert "partial ..." in blob, "expected the partial pre-hangup delta, got: " + blob
+    assert not done_seen, "stream unexpectedly terminated cleanly with [DONE]"
+    assert truncated, "expected a truncated, non-terminating stream on mid-stream death"
+    assert "response.completed" not in blob, (
+        "stream emitted response.completed despite mid-stream death: " + blob
+    )
+    assert "served_model=claude" not in blob, (
+        "gateway fell back mid-stream on the Responses bridge: " + blob
+    )
+
+
 # --- auth / virtual keys -----------------------------------------------------
 
 
