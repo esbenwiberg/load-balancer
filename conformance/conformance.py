@@ -163,12 +163,18 @@ class ChatTransport:
         )
 
     def record_tool_result(self, call_id, name, content) -> None:
-        self.messages.append({"role": "tool", "tool_call_id": call_id, "content": content})
+        self.messages.append(
+            {"role": "tool", "tool_call_id": call_id, "content": content}
+        )
 
     def _stream(self, temperature, tool_choice) -> AssistantTurn:
         stream = self.client.chat.completions.create(
-            model=self.model, messages=self.messages, tools=TOOLS,
-            tool_choice=tool_choice, temperature=temperature, stream=True,
+            model=self.model,
+            messages=self.messages,
+            tools=TOOLS,
+            tool_choice=tool_choice,
+            temperature=temperature,
+            stream=True,
         )
         parts: list[str] = []
         acc: dict[int, dict] = {}
@@ -183,7 +189,9 @@ class ChatTransport:
             if getattr(d, "content", None):
                 parts.append(d.content)
             for tc in getattr(d, "tool_calls", None) or []:
-                slot = acc.setdefault(tc.index, {"id": None, "name": "", "arguments": ""})
+                slot = acc.setdefault(
+                    tc.index, {"id": None, "name": "", "arguments": ""}
+                )
                 if tc.id:
                     slot["id"] = tc.id
                 fn = getattr(tc, "function", None)
@@ -200,12 +208,18 @@ class ChatTransport:
 
     def _block(self, temperature, tool_choice) -> AssistantTurn:
         resp = self.client.chat.completions.create(
-            model=self.model, messages=self.messages, tools=TOOLS,
-            tool_choice=tool_choice, temperature=temperature, stream=False,
+            model=self.model,
+            messages=self.messages,
+            tools=TOOLS,
+            tool_choice=tool_choice,
+            temperature=temperature,
+            stream=False,
         )
         ch = resp.choices[0]
         calls = [
-            ToolCall(tc.id or f"call_{i}", tc.function.name, tc.function.arguments or "")
+            ToolCall(
+                tc.id or f"call_{i}", tc.function.name, tc.function.arguments or ""
+            )
             for i, tc in enumerate(ch.message.tool_calls or [])
         ]
         return AssistantTurn(ch.message.content or "", calls, ch.finish_reason)
@@ -257,15 +271,19 @@ class ResponsesTransport:
 
     def _create(self, temperature, tool_choice, stream):
         return self.client.responses.create(
-            model=self.model, input=self.input, instructions=self.instructions,
-            tools=RESPONSES_TOOLS, tool_choice=tool_choice, temperature=temperature,
+            model=self.model,
+            input=self.input,
+            instructions=self.instructions,
+            tools=RESPONSES_TOOLS,
+            tool_choice=tool_choice,
+            temperature=temperature,
             stream=stream,
         )
 
     def _stream(self, temperature, tool_choice) -> AssistantTurn:
         events = self._create(temperature, tool_choice, stream=True)
         text_parts: list[str] = []
-        acc: dict[str, dict] = {}   # keyed by output index
+        acc: dict[str, dict] = {}  # keyed by output index
         order: list[str] = []
         finish = None
         for ev in events:
@@ -277,7 +295,8 @@ class ResponsesTransport:
                 if item is not None and getattr(item, "type", "") == "function_call":
                     key = str(getattr(ev, "output_index", len(order)))
                     acc[key] = {
-                        "id": getattr(item, "call_id", None) or getattr(item, "id", None),
+                        "id": getattr(item, "call_id", None)
+                        or getattr(item, "id", None),
                         "name": getattr(item, "name", "") or "",
                         "arguments": getattr(item, "arguments", "") or "",
                     }
@@ -288,7 +307,11 @@ class ResponsesTransport:
                 slot["arguments"] += getattr(ev, "delta", "") or ""
                 if key not in order:
                     order.append(key)
-            elif etype in ("response.completed", "response.incomplete", "response.failed"):
+            elif etype in (
+                "response.completed",
+                "response.incomplete",
+                "response.failed",
+            ):
                 finish = etype.split(".")[-1]
         calls = [
             ToolCall(acc[k]["id"] or f"call_{i}", acc[k]["name"], acc[k]["arguments"])
@@ -356,8 +379,8 @@ class RunMetrics:
     missing_required_arg: int = 0
     runaway: int = 0
     api_error: int = 0
-    tool_errors_fed: int = 0     # tool results we returned as "error: ..."
-    recovered: bool = False      # model finished the task despite a tool error
+    tool_errors_fed: int = 0  # tool results we returned as "error: ..."
+    recovered: bool = False  # model finished the task despite a tool error
     error_detail: list = field(default_factory=list)
     grade: dict = field(default_factory=dict)
     completed: bool = False
@@ -412,22 +435,34 @@ def run_once(transport, temperature, max_turns, stream, verbose) -> RunMetrics:
                 if tc.name not in TOOL_NAMES:
                     m.unknown_tool += 1
                     m.error_detail.append(f"unknown_tool: {tc.name!r}")
-                    transport.record_tool_result(tc.id, tc.name, f"error: unknown tool {tc.name}")
+                    transport.record_tool_result(
+                        tc.id, tc.name, f"error: unknown tool {tc.name}"
+                    )
                     if verbose:
                         print(f"    [unknown_tool] {tc.name!r}")
                     continue
                 args, err = _validate_args(tc.name, tc.arguments_raw)
                 if err == "invalid_json_args":
                     m.invalid_json_args += 1
-                    m.error_detail.append(f"invalid_json_args for {tc.name}: {tc.arguments_raw[:120]!r}")
-                    transport.record_tool_result(tc.id, tc.name, "error: arguments were not valid JSON")
+                    m.error_detail.append(
+                        f"invalid_json_args for {tc.name}: {tc.arguments_raw[:120]!r}"
+                    )
+                    transport.record_tool_result(
+                        tc.id, tc.name, "error: arguments were not valid JSON"
+                    )
                     if verbose:
-                        print(f"    [invalid_json] {tc.name}: {tc.arguments_raw[:80]!r}")
+                        print(
+                            f"    [invalid_json] {tc.name}: {tc.arguments_raw[:80]!r}"
+                        )
                     continue
                 if err == "missing_required_arg":
                     m.missing_required_arg += 1
                     m.error_detail.append(f"missing_required_arg for {tc.name}: {args}")
-                    transport.record_tool_result(tc.id, tc.name, f"error: missing required argument(s) for {tc.name}")
+                    transport.record_tool_result(
+                        tc.id,
+                        tc.name,
+                        f"error: missing required argument(s) for {tc.name}",
+                    )
                     if verbose:
                         print(f"    [missing_arg] {tc.name}: {args}")
                     continue
@@ -483,15 +518,20 @@ def probe_parallel(transport, stream, temperature, verbose) -> dict:
         return {"ran": False, "error": f"{type(exc).__name__}: {exc}"}
     ids = [tc.id for tc in turn.tool_calls]
     names_ok = all(tc.name in TOOL_NAMES for tc in turn.tool_calls)
-    args_ok = all(_validate_args(tc.name, tc.arguments_raw)[1] is None
-                  for tc in turn.tool_calls if tc.name in TOOL_NAMES)
+    args_ok = all(
+        _validate_args(tc.name, tc.arguments_raw)[1] is None
+        for tc in turn.tool_calls
+        if tc.name in TOOL_NAMES
+    )
     distinct_ids = len(set(ids)) == len(ids)
     parallelized = len(turn.tool_calls) >= 2
     # A defect only if it parallelized AND something is wrong with the calls.
     defect = parallelized and not (distinct_ids and names_ok and args_ok)
     if verbose:
-        print(f"  [parallel probe] calls={len(turn.tool_calls)} distinct_ids={distinct_ids} "
-              f"names_ok={names_ok} args_ok={args_ok}")
+        print(
+            f"  [parallel probe] calls={len(turn.tool_calls)} distinct_ids={distinct_ids} "
+            f"names_ok={names_ok} args_ok={args_ok}"
+        )
     return {
         "ran": True,
         "num_calls": len(turn.tool_calls),
@@ -512,19 +552,28 @@ def probe_tool_choice_required(transport, stream, temperature, verbose) -> dict:
     except Exception as exc:
         if verbose:
             print(f"  [tool_choice=required] HTTP/API error: {exc}")
-        return {"ran": True, "http_error": f"{type(exc).__name__}: {exc}",
-                "honored": False, "defect": True}
-    honored = len(turn.tool_calls) >= 1 and all(tc.name in TOOL_NAMES for tc in turn.tool_calls)
+        return {
+            "ran": True,
+            "http_error": f"{type(exc).__name__}: {exc}",
+            "honored": False,
+            "defect": True,
+        }
+    honored = len(turn.tool_calls) >= 1 and all(
+        tc.name in TOOL_NAMES for tc in turn.tool_calls
+    )
     if verbose:
-        print(f"  [tool_choice=required] honored={honored} calls={len(turn.tool_calls)}")
+        print(
+            f"  [tool_choice=required] honored={honored} calls={len(turn.tool_calls)}"
+        )
     return {"ran": True, "http_error": None, "honored": honored, "defect": not honored}
 
 
 # --- Aggregation ------------------------------------------------------------
 
 
-def aggregate(runs: list, fail_threshold: float, min_completion: float,
-              probes: dict | None = None) -> dict:
+def aggregate(
+    runs: list, fail_threshold: float, min_completion: float, probes: dict | None = None
+) -> dict:
     total_attempts = sum(r.attempts for r in runs)
     total_errored = sum(r.errored for r in runs)
     total_api_errors = sum(r.api_error for r in runs)
@@ -533,8 +582,9 @@ def aggregate(runs: list, fail_threshold: float, min_completion: float,
     completion_rate = completions / len(runs) if runs else 0.0
 
     probes = probes or {}
-    probe_defect = bool(probes.get("parallel", {}).get("defect")) or \
-        bool(probes.get("tool_choice_required", {}).get("defect"))
+    probe_defect = bool(probes.get("parallel", {}).get("defect")) or bool(
+        probes.get("tool_choice_required", {}).get("defect")
+    )
 
     agent_capable = (
         overall_rate <= fail_threshold
@@ -570,28 +620,61 @@ def main() -> int:
         description="Tool-calling conformance harness (sets agent_capable).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--base-url", default=os.environ.get("CONFORMANCE_BASE_URL", "http://localhost:8000/v1"),
-                   help="OpenAI-compatible base URL (vLLM Spark, or LiteLLM in front of it).")
-    p.add_argument("--api-key", default=os.environ.get("CONFORMANCE_API_KEY", "dummy"),
-                   help="API key/token. vLLM often ignores it; LiteLLM wants a virtual key.")
-    p.add_argument("--model", default=os.environ.get("CONFORMANCE_MODEL"),
-                   help="Model name/alias to target (required).")
-    p.add_argument("--api", choices=["chat", "responses"],
-                   default=os.environ.get("CONFORMANCE_API", "chat"),
-                   help="Wire protocol. 'responses' targets /v1/responses (the Codex path).")
-    p.add_argument("--runs", type=int, default=int(os.environ.get("CONFORMANCE_RUNS", "5")),
-                   help="Repeat the scenario N times for a stable error rate.")
-    p.add_argument("--max-turns", type=int, default=12, help="Max assistant turns per run.")
+    p.add_argument(
+        "--base-url",
+        default=os.environ.get("CONFORMANCE_BASE_URL", "http://localhost:8000/v1"),
+        help="OpenAI-compatible base URL (vLLM Spark, or LiteLLM in front of it).",
+    )
+    p.add_argument(
+        "--api-key",
+        default=os.environ.get("CONFORMANCE_API_KEY", "dummy"),
+        help="API key/token. vLLM often ignores it; LiteLLM wants a virtual key.",
+    )
+    p.add_argument(
+        "--model",
+        default=os.environ.get("CONFORMANCE_MODEL"),
+        help="Model name/alias to target (required).",
+    )
+    p.add_argument(
+        "--api",
+        choices=["chat", "responses"],
+        default=os.environ.get("CONFORMANCE_API", "chat"),
+        help="Wire protocol. 'responses' targets /v1/responses (the Codex path).",
+    )
+    p.add_argument(
+        "--runs",
+        type=int,
+        default=int(os.environ.get("CONFORMANCE_RUNS", "5")),
+        help="Repeat the scenario N times for a stable error rate.",
+    )
+    p.add_argument(
+        "--max-turns", type=int, default=12, help="Max assistant turns per run."
+    )
     p.add_argument("--temperature", type=float, default=0.0)
-    p.add_argument("--fail-threshold", type=float, default=0.02,
-                   help="Max tool-call-error-rate to still count as agent_capable.")
-    p.add_argument("--min-completion", type=float, default=0.8,
-                   help="Min fraction of runs that must complete the task.")
+    p.add_argument(
+        "--fail-threshold",
+        type=float,
+        default=0.02,
+        help="Max tool-call-error-rate to still count as agent_capable.",
+    )
+    p.add_argument(
+        "--min-completion",
+        type=float,
+        default=0.8,
+        help="Min fraction of runs that must complete the task.",
+    )
     no_stream_default = os.environ.get("CONFORMANCE_NO_STREAM") == "1"
-    p.add_argument("--no-stream", action="store_true", default=no_stream_default,
-                   help="Disable streaming (streaming is the realistic path — keep it on).")
-    p.add_argument("--no-probes", action="store_true",
-                   help="Skip the parallel + tool_choice:required probes.")
+    p.add_argument(
+        "--no-stream",
+        action="store_true",
+        default=no_stream_default,
+        help="Disable streaming (streaming is the realistic path — keep it on).",
+    )
+    p.add_argument(
+        "--no-probes",
+        action="store_true",
+        help="Skip the parallel + tool_choice:required probes.",
+    )
     p.add_argument("--json-out", help="Write the full JSON report to this path.")
     p.add_argument("-v", "--verbose", action="store_true", help="Print each tool call.")
     args = p.parse_args()
@@ -602,13 +685,17 @@ def main() -> int:
     try:
         from openai import OpenAI
     except ImportError:
-        sys.exit("The 'openai' package is required. Install it:\n    pip install -r requirements.txt")
+        sys.exit(
+            "The 'openai' package is required. Install it:\n    pip install -r requirements.txt"
+        )
 
     client = OpenAI(base_url=args.base_url, api_key=args.api_key)
     stream = not args.no_stream
 
-    print(f"Conformance: model={args.model!r} base_url={args.base_url!r} "
-          f"api={args.api} stream={stream} runs={args.runs}")
+    print(
+        f"Conformance: model={args.model!r} base_url={args.base_url!r} "
+        f"api={args.api} stream={stream} runs={args.runs}"
+    )
     print("-" * 72)
 
     runs: list[RunMetrics] = []
@@ -617,26 +704,38 @@ def main() -> int:
         transport = make_transport(args.api, client, args.model)
         m = run_once(transport, args.temperature, args.max_turns, stream, args.verbose)
         runs.append(m)
-        print(f"  turns={m.turns} valid_calls={m.valid_calls} errored={m.errored} "
-              f"completed={m.completed} run_error_rate={m.error_rate:.3f}")
+        print(
+            f"  turns={m.turns} valid_calls={m.valid_calls} errored={m.errored} "
+            f"completed={m.completed} run_error_rate={m.error_rate:.3f}"
+        )
 
     probes = {}
     if not args.no_probes:
         print("Probes:")
         probes["parallel"] = probe_parallel(
-            make_transport(args.api, client, args.model), stream, args.temperature, True)
+            make_transport(args.api, client, args.model), stream, args.temperature, True
+        )
         probes["tool_choice_required"] = probe_tool_choice_required(
-            make_transport(args.api, client, args.model), stream, args.temperature, True)
+            make_transport(args.api, client, args.model), stream, args.temperature, True
+        )
 
     summary = aggregate(runs, args.fail_threshold, args.min_completion, probes)
     report = {
-        "model": args.model, "base_url": args.base_url, "api": args.api,
-        "streaming": stream, "summary": summary, "runs": [asdict(r) for r in runs],
+        "model": args.model,
+        "base_url": args.base_url,
+        "api": args.api,
+        "streaming": stream,
+        "summary": summary,
+        "runs": [asdict(r) for r in runs],
     }
 
     print("=" * 72)
     print(json.dumps(summary, indent=2))
-    verdict = "PASS  agent_capable=true" if summary["agent_capable"] else "FAIL  agent_capable=false"
+    verdict = (
+        "PASS  agent_capable=true"
+        if summary["agent_capable"]
+        else "FAIL  agent_capable=false"
+    )
     print("=" * 72)
     print(verdict)
 

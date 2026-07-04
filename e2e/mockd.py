@@ -147,9 +147,7 @@ def _chat_last_user_text(messages) -> str:
             if isinstance(c, str):
                 return c
             if isinstance(c, list):  # content parts
-                return " ".join(
-                    p.get("text", "") for p in c if isinstance(p, dict)
-                )
+                return " ".join(p.get("text", "") for p in c if isinstance(p, dict))
     return ""
 
 
@@ -164,9 +162,7 @@ def _responses_last_user_text(input_items) -> str:
             if isinstance(c, str):
                 return c
             if isinstance(c, list):
-                return " ".join(
-                    p.get("text", "") for p in c if isinstance(p, dict)
-                )
+                return " ".join(p.get("text", "") for p in c if isinstance(p, dict))
     return ""
 
 
@@ -306,7 +302,9 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b""
         if os.environ.get("MOCKD_DEBUG") and raw and self.path.startswith("/v1/"):
-            sys.stderr.write("[mockd DEBUG] %s <- %s\n" % (self.path, raw.decode("utf-8", "replace")))
+            sys.stderr.write(
+                "[mockd DEBUG] %s <- %s\n" % (self.path, raw.decode("utf-8", "replace"))
+            )
         try:
             return json.loads(raw) if raw else {}
         except json.JSONDecodeError:
@@ -352,8 +350,13 @@ class Handler(BaseHTTPRequestHandler):
         if status:
             self._json(
                 int(status),
-                {"error": {"message": "mockd injected status %s" % status,
-                           "type": "mockd_fault", "code": int(status)}},
+                {
+                    "error": {
+                        "message": "mockd injected status %s" % status,
+                        "type": "mockd_fault",
+                        "code": int(status),
+                    }
+                },
             )
             return True
         return False
@@ -373,7 +376,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         text, calls = decide_turn(
-            bool(tools), tool_choice, user_text, _chat_tool_result_count(messages), model
+            bool(tools),
+            tool_choice,
+            user_text,
+            _chat_tool_result_count(messages),
+            model,
         )
         mode = directive.get("mode")
         if mode:
@@ -384,29 +391,61 @@ class Handler(BaseHTTPRequestHandler):
         cid = _new_id("chatcmpl")
 
         if not stream:
-            return self._json(200, {
-                "id": cid, "object": "chat.completion", "created": created,
-                "model": model,
-                "choices": [{
-                    "index": 0, "finish_reason": finish,
-                    "message": {
-                        "role": "assistant",
-                        "content": text or None,
-                        "tool_calls": [{
-                            "id": c["id"], "type": "function",
-                            "function": {"name": c["name"], "arguments": c["arguments"]},
-                        } for c in norm] or None,
+            return self._json(
+                200,
+                {
+                    "id": cid,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": finish,
+                            "message": {
+                                "role": "assistant",
+                                "content": text or None,
+                                "tool_calls": [
+                                    {
+                                        "id": c["id"],
+                                        "type": "function",
+                                        "function": {
+                                            "name": c["name"],
+                                            "arguments": c["arguments"],
+                                        },
+                                    }
+                                    for c in norm
+                                ]
+                                or None,
+                            },
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 8,
+                        "completion_tokens": 8,
+                        "total_tokens": 16,
                     },
-                }],
-                "usage": {"prompt_tokens": 8, "completion_tokens": 8, "total_tokens": 16},
-            })
+                },
+            )
 
         # Streaming
         self._sse_begin()
-        base = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model}
+        base = {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+        }
 
         def delta(d, finish_reason=None):
-            self._sse_chunk({**base, "choices": [{"index": 0, "delta": d, "finish_reason": finish_reason}]})
+            self._sse_chunk(
+                {
+                    **base,
+                    "choices": [
+                        {"index": 0, "delta": d, "finish_reason": finish_reason}
+                    ],
+                }
+            )
 
         delta({"role": "assistant"})
         if directive.get("mode") == "hangup":
@@ -422,10 +461,21 @@ class Handler(BaseHTTPRequestHandler):
         if text:
             delta({"content": text})
         for i, c in enumerate(norm):
-            delta({"tool_calls": [{
-                "index": i, "id": c["id"], "type": "function",
-                "function": {"name": c["name"], "arguments": c["arguments"]},
-            }]})
+            delta(
+                {
+                    "tool_calls": [
+                        {
+                            "index": i,
+                            "id": c["id"],
+                            "type": "function",
+                            "function": {
+                                "name": c["name"],
+                                "arguments": c["arguments"],
+                            },
+                        }
+                    ]
+                }
+            )
         delta({}, finish_reason=finish)
         self._sse_chunk("[DONE]")
         self._sse_end()
@@ -447,7 +497,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         text, calls = decide_turn(
-            bool(tools), tool_choice, user_text, _responses_tool_result_count(input_items), model
+            bool(tools),
+            tool_choice,
+            user_text,
+            _responses_tool_result_count(input_items),
+            model,
         )
         mode = directive.get("mode")
         if mode:
@@ -457,28 +511,54 @@ class Handler(BaseHTTPRequestHandler):
 
         output = []
         if text:
-            output.append({
-                "type": "message", "id": _new_id("msg"), "role": "assistant",
-                "status": "completed",
-                "content": [{"type": "output_text", "text": text}],
-            })
+            output.append(
+                {
+                    "type": "message",
+                    "id": _new_id("msg"),
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": text}],
+                }
+            )
         for c in norm:
-            output.append({
-                "type": "function_call", "id": _new_id("fc"),
-                "call_id": c["id"], "name": c["name"], "arguments": c["arguments"],
-            })
+            output.append(
+                {
+                    "type": "function_call",
+                    "id": _new_id("fc"),
+                    "call_id": c["id"],
+                    "name": c["name"],
+                    "arguments": c["arguments"],
+                }
+            )
 
         if not stream:
-            return self._json(200, {
-                "id": rid, "object": "response", "status": "completed",
-                "model": model, "output": output,
-            })
+            return self._json(
+                200,
+                {
+                    "id": rid,
+                    "object": "response",
+                    "status": "completed",
+                    "model": model,
+                    "output": output,
+                },
+            )
 
         # Streaming Responses events.
         self._sse_begin()
-        self._sse_chunk({"type": "response.created", "response": {"id": rid, "status": "in_progress"}})
+        self._sse_chunk(
+            {
+                "type": "response.created",
+                "response": {"id": rid, "status": "in_progress"},
+            }
+        )
         if directive.get("mode") == "hangup":
-            self._sse_chunk({"type": "response.output_text.delta", "output_index": 0, "delta": "partial ..."})
+            self._sse_chunk(
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "partial ...",
+                }
+            )
             try:
                 self.wfile.flush()
                 self.connection.close()
@@ -487,21 +567,62 @@ class Handler(BaseHTTPRequestHandler):
             return
         idx = 0
         if text:
-            self._sse_chunk({"type": "response.output_item.added", "output_index": idx,
-                             "item": {"type": "message", "role": "assistant"}})
-            self._sse_chunk({"type": "response.output_text.delta", "output_index": idx, "delta": text})
+            self._sse_chunk(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": idx,
+                    "item": {"type": "message", "role": "assistant"},
+                }
+            )
+            self._sse_chunk(
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": idx,
+                    "delta": text,
+                }
+            )
             idx += 1
         for c in norm:
-            self._sse_chunk({"type": "response.output_item.added", "output_index": idx,
-                             "item": {"type": "function_call", "id": c["id"],
-                                      "call_id": c["id"], "name": c["name"], "arguments": ""}})
-            self._sse_chunk({"type": "response.function_call_arguments.delta",
-                             "output_index": idx, "delta": c["arguments"]})
-            self._sse_chunk({"type": "response.output_item.done", "output_index": idx,
-                             "item": {"type": "function_call", "id": c["id"],
-                                      "call_id": c["id"], "name": c["name"], "arguments": c["arguments"]}})
+            self._sse_chunk(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": idx,
+                    "item": {
+                        "type": "function_call",
+                        "id": c["id"],
+                        "call_id": c["id"],
+                        "name": c["name"],
+                        "arguments": "",
+                    },
+                }
+            )
+            self._sse_chunk(
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": idx,
+                    "delta": c["arguments"],
+                }
+            )
+            self._sse_chunk(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": idx,
+                    "item": {
+                        "type": "function_call",
+                        "id": c["id"],
+                        "call_id": c["id"],
+                        "name": c["name"],
+                        "arguments": c["arguments"],
+                    },
+                }
+            )
             idx += 1
-        self._sse_chunk({"type": "response.completed", "response": {"id": rid, "status": "completed", "output": output}})
+        self._sse_chunk(
+            {
+                "type": "response.completed",
+                "response": {"id": rid, "status": "completed", "output": output},
+            }
+        )
         self._sse_chunk("[DONE]")
         self._sse_end()
 
@@ -510,7 +631,9 @@ def main():
     port = int(os.environ.get("MOCKD_PORT", "9100"))
     host = os.environ.get("MOCKD_HOST", "0.0.0.0")
     server = ThreadingHTTPServer((host, port), Handler)
-    print("mockd listening on http://%s:%d (chat + responses + /__control)" % (host, port))
+    print(
+        "mockd listening on http://%s:%d (chat + responses + /__control)" % (host, port)
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

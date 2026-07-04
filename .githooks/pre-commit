@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# =============================================================================
+# pre-commit hook — runs the FAST tier of scripts/check.sh.
+#
+# HARD RULE: no docker containers here. The fast tier only does `docker compose
+# config` (client-side YAML validation), never `up`. The full e2e stack is the
+# MERGE gate (CI / goal 1), never the commit gate — slow hooks just train
+# everyone to `git commit --no-verify`.
+#
+# Wired by scripts/setup-dev.sh (sets core.hooksPath = .githooks). Genuine
+# emergency bypass: `git commit --no-verify`.
+# =============================================================================
+set -euo pipefail
+ROOT="$(git rev-parse --show-toplevel)"
+exec "$ROOT/scripts/check.sh" --fast

@@ -14,7 +14,6 @@ STREAMING, emit clean structured tool calls for a MULTI-tool session.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 
 
@@ -52,9 +51,18 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Repo-relative path to the file."},
-                    "old_string": {"type": "string", "description": "Exact text to replace."},
-                    "new_string": {"type": "string", "description": "Replacement text."},
+                    "path": {
+                        "type": "string",
+                        "description": "Repo-relative path to the file.",
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact text to replace.",
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Replacement text.",
+                    },
                 },
                 "required": ["path", "old_string", "new_string"],
             },
@@ -68,7 +76,10 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "The shell command to run."}
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to run.",
+                    }
                 },
                 "required": ["command"],
             },
@@ -142,7 +153,9 @@ class VirtualEnv:
             return self.read_file(args.get("path", ""))
         if name == "edit_file":
             return self.edit_file(
-                args.get("path", ""), args.get("old_string", ""), args.get("new_string", "")
+                args.get("path", ""),
+                args.get("old_string", ""),
+                args.get("new_string", ""),
             )
         if name == "run_bash":
             return self.run_bash(args.get("command", ""))
@@ -183,9 +196,9 @@ class Grade:
     """Task-progress grading — separate from tool-call *mechanics* scoring."""
 
     did_read_config: bool = False
-    did_edit_correct: bool = False   # changed 8000 -> 9000 in config
+    did_edit_correct: bool = False  # changed 8000 -> 9000 in config
     did_run_tests: bool = False
-    saw_tests_pass: bool = False     # ran tests AFTER a correct edit
+    saw_tests_pass: bool = False  # ran tests AFTER a correct edit
     produced_final_text: bool = False
 
     def observe_call(self, name: str, args: dict, env_before: "VirtualEnv") -> None:
@@ -197,9 +210,10 @@ class Grade:
                 args.get("old_string", "")
             ):
                 self.did_edit_correct = True
-        if name == "run_bash" and ("pytest" in str(args.get("command", "")) or "test" in str(
-            args.get("command", "")
-        )):
+        if name == "run_bash" and (
+            "pytest" in str(args.get("command", ""))
+            or "test" in str(args.get("command", ""))
+        ):
             self.did_run_tests = True
             if "PORT = 9000" in env_before.files.get(CONFIG_PATH, ""):
                 self.saw_tests_pass = True
