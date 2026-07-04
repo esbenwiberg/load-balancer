@@ -220,6 +220,66 @@ def test_malformed_tool_call_through_responses_bridge():
         json.loads(raw_args)
 
 
+# --- negative paths: bad input -> clean 4xx, never a hang or 5xx (goal 8) ----
+#
+# The bound on "no hang" is the request completing inside TIMEOUT at all: httpx
+# raises ReadTimeout if the gateway wedges, which fails the test. So every
+# assertion here doubles as a liveness check — a 4xx that arrives is proof the
+# gateway rejected cleanly instead of hanging or melting into a 5xx.
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/v1/chat/completions", "/v1/responses", "/v1/messages"],
+)
+def test_malformed_json_body_clean_4xx(path):
+    """A body that isn't valid JSON must be rejected with a clean 4xx on EVERY
+    client surface — not a 5xx, not a hang. This is the classic garbage-in
+    probe: a truncated/corrupt request must never wedge a worker."""
+    headers = {**AUTH, "Content-Type": "application/json"}
+    if path == "/v1/messages":
+        headers["anthropic-version"] = "2023-06-01"
+    r = httpx.post(
+        GATEWAY + path,
+        headers=headers,
+        content=b'{"model": "qwen3-coder", "messages": [',  # truncated JSON
+        timeout=TIMEOUT,
+    )
+    assert 400 <= r.status_code < 500, (
+        "malformed JSON on %s must be a clean 4xx, got %s: %s"
+        % (path, r.status_code, r.text)
+    )
+
+
+@pytest.mark.parametrize(
+    "path,payload",
+    [
+        (
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "ping"}]},
+        ),
+        ("/v1/responses", {"input": [{"role": "user", "content": "ping"}]}),
+        (
+            "/v1/messages",
+            {"max_tokens": 16, "messages": [{"role": "user", "content": "ping"}]},
+        ),
+    ],
+)
+def test_unknown_model_alias_clean_4xx(path, payload):
+    """A model alias the gateway doesn't know must be refused with a clean 4xx
+    (LiteLLM's 'Invalid model name' family), never a 5xx or a hang. Proves the
+    router rejects unroutable aliases at the door instead of failing downstream."""
+    headers = {**AUTH}
+    if path == "/v1/messages":
+        headers["anthropic-version"] = "2023-06-01"
+    body = {"model": "no-such-model-alias-xyz", **payload}
+    r = httpx.post(GATEWAY + path, headers=headers, json=body, timeout=TIMEOUT)
+    assert 400 <= r.status_code < 500, (
+        "unknown model alias on %s must be a clean 4xx, got %s: %s"
+        % (path, r.status_code, r.text)
+    )
+
+
 # --- fallback ----------------------------------------------------------------
 
 

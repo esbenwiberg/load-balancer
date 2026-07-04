@@ -35,12 +35,26 @@ cd e2e
 1. **`test_e2e.py`** — raw-HTTP suite emulating the real clients: Anthropic
    `/v1/messages` (streaming, the Claude Code path), OpenAI `/v1/responses` (the
    Codex path), fallback on injected 5xx, cascading fallback, virtual-key model
-   scoping, missing-auth rejection, streaming integrity.
-2. **conformance through the gateway** — `conformance.py --api responses`
-   pointed at LiteLLM. mockd plays the Read→Edit→Bash scenario by the rules, so
-   this is **deterministically green** and gates the **Responses→ChatCompletions
-   bridge mechanics** (Blocker A, [docs/03 risk 4](../docs/03-open-questions-and-risks.md)) —
-   the plumbing, not a real model's quality.
+   scoping, missing-auth rejection, streaming integrity, and **negative paths**
+   (malformed JSON body + unknown model alias → a clean `4xx`, never a `5xx` or a
+   hang, on all three client surfaces).
+2. **conformance DIRECT against mockd** — `conformance.py --api chat` pointed at
+   mockd's OpenAI chat endpoint with **no gateway hop**. This isolates a mockd
+   regression from a gateway regression: the other conformance steps run
+   *through* the gateway, so without this a broken mockd and a broken gateway are
+   the same red. Runs first, so an isolated backend fault is attributed before
+   the gateway steps can muddy the signal.
+3. **conformance through the gateway** — `conformance.py --api responses` (and
+   `--api anthropic`) pointed at LiteLLM. mockd plays the Read→Edit→Bash scenario
+   by the rules, so this is **deterministically green** and gates the
+   **Responses→ChatCompletions bridge mechanics** (Blocker A,
+   [docs/03 risk 4](../docs/03-open-questions-and-risks.md)) — the plumbing, not a
+   real model's quality.
+
+The LiteLLM image pin (never the `1.82.7`/`1.82.8` malware tags — [docs/03 risk 8](../docs/03-open-questions-and-risks.md))
+is machine-enforced by `scripts/check.sh` (fast tier, so it runs in the
+pre-commit hook, the Stop hook, and CI): every active `litellm` image reference
+across compose files must equal the vetted pin, or the gate fails.
 
 ### mockd — the controllable backend
 

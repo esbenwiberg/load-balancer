@@ -63,6 +63,22 @@ done
 echo "--- pytest e2e suite ---"
 "$VENV/bin/python" -m pytest test_e2e.py -v
 
+# --- conformance DIRECT against mockd: isolate the backend (goal 8) ----------
+# The other conformance steps run THROUGH the gateway, so a mockd regression is
+# indistinguishable from a gateway regression — both surface as the same red.
+# This step hits mockd's OpenAI chat endpoint directly (no gateway hop): if the
+# scenario breaks HERE, the fault is in mockd; if it breaks only in the gateway
+# steps below, the fault is in the gateway/translation. mockd doesn't auth, so
+# the key is a placeholder. This runs FIRST so an isolated backend regression is
+# attributed before the gateway steps can muddy the signal.
+echo "--- conformance harness DIRECT against mockd (chat, no gateway) ---"
+"$VENV/bin/python" ../conformance/conformance.py \
+  --base-url "$MOCKD_URL/v1" \
+  --api chat \
+  --model qwen3-coder \
+  --api-key "sk-mockd-direct-placeholder" \
+  --runs 3
+
 # --- conformance THROUGH the gateway: the Blocker-A plumbing gate -----------
 # Responses -> Chat bridge (Codex path) end-to-end, deterministically green
 # because mockd plays the scenario by the rules. Proves the bridge mechanics,
