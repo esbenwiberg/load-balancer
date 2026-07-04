@@ -89,17 +89,6 @@ isn't (see § Needs-a-human).
 a minimal control-plane service exists (SQLite or Redis + a heartbeat interface) exposing per-model {warm, in_flight, healthy, agent_capable}; it has unit tests that pass, with the passing output surfaced in the conversation; its open design decisions are documented in a new docs file; hard constraint: build the registry + state + tests ONLY — do NOT implement the routing policy or session-stickiness rule, those are Needs-a-human decisions; e2e/run.sh exits 0 with its passing output surfaced; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 40 turns and leave a draft PR describing the decision needed
 ```
 
-### 6. Exercise mockd's remaining fault modes + pin retry-vs-fallback order — risk: low
-**Why:** mockd can already inject 429, latency, count-limited transient faults,
-and malformed tool calls ([e2e/mockd.py](e2e/mockd.py)) — but `test_e2e.py`
-only ever uses a persistent 503. Worse, LiteLLM's retry-before-fallback order
-is unpinned: a config change could silently turn one backend fault into N
-duplicate upstream requests and nothing would catch it.
-**Completion condition:**
-```
-e2e/test_e2e.py has passing tests for (a) 429 -> fallback/cooldown behaviour, (b) a count-limited transient 5xx that documents whether LiteLLM retries the same backend before advancing the fallback chain, and (c) a malformed tool-call surfaced through the Responses bridge; the observed retry-vs-fallback order is written into docs/03-open-questions-and-risks.md; this overlaps goal 2 (hangup) and may share a PR with it, but this condition is judged on its own clauses; e2e/run.sh exits 0 with its passing output surfaced in the conversation; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR describing the decision needed
-```
-
 ### 7. Tool-calling coverage on the Anthropic surface — risk: medium
 **Why:** Claude Code's real path is `/v1/messages` **with tools**, streaming.
 e2e only proves plain-text translation there; the conformance harness speaks
@@ -246,3 +235,4 @@ decision is made.
 - ✅ 0. One check script + githooks + agent self-validation — PR #7 (2026-07)
 - ✅ 1. Wire the e2e harness into CI — PR #9 (2026-07)
 - ✅ 2. Mid-stream-death fallback test + pinned retry/stream semantics (risk 7) — PR #11 (2026-07)
+- ✅ 6. mockd fault modes (429, transient 5xx, malformed tool-call) + pinned retry-before-fallback order + fixed cross-test cooldown flake — PR #13 (2026-07)

@@ -35,7 +35,18 @@ TIMEOUT = 30.0
 
 @pytest.fixture(autouse=True)
 def _reset_mockd():
-    """Clear all injected faults before each test so tests can't leak state."""
+    """Clear all injected faults before each test so tests can't leak state.
+
+    NOTE: this clears mockd's BACKEND fault state, but not any gateway-side
+    router state. LiteLLM's per-deployment COOLDOWN is exactly such state — it is
+    in-memory, time-based, and survives a mockd reset, so a fault test that
+    flapped qwen3-coder would silently cool it down and reroute the *next*
+    serial test's request to the fallback. We defuse that at the source by
+    setting `disable_cooldowns: true` in litellm-config.e2e.yaml (see the comment
+    there) rather than papering over it with waits here — cooldown is a latency
+    optimization, and the client-visible contract the suite asserts is fallback,
+    which is cooldown-independent.
+    """
     httpx.post(MOCKD + "/__reset", timeout=TIMEOUT)
     yield
     httpx.post(MOCKD + "/__reset", timeout=TIMEOUT)
@@ -154,6 +165,61 @@ def test_responses_bridge():
     assert "served_model=qwen3-coder" in text, body
 
 
+def test_malformed_tool_call_through_responses_bridge():
+    """A malformed tool call surfaced through the Responses bridge (goal 6c).
+
+    mockd's `malformed` mode emits a real tool call whose JSON arguments are
+    truncated (closing brace dropped) — the classic "model produced invalid
+    tool-call JSON" failure. Codex's path is /v1/responses bridged down to the
+    chat backend, so this exercises the bridge's tool-call translation on a
+    corrupt payload.
+
+    Observed contract: the bridge is a TRANSPORT, not a validator. It surfaces
+    the malformed arguments to the client VERBATIM as a function_call item — it
+    neither repairs the JSON nor rejects the turn with a 5xx. Parsing/validation
+    is the client's job (the SDK's json.loads on `arguments` is where it fails),
+    which is the correct layering: the gateway must not silently mutate a tool
+    call. If a LiteLLM bump starts sanitising or erroring here, this flips.
+    """
+    _inject({"model": "qwen3-coder", "mode": "malformed"})
+    r = httpx.post(
+        GATEWAY + "/v1/responses",
+        headers=AUTH,
+        json={
+            "model": "qwen3-coder",
+            "tool_choice": "required",  # force the scripted read_file call
+            "input": [{"role": "user", "content": "read the config"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "read_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                    },
+                }
+            ],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, (
+        "bridge must not 5xx on a malformed tool call: " + r.text
+    )
+    body = r.json()
+    calls = [it for it in body.get("output", []) if it.get("type") == "function_call"]
+    assert calls, (
+        "expected a function_call to surface through the bridge, got: "
+        + repr(body.get("output"))
+    )
+    raw_args = calls[0].get("arguments", "")
+    assert raw_args, "function_call surfaced with no arguments string: " + repr(
+        calls[0]
+    )
+    # The whole point: the args are passed through corrupt, not repaired.
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(raw_args)
+
+
 # --- fallback ----------------------------------------------------------------
 
 
@@ -195,6 +261,102 @@ def test_fallback_cascades_when_first_fallback_also_down():
     assert r.status_code == 200, r.text
     content = r.json()["choices"][0]["message"]["content"] or ""
     assert "served_model=claude-opus" in content, content
+
+
+def test_fallback_on_429():
+    """429 (rate-limit) is a fallback-triggering fault just like 5xx (goal 6a).
+
+    A persistent 429 on the workbench must advance the fallback chain to the
+    Foundry tier, not surface the 429 to the client. In production a repeated
+    429 would ALSO trip the router's cooldown (`allowed_fails`/`cooldown_time`),
+    pre-emptively skipping qwen3-coder on later requests — but cooldown is a
+    latency optimization layered on TOP of fallback, and it is deliberately
+    disabled in the e2e config (`disable_cooldowns: true`) because its in-memory,
+    time-based state bleeds across serially-run tests. The client-visible
+    contract this test pins is cooldown-independent: a clean 200 served by the
+    fallback, never a leaked 429.
+    """
+    _inject({"model": "qwen3-coder", "status": 429})  # persistent until reset
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": "qwen3-coder",
+            "messages": [{"role": "user", "content": "ping"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, "429 must fall back cleanly, not surface: " + r.text
+    content = r.json()["choices"][0]["message"]["content"] or ""
+    assert "served_model=claude-sonnet" in content, (
+        "expected 429 to fall back to claude-sonnet, got: " + content
+    )
+
+
+def _served_model(resp_json) -> str:
+    """Pull mockd's served_model stamp out of a chat completion."""
+    return resp_json["choices"][0]["message"]["content"] or ""
+
+
+def test_transient_5xx_retries_same_backend_before_fallback():
+    """PIN the retry-vs-fallback ORDER (goal 6b). This is the config-change
+    tripwire: LiteLLM's `num_retries` (=1 in the e2e config) is spent RETRYING
+    THE SAME BACKEND before the fallback chain is ever consulted.
+
+    mockd's count-limited fault lets us prove the order by observation, because
+    which backend answers depends on whether the retry lands on the original:
+
+      * count=1  -> the FIRST attempt 503s and the fault auto-clears, so the one
+                    retry hits qwen3-coder again and SUCCEEDS. served_model is
+                    still qwen3-coder => LiteLLM retried the same backend and
+                    never touched the fallback chain.
+      * count=2  -> BOTH the first attempt and its retry 503 (fault outlasts the
+                    retry budget); only THEN does the chain advance, so
+                    claude-sonnet answers.
+
+    The contrast nails it: a transient fault shorter than the retry budget is
+    absorbed on the same backend; one that outlasts it advances the chain. If a
+    future config bump reorders this (e.g. fallback-before-retry, or a retry that
+    re-sends to a *different* deployment), count=1 would start answering from the
+    Foundry tier and this test flips red. The observed order is documented in
+    docs/03-open-questions-and-risks.md (risk 7).
+    """
+    # One transient 503, shorter than the retry budget -> absorbed on retry.
+    _inject({"model": "qwen3-coder", "status": 503, "count": 1})
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": "qwen3-coder",
+            "messages": [{"role": "user", "content": "ping"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+    assert "served_model=qwen3-coder" in _served_model(r.json()), (
+        "a transient fault within the retry budget must be absorbed on the SAME "
+        "backend (num_retries retried qwen3-coder before any fallback), got: "
+        + _served_model(r.json())
+    )
+
+    # A fault that outlasts the retry budget (first attempt + its one retry both
+    # 503) -> retries exhausted, chain advances to the Foundry tier.
+    httpx.post(MOCKD + "/__reset", timeout=TIMEOUT)
+    _inject({"model": "qwen3-coder", "status": 503, "count": 2})
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": "qwen3-coder",
+            "messages": [{"role": "user", "content": "ping"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+    assert "served_model=claude-sonnet" in _served_model(r.json()), (
+        "a fault outlasting the retry budget must advance the fallback chain, "
+        "got: " + _served_model(r.json())
+    )
 
 
 # --- mid-stream backend death (docs/03 risk 7) ------------------------------
