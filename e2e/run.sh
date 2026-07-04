@@ -75,5 +75,19 @@ echo "--- conformance harness through the gateway (Responses bridge) ---"
   --api-key "$LITELLM_MASTER_KEY" \
   --runs 3
 
+# --- conformance THROUGH the gateway: the Anthropic tool-call gate (goal 7) --
+# Claude Code's REAL path — /v1/messages with tools, streaming — driven through
+# the full read->edit->bash scenario AND both probes (parallel tool calls,
+# tool_choice:required). The gateway translates anthropic->chat toward mockd and
+# back, so this is the ONLY gate on tool-call translation over our single
+# biggest client surface. mockd is unchanged; it just sees a chat request.
+echo "--- conformance harness through the gateway (Anthropic /v1/messages, tools+stream) ---"
+"$VENV/bin/python" ../conformance/conformance.py \
+  --base-url "$GATEWAY_URL/v1" \
+  --api anthropic \
+  --model qwen3-coder \
+  --api-key "$LITELLM_MASTER_KEY" \
+  --runs 3
+
 echo
 echo "ALL E2E CHECKS PASSED"

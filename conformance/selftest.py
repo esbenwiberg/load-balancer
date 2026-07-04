@@ -17,10 +17,15 @@ from __future__ import annotations
 
 import sys
 
+import json
+
 from conformance import (
+    AnthropicTransport,
     AssistantTurn,
     ToolCall,
+    _iter_sse_data,
     aggregate,
+    detect_content_toolcall_leak,
     probe_parallel,
     probe_tool_choice_required,
     run_once,
@@ -143,6 +148,166 @@ def _run(script):
     return m, aggregate([m], 0.02, 0.8)
 
 
+# --- Anthropic transport wire parsing (offline, no network) -----------------
+# The `anthropic` transport is the only transport with bespoke wire handling not
+# exercised by the fake-transport run loop. These prove its Anthropic-Messages
+# serialization (tool_use / tool_result blocks) and streaming/block parsing
+# without a gateway, so a translation regression is caught in the fast tier.
+
+
+def _check_anthropic(fails):
+    at = AnthropicTransport("http://gw/v1", "sk-test", "qwen3-coder")
+
+    # SSE data extraction: skip event:/blank/[DONE], parse data: JSON.
+    lines = [
+        "event: content_block_start",
+        'data: {"type": "content_block_start", "index": 0}',
+        "",
+        "data: [DONE]",
+    ]
+    got = list(_iter_sse_data(lines))
+    if got != [{"type": "content_block_start", "index": 0}]:
+        fails.append(f"anthropic _iter_sse_data: got {got}")
+
+    # Streaming: a tool_use block whose args arrive across two input_json_delta
+    # chunks -> one clean ToolCall with reassembled JSON.
+    stream_toolcall = [
+        {"type": "message_start", "message": {}},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read_file"},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"path": '},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '"app/config.py"}'},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+        {"type": "message_stop"},
+    ]
+    turn = AnthropicTransport._parse_stream_events(stream_toolcall)
+    if not (
+        len(turn.tool_calls) == 1
+        and turn.tool_calls[0].id == "toolu_1"
+        and turn.tool_calls[0].name == "read_file"
+        and json.loads(turn.tool_calls[0].arguments_raw) == {"path": "app/config.py"}
+        and turn.content == ""
+        and turn.finish_reason == "tool_use"
+    ):
+        fails.append(f"anthropic stream tool_use parse: got {turn}")
+
+    # Streaming: a plain-text final turn -> content, no calls.
+    stream_text = [
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "Done — PORT is 9000"},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": " and tests pass."},
+        },
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+    ]
+    turn = AnthropicTransport._parse_stream_events(stream_text)
+    if not (
+        turn.content == "Done — PORT is 9000 and tests pass." and not turn.tool_calls
+    ):
+        fails.append(f"anthropic stream text parse: got {turn}")
+
+    # A leaked tool call arriving as TEXT (wrong parser upstream) must survive
+    # into content so detect_content_toolcall_leak can flag it downstream.
+    stream_leak = [
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "text_delta",
+                "text": '<tool_call>{"name": "read_file"}</tool_call>',
+            },
+        }
+    ]
+    turn = AnthropicTransport._parse_stream_events(stream_leak)
+    if not (not turn.tool_calls and detect_content_toolcall_leak(turn.content)):
+        fails.append(f"anthropic stream leak-in-text parse: got {turn}")
+
+    # Non-streaming block response: text + tool_use in the content array.
+    body = {
+        "content": [
+            {"type": "text", "text": "reading"},
+            {
+                "type": "tool_use",
+                "id": "toolu_2",
+                "name": "edit_file",
+                "input": {"path": "app/config.py", "old_string": "8000"},
+            },
+        ],
+        "stop_reason": "tool_use",
+    }
+    turn = AnthropicTransport._parse_block_response(body)
+    if not (
+        turn.content == "reading"
+        and len(turn.tool_calls) == 1
+        and turn.tool_calls[0].name == "edit_file"
+        and json.loads(turn.tool_calls[0].arguments_raw)["path"] == "app/config.py"
+    ):
+        fails.append(f"anthropic block parse: got {turn}")
+
+    # record_assistant serializes tool_use blocks with a real dict `input`;
+    # record_tool_result serializes a tool_result user message.
+    at.reset("sys", "do the thing")
+    at.record_assistant(
+        AssistantTurn(
+            "",
+            [ToolCall("toolu_3", "read_file", '{"path": "app/config.py"}')],
+            "tool_use",
+        )
+    )
+    at.record_tool_result("toolu_3", "read_file", "PORT = 8000")
+    asst, tool_msg = at.messages[-2], at.messages[-1]
+    tu = asst["content"][0]
+    tr = tool_msg["content"][0]
+    if not (
+        asst["role"] == "assistant"
+        and tu["type"] == "tool_use"
+        and tu["input"] == {"path": "app/config.py"}
+        and tool_msg["role"] == "user"
+        and tr["type"] == "tool_result"
+        and tr["tool_use_id"] == "toolu_3"
+        and tr["content"] == "PORT = 8000"
+    ):
+        fails.append(f"anthropic serialization: asst={asst} tool={tool_msg}")
+
+    # Malformed args must NOT crash serialization — they fall back to {} so the
+    # request stays well-formed (the error is recorded against the call anyway).
+    at.reset("sys", "x")
+    at.record_assistant(
+        AssistantTurn("", [ToolCall("toolu_4", "read_file", '{"path": ')], "tool_use")
+    )
+    if at.messages[-1]["content"][0]["input"] != {}:
+        fails.append("anthropic serialization: malformed args should fall back to {}")
+
+    # tool_choice mapping: OpenAI 'required' -> Anthropic {"type": "any"}.
+    at.reset("sys", "x")
+    if at._payload(0.0, "required", True).get("tool_choice") != {"type": "any"}:
+        fails.append("anthropic tool_choice: 'required' must map to {'type':'any'}")
+    if at._payload(0.0, "auto", True).get("tool_choice") != {"type": "auto"}:
+        fails.append("anthropic tool_choice: 'auto' must map to {'type':'auto'}")
+
+
 def main() -> int:
     fails = []
 
@@ -226,6 +391,9 @@ def main() -> int:
             "probe defect should force agent_capable=false even with clean runs"
         )
 
+    # --- Anthropic transport wire parsing / serialization ---
+    _check_anthropic(fails)
+
     if fails:
         print("SELF-TEST FAILED:")
         for f in fails:
@@ -233,7 +401,8 @@ def main() -> int:
         return 1
     print(
         "SELF-TEST PASSED: runs (happy/recovery), failure modes "
-        "(leak/bad-json/unknown-tool/runaway), and probes (parallel/tool_choice) all correct."
+        "(leak/bad-json/unknown-tool/runaway), probes (parallel/tool_choice), "
+        "and anthropic-transport wire parsing all correct."
     )
     return 0
 

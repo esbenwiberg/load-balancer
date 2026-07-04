@@ -89,16 +89,6 @@ isn't (see § Needs-a-human).
 a minimal control-plane service exists (SQLite or Redis + a heartbeat interface) exposing per-model {warm, in_flight, healthy, agent_capable}; it has unit tests that pass, with the passing output surfaced in the conversation; its open design decisions are documented in a new docs file; hard constraint: build the registry + state + tests ONLY — do NOT implement the routing policy or session-stickiness rule, those are Needs-a-human decisions; e2e/run.sh exits 0 with its passing output surfaced; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 40 turns and leave a draft PR describing the decision needed
 ```
 
-### 7. Tool-calling coverage on the Anthropic surface — risk: medium
-**Why:** Claude Code's real path is `/v1/messages` **with tools**, streaming.
-e2e only proves plain-text translation there; the conformance harness speaks
-`chat` and `responses` but has no `anthropic` transport. Our single biggest
-client path has no tool-call gate at all.
-**Completion condition:**
-```
-conformance.py gains an --api anthropic transport (or e2e gains an equivalent full read->edit->bash tool round-trip over streaming /v1/messages); it passes through the gateway against mockd and run.sh executes it as part of the suite; constraint: mockd needs no changes — the gateway translates anthropic->chat toward the backend, so the new transport targets the gateway's /v1/messages; e2e/run.sh exits 0 with its passing output surfaced in the conversation; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 40 turns and leave a draft PR describing the decision needed
-```
-
 ### 8. Harness self-checks + guardrail automation — risk: low
 **Why:** run.sh only tests *through* the gateway, so a mockd regression is
 indistinguishable from a gateway regression. And the LiteLLM digest pin
@@ -236,3 +226,4 @@ decision is made.
 - ✅ 1. Wire the e2e harness into CI — PR #9 (2026-07)
 - ✅ 2. Mid-stream-death fallback test + pinned retry/stream semantics (risk 7) — PR #11 (2026-07)
 - ✅ 6. mockd fault modes (429, transient 5xx, malformed tool-call) + pinned retry-before-fallback order + fixed cross-test cooldown flake — PR #13 (2026-07)
+- ✅ 7. Tool-calling coverage on the Anthropic surface (`conformance.py --api anthropic`: /v1/messages tools+streaming, full read→edit→bash round-trip + probes, wired into run.sh) — PR #14 (2026-07)

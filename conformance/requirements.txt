@@ -1,3 +1,6 @@
-# Pin the OpenAI SDK; it's the only runtime dep. Responses API (client.responses)
-# landed in 1.66, and --api responses needs it.
+# OpenAI SDK for the chat/responses transports. Responses API
+# (client.responses) landed in 1.66, and --api responses needs it.
 openai>=1.66,<2
+# httpx for the --api anthropic transport (raw /v1/messages, Bearer auth). The
+# e2e venv already ships it; pinned here so `--api anthropic` works standalone.
+httpx>=0.27,<1

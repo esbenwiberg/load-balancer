@@ -69,11 +69,33 @@ python conformance.py \
   --model qwen3-coder \
   --api-key "$LITELLM_VIRTUAL_KEY" \
   --runs 5
+
+# Anthropic Messages API THROUGH LiteLLM — Claude Code's REAL path (/v1/messages
+# with tools, streaming). Validates anthropic→chat translation both ways. Point
+# at the LiteLLM proxy — it owns the /v1/messages endpoint:
+python conformance.py \
+  --base-url http://litellm.internal:4000/v1 \
+  --api anthropic \
+  --model qwen3-coder \
+  --api-key "$LITELLM_VIRTUAL_KEY" \
+  --runs 5
 ```
 
 `--api chat` (default) speaks Chat Completions; `--api responses` speaks the
 OpenAI Responses API — the endpoint Codex uses and the one that exercises
-LiteLLM's Responses→ChatCompletions bridge.
+LiteLLM's Responses→ChatCompletions bridge. `--api anthropic` speaks the
+Anthropic Messages API (`/v1/messages`) — **Claude Code's real path**, with
+tools and streaming. The base URL is the same OpenAI-style `…/v1`; the transport
+posts to `…/v1/messages` with `Authorization: Bearer` + `anthropic-version`. It
+sends tools in `input_schema` shape, feeds results back as `tool_result` blocks,
+and exercises the gateway's anthropic↔chat tool-call translation in **both
+directions** — the only gate on our single biggest client surface.
+
+> **Keep streaming ON for `--api anthropic`.** LiteLLM's *non-streaming*
+> `/v1/messages` over an OpenAI-chat backend drops text content (a known quirk —
+> see `e2e/test_e2e.py::test_anthropic_messages_nonstream_content_quirk`), which
+> would sink task completion for reasons unrelated to tool calls. Streaming is
+> Claude Code's real path anyway.
 
 Exit code is `0` if `agent_capable`, `1` otherwise — wire it into CI / a cron so
 the flag is *continuously* measured, not earned once.
