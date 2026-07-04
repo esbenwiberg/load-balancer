@@ -61,17 +61,6 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 
 ## § Autonomy-friendly (safe to run unattended)
 
-### 0. One check script + githooks + agent self-validation — risk: low
-**Why:** today the only arbiter is `e2e/run.sh`, which costs a full docker
-stack — there is nothing between "save file" and a multi-minute e2e run, so
-agents get zero cheap feedback and the no-secrets guardrail is enforced by
-vibes. One `scripts/check.sh` that hooks, CI (goal 1), and agents all call
-means the definition of "green" can never drift between them.
-**Completion condition:**
-```
-scripts/check.sh exists with a --fast tier (ruff lint+format, shellcheck, docker compose config validation for all compose files, conformance/selftest.py, gitleaks secret scan — starting no docker containers) and a full tier that adds e2e/run.sh; a checked-in .githooks/pre-commit runs the fast tier via a scripts/setup-dev.sh that sets core.hooksPath and reports missing tools; a Claude Code Stop hook in .claude/settings.json runs the fast tier; missing tools warn-and-skip locally but the script hard-fails on real findings — demonstrate this by running the fast tier once with one tool absent from PATH and surfacing the warn-and-skip output in the conversation; hard constraint: NO docker containers in any git hook — full e2e stays the merge gate (CI, goal 1), never the commit gate, because slow hooks train everyone to --no-verify; both tiers exit 0 on the repo's current HEAD with their exit status surfaced in the conversation; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 40 turns and leave a draft PR describing the decision needed
-```
-
 ### 1. Wire the e2e harness into CI — risk: low
 **Why:** `e2e/run.sh` is exit-code clean but nothing runs it automatically; a
 regression (like the `tier`→`backend_tier` bug) could sneak back in.
@@ -271,3 +260,4 @@ decision is made.
 - ✅ Phase-0 groundwork (blockers A & B, conformance harness, deploy scaffold) — PR #1
 - ✅ E2E test harness (mock + cli-auth profiles) — PR #2
 - ✅ Goal-driven workflow (GOALS.md backlog + unattended contract) — PR #3
+- ✅ 0. One check script + githooks + agent self-validation — PR #7 (2026-07)
