@@ -98,6 +98,48 @@ A retry that re-sends a partially-streamed request is a correctness bug.
 **Open:** define timeout/retry semantics per hop; test mid-stream Spark death → clean
 fallback.
 
+> **✅ OBSERVED (mid-stream death, e2e — 2026-07).** mockd's `hangup` mode
+> (partial SSE chunk, then the connection is slammed shut with no terminator)
+> exercises this on both surfaces through LiteLLM `v1.83.14-stable`. Pinned by
+> `test_chat_stream_backend_hangup_midstream` and
+> `test_responses_stream_backend_hangup_midstream` in [e2e/test_e2e.py](../e2e/test_e2e.py).
+> Retry/fallback config in play: `num_retries: 1`, fallback chain
+> `qwen3-coder → claude-sonnet → claude-opus → gpt` ([e2e/litellm-config.e2e.yaml](../e2e/litellm-config.e2e.yaml)).
+>
+> **Semantics per hop — the fallback boundary is the first byte to the client:**
+> - **Backend → gateway (retry/fallback CAN act):** happens only *before* the
+>   client response line is committed. Connection-establishment errors and
+>   non-2xx statuses (e.g. a 503) are retried/failed-over cleanly — that's what
+>   `test_fallback_to_foundry_on_5xx` proves. A 5xx/connection error while the
+>   upstream stream has NOT yet started still falls back.
+> - **Gateway → client (retry/fallback CANNOT act):** once the gateway forwards
+>   the first SSE byte, HTTP `200` + headers are on the wire, so it can no longer
+>   change status or re-route. When the backend dies *mid-stream* the client
+>   receives the partial pre-hangup content (`chat`: a `delta.content` chunk;
+>   `responses`: a `response.output_text.delta`) and then a **truncated stream
+>   that never emits `[DONE]` / `response.completed`** — it goes silent until the
+>   client's own read timeout fires. **No clean fallback is possible here** — this
+>   is inherent to HTTP streaming, not a LiteLLM bug.
+> - **No duplicate upstream request / no spliced reply:** measured backend hit
+>   count for one mid-stream-death request is **1** — LiteLLM does *not* re-send
+>   the partially-streamed request to another backend, and no Foundry-tier
+>   `served_model` stamp leaks into the truncated stream. So the specific
+>   correctness bug this risk warns about ("a retry that re-sends a
+>   partially-streamed request") does **not** occur on the streaming path; the
+>   failure mode is instead a clean truncation the **client must detect** via the
+>   missing terminator.
+>
+> **Implication for the design:** mid-stream backend death is a client-visible
+> truncation, not a gateway-recoverable event. Clients (Claude Code / Codex)
+> already treat a stream that ends without its terminator as a failed turn and
+> retry the *whole* turn — which is the correct recovery (a fresh request CAN
+> fall back at the backend→gateway boundary). Two follow-ups worth tracking:
+> (a) the gateway holds the client connection open (silent) rather than closing
+> it on upstream death, so clients rely on their own read timeout — consider a
+> gateway-side idle-stream timeout so truncations surface fast; (b) to *avoid*
+> mid-stream death costing a full turn, routing could prefer the always-up
+> Foundry tier for requests expected to stream a lot (ties into risk 3).
+
 ## 🟡 Operational / security
 
 ### 8. LiteLLM supply-chain
