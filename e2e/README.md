@@ -35,9 +35,14 @@ cd e2e
 1. **`test_e2e.py`** — raw-HTTP suite emulating the real clients: Anthropic
    `/v1/messages` (streaming, the Claude Code path), OpenAI `/v1/responses` (the
    Codex path), fallback on injected 5xx, cascading fallback, virtual-key model
-   scoping, missing-auth rejection, streaming integrity, and **negative paths**
+   scoping, missing-auth rejection, streaming integrity, **negative paths**
    (malformed JSON body + unknown model alias → a clean `4xx`, never a `5xx` or a
-   hang, on all three client surfaces).
+   hang, on all three client surfaces), and **concurrency smoke** (goal 9): a
+   fleet of parallel streams across four aliases — with a 503 on one forcing a
+   fallback hop mid-fleet — asserts every response carries its *own* backend's
+   `served_model` stamp (no cross-request bleed) and terminates its stream
+   cleanly, including a mixed-surface variant that runs chat + responses +
+   messages streams at once to catch interleaved SSE across protocols.
 2. **conformance DIRECT against mockd** — `conformance.py --api chat` pointed at
    mockd's OpenAI chat endpoint with **no gateway hop**. This isolates a mockd
    regression from a gateway regression: the other conformance steps run

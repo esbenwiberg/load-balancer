@@ -89,15 +89,6 @@ isn't (see § Needs-a-human).
 a minimal control-plane service exists (SQLite or Redis + a heartbeat interface) exposing per-model {warm, in_flight, healthy, agent_capable}; it has unit tests that pass, with the passing output surfaced in the conversation; its open design decisions are documented in a new docs file; hard constraint: build the registry + state + tests ONLY — do NOT implement the routing policy or session-stickiness rule, those are Needs-a-human decisions; e2e/run.sh exits 0 with its passing output surfaced; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 40 turns and leave a draft PR describing the decision needed
 ```
 
-### 9. Concurrency smoke — parallel streams must not cross-talk — risk: low
-**Why:** every e2e test runs serially, but the gateway's whole job is serving
-concurrent agents. A cross-request bleed (wrong `served_model` stamp,
-interleaved SSE chunks) would be catastrophic and is currently invisible.
-**Completion condition:**
-```
-an e2e test fires concurrent streaming requests across different model aliases with a fault injected on one of them, and asserts every response carries the correct served_model stamp and terminates its stream cleanly; e2e/run.sh exits 0 with its passing output surfaced in the conversation; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR describing the decision needed
-```
-
 ### 10. Dev-mode stack — the self-validation fleet — risk: low
 **Why:** the endgame's harness. Agents building features must be able to spin
 up the full topology locally — gateway + **two separate mock workbench
@@ -218,3 +209,4 @@ decision is made.
 - ✅ 6. mockd fault modes (429, transient 5xx, malformed tool-call) + pinned retry-before-fallback order + fixed cross-test cooldown flake — PR #13 (2026-07)
 - ✅ 7. Tool-calling coverage on the Anthropic surface (`conformance.py --api anthropic`: /v1/messages tools+streaming, full read→edit→bash round-trip + probes, wired into run.sh) — PR #14 (2026-07)
 - ✅ 8. Harness self-checks + guardrail automation (mockd-direct conformance step in run.sh; negative-path e2e tests — malformed JSON + unknown alias → clean 4xx on all three surfaces; LiteLLM image-pin guard in check.sh enforced by pre-commit/Stop/CI) — PR #15 (2026-07)
+- ✅ 9. Concurrency smoke — parallel streams across 4 aliases with a 503-fault forcing a fallback mid-fleet; asserts each response keeps its own served_model stamp (no cross-request bleed) + clean stream termination, plus a mixed chat/responses/messages variant for interleaved-SSE-across-protocols — PR #16 (2026-07)
