@@ -51,7 +51,7 @@ unattended run.
 Priority is (a) completing the idea — control plane, observability, dashboard —
 and (b) hardening the harness + test setup. Recommended order:
 harness core (0 → 1 → 2 → 6 → 7 → 9) → dev stack (10) → observability +
-wallet guards (3 → 11 → 11b) → dashboard v1 (12) → Ollama (4) → control plane
+wallet guards (3 → 11b) → dashboard v1 (12) → Ollama (4) → control plane
 (5) → dashboard v2 (13) → Azure IaC (14). Spark-infra-shaped work is parked.
 
 Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
@@ -87,15 +87,6 @@ isn't (see § Needs-a-human).
 **Completion condition:**
 ```
 a minimal control-plane service exists (SQLite or Redis + a heartbeat interface) exposing per-model {warm, in_flight, healthy, agent_capable}; it has unit tests that pass, with the passing output surfaced in the conversation; its open design decisions are documented in a new docs file; hard constraint: build the registry + state + tests ONLY — do NOT implement the routing policy or session-stickiness rule, those are Needs-a-human decisions; e2e/run.sh exits 0 with its passing output surfaced; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 40 turns and leave a draft PR describing the decision needed
-```
-
-### 11. Budgets + rate limits per virtual key — vacation-proof the wallet — risk: low
-**Why:** unattended goal runs + (eventually) a hosted endpoint = runaway-spend
-risk, and the whole point is burning *subscription*, not invoice. LiteLLM
-supports `max_budget` / tpm / rpm per key; nothing configures or tests it.
-**Completion condition:**
-```
-every virtual key the gateway issues gets a default budget and rate limit from config; an e2e test proves an over-budget key and an over-limit key are refused with a clean 4xx (no hang, no 5xx); the knobs and how to raise them are documented; e2e/run.sh exits 0 with its passing output surfaced in the conversation; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR describing the decision needed
 ```
 
 ### 11b. Users, teams, and spend audit — who spent what — risk: medium
@@ -199,3 +190,4 @@ decision is made.
 - ✅ 8. Harness self-checks + guardrail automation (mockd-direct conformance step in run.sh; negative-path e2e tests — malformed JSON + unknown alias → clean 4xx on all three surfaces; LiteLLM image-pin guard in check.sh enforced by pre-commit/Stop/CI) — PR #15 (2026-07)
 - ✅ 9. Concurrency smoke — parallel streams across 4 aliases with a 503-fault forcing a fallback mid-fleet; asserts each response keeps its own served_model stamp (no cross-request bleed) + clean stream termination, plus a mixed chat/responses/messages variant for interleaved-SSE-across-protocols — PR #16 (2026-07)
 - ✅ 10. Dev-mode stack — standing dev profile (docker-compose.dev.yaml): gateway + two distinct mock workbench containers (workbench-a/-b) + mock-foundry, each stamping served_model=<model>@<instance>; dev_smoke.sh proves all 3 surfaces (messages/chat/responses) route to distinct containers; per-instance /__control faults; README wires Claude Code + Codex; real-haiku variant documented but keyless-offline stays default — PR #17 (2026-07)
+- ✅ 11. Budgets + rate limits per virtual key — `default_key_generate_params` (max_budget/rpm/tpm) in litellm-config.e2e.yaml so every issued key inherits a config default; e2e proves a bare key inherits the defaults, an over-budget key (max_budget:0) → clean 400 budget_exceeded, an over-rate-limit key (rpm:1) → clean 429 (never 5xx/hang); README documents the knobs + how to raise them + the goal-11/11b units boundary (dollar-spend accrual is 11b) — PR #? (2026-07)

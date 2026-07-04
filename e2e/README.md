@@ -43,7 +43,11 @@ cd e2e
    fallback hop mid-fleet — asserts every response carries its *own* backend's
    `served_model` stamp (no cross-request bleed) and terminates its stream
    cleanly, including a mixed-surface variant that runs chat + responses +
-   messages streams at once to catch interleaved SSE across protocols.
+   messages streams at once to catch interleaved SSE across protocols. Also the
+   **wallet guardrails** (goal 11): every issued key inherits a default budget +
+   rate limit from config, and an over-budget key and an over-rate-limit key are
+   each refused with a clean `4xx` (never a `5xx` or a hang). See
+   [Budgets & rate limits](#budgets--rate-limits-goal-11) below.
 2. **conformance DIRECT against mockd** — `conformance.py --api chat` pointed at
    mockd's OpenAI chat endpoint with **no gateway hop**. This isolates a mockd
    regression from a gateway regression: the other conformance steps run
@@ -87,6 +91,59 @@ Modes: `agent` (default) · `leak` · `runaway` · `malformed` · `hangup` · `e
 Faults also inject inline via a prompt marker: `[[mockd:status=500]]`.
 `MOCKD_DEBUG=1` logs the exact body LiteLLM forwards (how the finding below was
 found).
+
+### Budgets & rate limits (goal 11)
+
+Unattended goal runs (and, later, a hosted endpoint) mean runaway-spend risk —
+the point is to burn *subscription*, not rack up an invoice. So **every virtual
+key the gateway mints inherits a default budget and rate limit from config**,
+and a key that blows past either is refused with a clean `4xx`.
+
+**Where the defaults live** — `litellm-config.e2e.yaml` →
+`litellm_settings.default_key_generate_params`:
+
+```yaml
+litellm_settings:
+  default_key_generate_params:
+    max_budget: 100          # USD of spend, lifetime (no reset window)
+    rpm_limit: 60            # requests per minute, per key
+    tpm_limit: 200000        # tokens per minute, per key
+```
+
+LiteLLM applies each field only when the `/key/generate` call left it unset, so
+these are *defaults*, not caps — an explicit value on the request always wins.
+The defaults are deliberately generous: they're a backstop against a runaway
+loop, not a throttle on normal traffic.
+
+**How to raise (or lower) a limit**
+
+- *Per key, at issue time* — pass the field explicitly; it overrides the default:
+  ```bash
+  curl -X POST localhost:4000/key/generate -H "Authorization: Bearer $MASTER" \
+    -d '{"models":["qwen3-coder"],"max_budget":1000,"rpm_limit":600}'
+  ```
+  Set `budget_duration` (e.g. `"30d"`) for a budget that resets on a window
+  instead of a lifetime cap.
+- *For an existing key* — `POST /key/update {"key": "...", "rpm_limit": ...}`.
+- *For every future key* — edit `default_key_generate_params` above.
+
+**What refusal looks like** (both are 4xx, never 5xx, never a hang):
+
+| Over… | HTTP | `error.type` |
+|-------|------|--------------|
+| budget (`spend >= max_budget`) | `400` | `budget_exceeded` |
+| rate limit (`rpm`/`tpm`)       | `429` | rate-limit message |
+
+**Units caveat (the goal-11 / goal-11b boundary).** `max_budget` is USD of
+*spend*, and spend = tokens × per-model cost. The mock models carry **no cost**,
+so real dollar spend stays `$0` on this stack — a budget can't be crossed by
+volume here. That's deliberate: dollar-denominated enforcement (accruing spend
+past a budget, attributed per user/team, surviving a restart) is **goal 11b**,
+which adds per-model costs and durable Postgres spend. What this profile proves
+is the client-visible *contract* — the budget and rate-limit **gates refuse a
+key with a clean 4xx**. The over-budget test uses an explicit `max_budget: 0`
+key so the `spend >= max_budget` gate trips on the first request, deterministic
+without depending on async spend-flush or auth-cache TTL.
 
 ---
 

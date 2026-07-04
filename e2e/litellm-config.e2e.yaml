@@ -89,5 +89,29 @@ router_settings:
 litellm_settings:
   drop_params: true
 
+  # --- Wallet guardrails (goal 11) ------------------------------------------
+  # EVERY virtual key the gateway mints inherits these unless the /key/generate
+  # call sets the field explicitly. LiteLLM applies each entry only where the
+  # request left the field None (see key_management_endpoints.py:
+  # `default_key_generate_params`), so an explicit per-key override still wins.
+  # Values are DELIBERATELY generous — they are a runaway-spend backstop for
+  # unattended goal runs, not a throttle on normal traffic. Raise them per key
+  # at issue time (`/key/generate {"max_budget": ..., "rpm_limit": ...}`) or
+  # globally by editing here. See e2e/README.md "Budgets & rate limits".
+  #
+  # NOTE ON UNITS: max_budget is USD of *spend*, and spend = tokens x per-model
+  # cost. These mock models carry no cost, so real dollar spend stays $0 here —
+  # dollar-denominated enforcement (accruing spend past a budget) is proven in
+  # goal 11b, which adds per-model costs + durable Postgres spend. What THIS
+  # config + suite prove is that the budget and rate-limit GATES refuse an
+  # over-limit key with a clean 4xx (never a 5xx or a hang), the client-visible
+  # contract. The over-budget test uses an explicit max_budget:0 key to exercise
+  # the `spend >= max_budget` gate deterministically without depending on async
+  # spend flush or auth-cache TTL.
+  default_key_generate_params:
+    max_budget: 100          # USD, lifetime (no budget_duration reset window)
+    rpm_limit: 60            # requests/min per key
+    tpm_limit: 200000        # tokens/min per key
+
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
