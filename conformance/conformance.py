@@ -6,11 +6,15 @@ Drives a model through a real multi-tool coding task (Read -> Edit -> Bash)
 UNDER STREAMING and measures how reliably it emits *clean, structured* tool
 calls. Emits pass/fail + a tool-call-error-rate.
 
-Two transports:
+Three transports:
   --api chat       OpenAI Chat Completions (vLLM Spark direct, or LiteLLM).
   --api responses  OpenAI Responses API — the endpoint Codex speaks. Point this
                    at LiteLLM to exercise the Responses->ChatCompletions bridge
                    end-to-end (Blocker A / docs/03 risk 4).
+  --api anthropic  Anthropic Messages API — Claude Code's REAL path (/v1/messages
+                   with tools, streaming). Point this at LiteLLM to exercise the
+                   anthropic->chat translation both ways (tools -> tool_use ->
+                   tool_result). This is our single biggest client surface.
 
 Plus two single-turn probes for known failure modes:
   * parallel tool calls (LiteLLM bridge index-collision bug #21331, doc 04)
@@ -34,6 +38,7 @@ import sys
 from dataclasses import asdict, dataclass, field
 
 from scenarios import (
+    ANTHROPIC_TOOLS,
     PARALLEL_PROBE_PROMPT,
     RESPONSES_TOOLS,
     SYSTEM_PROMPT,
@@ -45,8 +50,9 @@ from scenarios import (
     VirtualEnv,
 )
 
-# `openai` is imported lazily inside main() so the offline self-test (which
-# monkeypatches the transport) can run without the dependency installed.
+# `openai` (chat/responses) and `httpx` (anthropic) are imported lazily inside
+# the transports / main() so the offline self-test — which drives the parse
+# helpers and a fake transport directly — can run without either installed.
 
 
 # --- Leaked / degenerate tool-call detection --------------------------------
@@ -340,7 +346,228 @@ class ResponsesTransport:
         return AssistantTurn("".join(text_parts), calls, getattr(resp, "status", None))
 
 
-def make_transport(api: str, client, model):
+class AnthropicTransport:
+    """Anthropic Messages API (/v1/messages) — Claude Code's REAL path, with
+    tools and streaming.
+
+    Targets the GATEWAY's /v1/messages (not a backend directly): LiteLLM
+    translates anthropic->chat toward the backend and back, so this exercises
+    the full Anthropic tool-call round-trip — request `tools` (input_schema
+    shape) -> assistant `tool_use` blocks -> `tool_result` blocks fed back — in
+    BOTH directions. Constraint (goal 7): mockd is unchanged; it just sees a
+    normal chat request with OpenAI tools after the gateway translates.
+
+    Deliberately raw httpx with Bearer auth + anthropic-version, matching the
+    proven e2e client path (test_e2e.py) rather than pulling in the anthropic
+    SDK: no new dependency, and identical auth to the rest of the suite. The
+    wire parsing is factored into pure helpers (_parse_stream_events /
+    _parse_block_response) so selftest.py can cover it offline.
+    """
+
+    name = "anthropic"
+
+    # Anthropic requires max_tokens. mockd's scripted turns are tiny; keep it
+    # generous so a real backend behind the gateway wouldn't be truncated either.
+    def __init__(self, base_url, api_key, model, max_tokens=1024):
+        # base_url is the OpenAI-style base (…/v1). The Messages endpoint is
+        # <base>/messages — e.g. http://host:4000/v1/messages, the exact URL the
+        # e2e suite drives.
+        self.url = base_url.rstrip("/") + "/messages"
+        self.api_key = api_key
+        self.model = model
+        self.max_tokens = max_tokens
+        self.system = ""
+        self.messages: list = []
+        self._client = None  # lazy httpx.Client
+
+    def reset(self, system: str, user: str) -> None:
+        self.system = system
+        self.messages = [{"role": "user", "content": user}]
+
+    def _http(self):
+        if self._client is None:
+            import httpx  # lazy: only when actually hitting the wire
+
+            self._client = httpx.Client(timeout=60.0)
+        return self._client
+
+    def _headers(self):
+        return {
+            "Authorization": "Bearer " + self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+
+    def _payload(self, temperature, tool_choice, stream):
+        payload = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "system": self.system,
+            "messages": self.messages,
+            "tools": ANTHROPIC_TOOLS,
+            "temperature": temperature,
+            "stream": stream,
+        }
+        # OpenAI tool_choice -> Anthropic tool_choice. "required" == "any".
+        if tool_choice == "required":
+            payload["tool_choice"] = {"type": "any"}
+        elif tool_choice == "auto":
+            payload["tool_choice"] = {"type": "auto"}
+        return payload
+
+    def get_turn(self, stream, temperature, tool_choice="auto") -> AssistantTurn:
+        payload = self._payload(temperature, tool_choice, stream)
+        if stream:
+            return self._stream(payload)
+        return self._block(payload)
+
+    def record_assistant(self, turn: AssistantTurn) -> None:
+        blocks: list = []
+        if turn.content:
+            blocks.append({"type": "text", "text": turn.content})
+        for tc in turn.tool_calls:
+            # Anthropic `input` must be a JSON object. If the model emitted
+            # malformed args (only under injected faults — never in the clean
+            # scenario), fall back to {} so the request stays well-formed; the
+            # error is already recorded against the tool call by the run loop.
+            try:
+                inp = json.loads(tc.arguments_raw) if tc.arguments_raw.strip() else {}
+                if not isinstance(inp, dict):
+                    inp = {}
+            except (json.JSONDecodeError, ValueError):
+                inp = {}
+            blocks.append(
+                {"type": "tool_use", "id": tc.id, "name": tc.name, "input": inp}
+            )
+        self.messages.append({"role": "assistant", "content": blocks})
+
+    def record_tool_result(self, call_id, name, content) -> None:
+        self.messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call_id,
+                        "content": content,
+                    }
+                ],
+            }
+        )
+
+    def _block(self, payload) -> AssistantTurn:
+        resp = self._http().post(self.url, headers=self._headers(), json=payload)
+        resp.raise_for_status()
+        return self._parse_block_response(resp.json())
+
+    def _stream(self, payload) -> AssistantTurn:
+        with self._http().stream(
+            "POST", self.url, headers=self._headers(), json=payload
+        ) as resp:
+            resp.raise_for_status()
+            return self._parse_stream_events(_iter_sse_data(resp.iter_lines()))
+
+    # --- pure parse helpers (offline-testable) -----------------------------
+    @staticmethod
+    def _parse_block_response(body: dict) -> AssistantTurn:
+        text_parts: list[str] = []
+        calls: list[ToolCall] = []
+        for i, block in enumerate(body.get("content", []) or []):
+            btype = block.get("type")
+            if btype == "text":
+                text_parts.append(block.get("text", "") or "")
+            elif btype == "tool_use":
+                calls.append(
+                    ToolCall(
+                        block.get("id") or f"call_{i}",
+                        block.get("name", "") or "",
+                        json.dumps(block.get("input", {}) or {}),
+                    )
+                )
+        return AssistantTurn("".join(text_parts), calls, body.get("stop_reason"))
+
+    @staticmethod
+    def _parse_stream_events(events) -> AssistantTurn:
+        """Fold Anthropic streaming events (parsed `data:` dicts) into a turn.
+
+        Accumulates per content-block index: text_delta -> content, tool_use +
+        input_json_delta -> a ToolCall whose arguments are the concatenated
+        partial_json. stop_reason (message_delta) becomes finish_reason.
+        """
+        blocks: dict = {}  # index -> {"kind","text","id","name","args"}
+        order: list = []
+        finish = None
+        for ev in events:
+            etype = ev.get("type")
+            if etype == "content_block_start":
+                idx = ev.get("index", len(order))
+                cb = ev.get("content_block", {}) or {}
+                if cb.get("type") == "tool_use":
+                    blocks[idx] = {
+                        "kind": "tool_use",
+                        "id": cb.get("id"),
+                        "name": cb.get("name", "") or "",
+                        "args": "",
+                    }
+                else:
+                    blocks[idx] = {"kind": "text", "text": cb.get("text", "") or ""}
+                if idx not in order:
+                    order.append(idx)
+            elif etype == "content_block_delta":
+                idx = ev.get("index")
+                delta = ev.get("delta", {}) or {}
+                slot = blocks.setdefault(idx, {"kind": "text", "text": ""})
+                if idx not in order:
+                    order.append(idx)
+                dtype = delta.get("type")
+                if dtype == "text_delta":
+                    slot.setdefault("text", "")
+                    slot["text"] += delta.get("text", "") or ""
+                elif dtype == "input_json_delta":
+                    slot.setdefault("args", "")
+                    slot["args"] += delta.get("partial_json", "") or ""
+            elif etype == "message_delta":
+                sr = (ev.get("delta", {}) or {}).get("stop_reason")
+                if sr:
+                    finish = sr
+            elif etype in ("message_stop", "error"):
+                if etype == "error":
+                    finish = "error"
+        text_parts: list[str] = []
+        calls: list[ToolCall] = []
+        for i, idx in enumerate(order):
+            slot = blocks[idx]
+            if slot.get("kind") == "tool_use":
+                calls.append(
+                    ToolCall(
+                        slot.get("id") or f"call_{i}",
+                        slot.get("name", "") or "",
+                        slot.get("args", ""),
+                    )
+                )
+            else:
+                text_parts.append(slot.get("text", "") or "")
+        return AssistantTurn("".join(text_parts), calls, finish)
+
+
+def _iter_sse_data(lines):
+    """Yield parsed JSON objects from the `data:` lines of an SSE stream,
+    skipping event: lines, blanks, and the [DONE] sentinel."""
+    for line in lines:
+        if not line or not line.startswith("data:"):
+            continue
+        payload = line[len("data:") :].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            yield json.loads(payload)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+
+def make_transport(api: str, client, model, base_url=None, api_key=None):
+    if api == "anthropic":
+        return AnthropicTransport(base_url, api_key, model)
     if api == "responses":
         return ResponsesTransport(client, model)
     return ChatTransport(client, model)
@@ -637,9 +864,12 @@ def main() -> int:
     )
     p.add_argument(
         "--api",
-        choices=["chat", "responses"],
+        choices=["chat", "responses", "anthropic"],
         default=os.environ.get("CONFORMANCE_API", "chat"),
-        help="Wire protocol. 'responses' targets /v1/responses (the Codex path).",
+        help=(
+            "Wire protocol. 'responses' targets /v1/responses (the Codex path); "
+            "'anthropic' targets /v1/messages (Claude Code's path, tools+stream)."
+        ),
     )
     p.add_argument(
         "--runs",
@@ -682,14 +912,17 @@ def main() -> int:
     if not args.model:
         p.error("--model (or CONFORMANCE_MODEL) is required.")
 
-    try:
-        from openai import OpenAI
-    except ImportError:
-        sys.exit(
-            "The 'openai' package is required. Install it:\n    pip install -r requirements.txt"
-        )
-
-    client = OpenAI(base_url=args.base_url, api_key=args.api_key)
+    # chat/responses need the OpenAI SDK; anthropic uses httpx (built lazily in
+    # the transport). Only require what this run actually uses.
+    client = None
+    if args.api in ("chat", "responses"):
+        try:
+            from openai import OpenAI
+        except ImportError:
+            sys.exit(
+                "The 'openai' package is required. Install it:\n    pip install -r requirements.txt"
+            )
+        client = OpenAI(base_url=args.base_url, api_key=args.api_key)
     stream = not args.no_stream
 
     print(
@@ -701,7 +934,9 @@ def main() -> int:
     runs: list[RunMetrics] = []
     for i in range(args.runs):
         print(f"Run {i + 1}/{args.runs}:")
-        transport = make_transport(args.api, client, args.model)
+        transport = make_transport(
+            args.api, client, args.model, args.base_url, args.api_key
+        )
         m = run_once(transport, args.temperature, args.max_turns, stream, args.verbose)
         runs.append(m)
         print(
@@ -713,10 +948,16 @@ def main() -> int:
     if not args.no_probes:
         print("Probes:")
         probes["parallel"] = probe_parallel(
-            make_transport(args.api, client, args.model), stream, args.temperature, True
+            make_transport(args.api, client, args.model, args.base_url, args.api_key),
+            stream,
+            args.temperature,
+            True,
         )
         probes["tool_choice_required"] = probe_tool_choice_required(
-            make_transport(args.api, client, args.model), stream, args.temperature, True
+            make_transport(args.api, client, args.model, args.base_url, args.api_key),
+            stream,
+            args.temperature,
+            True,
         )
 
     summary = aggregate(runs, args.fail_threshold, args.min_completion, probes)

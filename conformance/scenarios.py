@@ -103,6 +103,21 @@ RESPONSES_TOOLS = [
     for t in TOOLS
 ]
 
+# Same tools in the *Anthropic Messages* API shape (name/description at the top
+# level, JSON schema under "input_schema"). Used by the `anthropic` transport,
+# which drives the gateway's /v1/messages — Claude Code's real path — with tools
+# and streaming. The gateway translates anthropic->chat toward the backend, so
+# this exercises the full Anthropic tool-call round-trip (tools -> tool_use
+# blocks -> tool_result blocks) in BOTH directions.
+ANTHROPIC_TOOLS = [
+    {
+        "name": t["function"]["name"],
+        "description": t["function"]["description"],
+        "input_schema": t["function"]["parameters"],
+    }
+    for t in TOOLS
+]
+
 
 # --- Virtual workspace ------------------------------------------------------
 # Stateful so tool results depend on what the model actually did — a model that
