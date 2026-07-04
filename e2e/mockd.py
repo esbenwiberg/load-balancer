@@ -66,6 +66,23 @@ def _new_id(prefix: str) -> str:
     return prefix + "_" + os.urandom(8).hex()
 
 
+# --- Instance identity ------------------------------------------------------
+# In the single-mockd e2e profile this is empty and the served_model stamp is
+# just `served_model=<model>` (unchanged — the e2e suite relies on that exact
+# substring). In the dev profile (goal 10) each mockd container sets a distinct
+# MOCKD_INSTANCE (workbench-a / workbench-b / mock-foundry), so the stamp becomes
+# `served_model=<model>@<instance>` — letting a client tell two containers apart
+# even when they'd otherwise serve indistinguishable aliases. The `@<instance>`
+# is a SUFFIX, so every existing `"served_model=<model>" in text` assertion still
+# holds by substring.
+INSTANCE = os.environ.get("MOCKD_INSTANCE", "").strip()
+
+
+def _stamp(served_model: str) -> str:
+    base = served_model or "?"
+    return base + "@" + INSTANCE if INSTANCE else base
+
+
 # --- Control state ----------------------------------------------------------
 
 
@@ -193,10 +210,12 @@ def decide_turn(has_tools, tool_choice, user_text, results_so_far, served_model=
         return "", [("read_file", {"path": CONFIG_PATH})]
 
     if not has_tools:
-        # Stamp the SERVED backend model into the reply text. It survives
+        # Stamp the SERVED backend model (and, in the dev profile, this
+        # container's instance identity) into the reply text. It survives
         # protocol translation, so a fallback test can assert which backend
-        # actually answered (client alias != served model after a fallback hop).
-        return "mockd served_model=%s" % (served_model or "?"), []
+        # actually answered (client alias != served model after a fallback hop),
+        # and the dev smoke can assert WHICH container answered.
+        return "mockd served_model=%s" % _stamp(served_model), []
 
     # Main scripted task, driven by how many results we've been fed.
     if results_so_far <= 0:
@@ -631,8 +650,10 @@ def main():
     port = int(os.environ.get("MOCKD_PORT", "9100"))
     host = os.environ.get("MOCKD_HOST", "0.0.0.0")
     server = ThreadingHTTPServer((host, port), Handler)
+    ident = (" instance=%s" % INSTANCE) if INSTANCE else ""
     print(
-        "mockd listening on http://%s:%d (chat + responses + /__control)" % (host, port)
+        "mockd listening on http://%s:%d (chat + responses + /__control)%s"
+        % (host, port, ident)
     )
     try:
         server.serve_forever()
