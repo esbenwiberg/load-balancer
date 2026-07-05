@@ -51,9 +51,9 @@ unattended run.
 Priority is (a) completing the idea — control plane, observability, dashboard —
 and (b) hardening the harness + test setup. Recommended order:
 harness core (0 → 1 → 2 → 6 → 7 → 9) → dev stack (10) → observability +
-wallet guards (3 ✅ → 11b) → dashboard v1 (12) → Ollama (4) → control plane
+wallet guards (3 ✅ → 11b ✅) → dashboard v1 (12) → Ollama (4) → control plane
 (5) → dashboard v2 (13) → Azure IaC (14). Spark-infra-shaped work is parked.
-**Next up: 11b** (spend audit) then **12** (dashboard v1, now unblocked by 3).
+**Next up: 12** (dashboard v1, now unblocked by 3 + 10).
 
 Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 [`docs/06`](docs/06-recommendation.md) (decision), [`docs/03`](docs/03-open-questions-and-risks.md) (risks).
@@ -79,18 +79,6 @@ isn't (see § Needs-a-human).
 **Completion condition:**
 ```
 a minimal control-plane service exists (SQLite or Redis + a heartbeat interface) exposing per-model {warm, in_flight, healthy, agent_capable}; it has unit tests that pass, with the passing output surfaced in the conversation; its open design decisions are documented in a new docs file; hard constraint: build the registry + state + tests ONLY — do NOT implement the routing policy or session-stickiness rule, those are Needs-a-human decisions; e2e/run.sh exits 0 with its passing output surfaced; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 40 turns and leave a draft PR describing the decision needed
-```
-
-### 11b. Users, teams, and spend audit — who spent what — risk: medium
-**Why:** budgets (goal 11) cap the damage; this makes spend *attributable*:
-every key belongs to a user, users group into teams, and spend is queryable
-per key/user/team after the fact. LiteLLM has all of it natively (internal
-users, teams, spend logs) — but it needs a real Postgres behind the gateway,
-which today runs stateless. That's also where the open persistence question
-(do keys survive a restart?) gets answered for good.
-**Completion condition:**
-```
-prerequisite: goal 10's dev profile must already be merged to main — if it is not, stop immediately and report that instead of building the stack ad hoc; the dev/e2e stack includes a Postgres the gateway uses; keys are issued bound to a user and users can be grouped into teams; per-model costs are configured so mockd traffic produces nonzero spend; an e2e test proves spend for a request is attributed to the right key+user+team and survives a gateway restart; the audit queries are documented; e2e/run.sh exits 0 with its passing output surfaced in the conversation; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 50 turns and leave a draft PR describing the decision needed
 ```
 
 ### 12. Routing dashboard v1 — "where did my prompt go?" — risk: medium
@@ -183,4 +171,5 @@ decision is made.
 - ✅ 9. Concurrency smoke — parallel streams across 4 aliases with a 503-fault forcing a fallback mid-fleet; asserts each response keeps its own served_model stamp (no cross-request bleed) + clean stream termination, plus a mixed chat/responses/messages variant for interleaved-SSE-across-protocols — PR #16 (2026-07)
 - ✅ 10. Dev-mode stack — standing dev profile (docker-compose.dev.yaml): gateway + two distinct mock workbench containers (workbench-a/-b) + mock-foundry, each stamping served_model=<model>@<instance>; dev_smoke.sh proves all 3 surfaces (messages/chat/responses) route to distinct containers; per-instance /__control faults; README wires Claude Code + Codex; real-haiku variant documented but keyless-offline stays default — PR #17 (2026-07)
 - ✅ 3. Observability & cost attribution — per-request routing records via a LiteLLM callback (`e2e/obs_callback.py`): `llm_call` per backend attempt (backend, tier, latency, tokens, and on failure the 503/429 that triggered fallback) + `delivered` per request (requested vs served ⇒ fallback flag, tokens). Sinks: stdout `ROUTING_RECORD <json>` (prod) + webhook to mockd `/__observe` (e2e). `test_fallback_is_observable_in_routing_record` proves a fallback is captured; deploy/ wired for parity; doc [docs/09](docs/09-observability.md). Verified quirk: LiteLLM fallback winner fires no success event — captured via `async_post_call_success_hook`. — PR #? (2026-07)
+- ✅ 11b. Users, teams, and spend audit — per-model costs on `qwen3-coder` so mockd traffic accrues nonzero spend; keys minted bound to a user grouped into a team (`/team/new` → `/team/member_add` → `/key/generate`); `test_spend_attributed_to_key_user_team` proves a `SpendLogs` row + `/key|user|team/info` aggregates attribute spend to the right key+user+team, `test_spend_survives_gateway_restart` restarts the gateway container and proves the Postgres-backed ledger + issued key persist (the open persistence question answered); audit queries + SQL documented in e2e/README "Spend audit" — PR #? (2026-07)
 - ✅ 11. Budgets + rate limits per virtual key — `default_key_generate_params` (max_budget/rpm/tpm) in litellm-config.e2e.yaml so every issued key inherits a config default; e2e proves a bare key inherits the defaults, an over-budget key (max_budget:0) → clean 400 budget_exceeded, an over-rate-limit key (rpm:1) → clean 429 (never 5xx/hang); README documents the knobs + how to raise them + the goal-11/11b units boundary (dollar-spend accrual is 11b) — PR #? (2026-07)

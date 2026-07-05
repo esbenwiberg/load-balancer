@@ -29,6 +29,18 @@ model_list:
       # exactly Blocker A — with mockd it becomes a deterministic CI gate for
       # the bridge MECHANICS (streaming + tool-call translation both ways).
       use_chat_completions_api: true
+      # --- Per-model cost (goal 11b) -----------------------------------------
+      # mockd returns a usage block (prompt=8, completion=8) on every reply, so
+      # cost = tokens x these rates > 0. LiteLLM's cost tracker multiplies the
+      # returned usage by these and accrues the result onto the calling key,
+      # its user, and its team — which is what makes mockd traffic produce
+      # NONZERO, attributable spend (goal 11 proved the gates; 11b proves the
+      # accrual). Values are round + deliberately chunky so a couple of requests
+      # register clearly (~0.024 USD/request) yet stay far under the default
+      # 100-USD key budget. They are NOT real prices — real backends carry real
+      # per-model costs known to LiteLLM by model name (deploy/litellm-config.yaml).
+      input_cost_per_token: 0.001
+      output_cost_per_token: 0.002
     model_info:
       backend_tier: local
       agent_capable: true
@@ -110,14 +122,14 @@ litellm_settings:
   # globally by editing here. See e2e/README.md "Budgets & rate limits".
   #
   # NOTE ON UNITS: max_budget is USD of *spend*, and spend = tokens x per-model
-  # cost. These mock models carry no cost, so real dollar spend stays $0 here —
-  # dollar-denominated enforcement (accruing spend past a budget) is proven in
-  # goal 11b, which adds per-model costs + durable Postgres spend. What THIS
-  # config + suite prove is that the budget and rate-limit GATES refuse an
-  # over-limit key with a clean 4xx (never a 5xx or a hang), the client-visible
-  # contract. The over-budget test uses an explicit max_budget:0 key to exercise
-  # the `spend >= max_budget` gate deterministically without depending on async
-  # spend flush or auth-cache TTL.
+  # cost. As of goal 11b the workbench alias (qwen3-coder) carries a per-token
+  # cost above, so mockd traffic now accrues NONZERO spend that LiteLLM attributes
+  # to the calling key, its user, and its team, and persists in Postgres (survives
+  # a gateway restart). See test_spend_attributed_to_key_user_team and
+  # test_spend_survives_gateway_restart, and e2e/README.md "Spend audit".
+  # The goal-11 gate tests remain cost-independent by design: the over-budget test
+  # uses an explicit max_budget:0 key so the `spend >= max_budget` gate trips on
+  # the first request without depending on async spend flush or auth-cache TTL.
   default_key_generate_params:
     max_budget: 100          # USD, lifetime (no budget_duration reset window)
     rpm_limit: 60            # requests/min per key
@@ -125,3 +137,12 @@ litellm_settings:
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
+  # --- Spend flush cadence (goal 11b) ---------------------------------------
+  # LiteLLM accrues per-request spend in memory and flushes it to Postgres on an
+  # interval (default 60s). The spend-attribution tests poll the DB-backed audit
+  # endpoints (/spend/logs, /user/info, /team/info) until spend lands, so a low
+  # value just makes those tests fast + the restart test's "already persisted"
+  # precondition quick to reach. This key is a latency knob only: if a given
+  # LiteLLM build ignores it, the tests still pass on the 60s default because
+  # their poll timeout is generous — nothing here is a correctness contract.
+  proxy_batch_write_at: 1
