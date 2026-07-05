@@ -48,8 +48,6 @@ export LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-sk-local-master-test-key}"
 export GATEWAY_URL="${GATEWAY_URL:-http://localhost:4000}"
 REPORT="${CONFORMANCE_JSON_OUT:-conformance.local.json}"
 
-# shellcheck disable=SC2329  # invoked indirectly via `trap cleanup EXIT` below;
-# SC2329 can't see that when the script ends in an explicit `exit "$RC"`.
 cleanup() {
   if [[ "$KEEP" -eq 0 ]]; then
     echo "--- tearing down (models persist on the named volume; use 'down -v' to wipe) ---"
@@ -114,4 +112,8 @@ else
   echo "  For qwen2.5-coder this is EXPECTED (it leaks tool calls on Ollama — see e2e/README 'What conformance found')."
   echo "  To chase a green, point at a model whose Ollama build emits structured tool_calls: OLLAMA_MODEL=<tag> ./run.local.sh"
 fi
-exit "$RC"
+# Exit with conformance's verdict WITHOUT an explicit `exit` keyword: that would
+# make shellcheck mark the `trap cleanup EXIT` handler unreachable (SC2317 on
+# older shellcheck, SC2329 on newer). conformance.py returns exactly 0/1, so this
+# final test under `set -e` yields the same status; the EXIT trap still tears down.
+[ "$RC" -eq 0 ]
