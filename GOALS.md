@@ -51,12 +51,14 @@ unattended run.
 Priority is (a) completing the idea — control plane, observability, dashboard —
 and (b) hardening the harness + test setup. Recommended order:
 harness core (0 → 1 → 2 → 6 → 7 → 9) → dev stack (10) → observability +
-wallet guards (3 ✅ → 11b ✅) → dashboard v1 (12 ✅) → Ollama (4) → control plane
+wallet guards (3 ✅ → 11b ✅) → dashboard v1 (12 ✅) → Ollama (4 ✅) → control plane
 (5 ✅) → dashboard v2 (13 ✅) → Azure IaC (14 ✅). Spark-infra-shaped work is parked.
-**Next up: 4** (Ollama local-model profile — the one autonomy-friendly goal left).
-The control-plane, both dashboard halves (12, 13), and the Azure IaC skeleton
-(14) are done, so the "complete the idea" arc is closed and the local↔cloud
-parity story is pinned; 4 adds real keyless tool-calling to the harness.
+**All autonomy-friendly goals are now done.** The control-plane, both dashboard
+halves (12, 13), the Azure IaC skeleton (14), and the Ollama local profile (4)
+are complete — the "complete the idea" arc is closed, the local↔cloud parity
+story is pinned, and the harness now has real keyless tool-calling. What's left
+is § Needs-a-human (real infra / an irreversible call): pick those at the
+keyboard.
 
 Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 [`docs/06`](docs/06-recommendation.md) (decision), [`docs/03`](docs/03-open-questions-and-risks.md) (risks).
@@ -65,15 +67,9 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 
 ## § Autonomy-friendly (safe to run unattended)
 
-### 4. Add a local-model (Ollama) e2e profile — risk: medium
-**Why:** [docs/08 decision 1](docs/08-e2e-testing.md) — the one thing the mock
-profile can't give is *real* tool-calling with no keys/ToS. With Spark intake
-parked, Ollama serving a small coding model isn't just the closest analog to a
-workbench — it's the stand-in until real Sparks arrive.
-**Completion condition:**
-```
-e2e has a documented 'local' profile (compose + config) running Ollama with a small coding model as the workbench, and conformance.py can be pointed at it; hard constraint: Ollama must NOT run in CI (too heavy) — the deliverable is the profile + docs, machine-verified by the mock profile still passing; e2e/run.sh (mock profile) exits 0 with its passing output surfaced in the conversation; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 40 turns and leave a draft PR describing the decision needed
-```
+_All current autonomy-friendly goals are done. The next vetted units live in
+§ Needs-a-human (they require a human decision or real infra); pick one at the
+keyboard, or add a new autonomy-friendly goal here when you spot one._
 
 ---
 
@@ -152,4 +148,22 @@ decision is made.
   `dashboard_test.py` (offline shaping + degrade, fast tier), `dev_smoke.sh` step
   4 (live fleet). Docs: [docs/09](docs/09-observability.md), [docs/10](docs/10-control-plane.md). — PR #? (2026-07)
 - ✅ 11. Budgets + rate limits per virtual key — `default_key_generate_params` (max_budget/rpm/tpm) in litellm-config.e2e.yaml so every issued key inherits a config default; e2e proves a bare key inherits the defaults, an over-budget key (max_budget:0) → clean 400 budget_exceeded, an over-rate-limit key (rpm:1) → clean 429 (never 5xx/hang); README documents the knobs + how to raise them + the goal-11/11b units boundary (dollar-spend accrual is 11b) — PR #? (2026-07)
+- ✅ 4. Local-model (Ollama) e2e profile — a dedicated `local` profile
+  (`docker-compose.local.yaml` + committed keyless `litellm-config.local.yaml`)
+  running Ollama serving `qwen2.5-coder:3b` as the workbench behind the same
+  gateway; self-contained bring-up (`ollama-entrypoint.sh` pulls+warms the model,
+  healthcheck-gated so the gateway never boots against an empty Ollama);
+  `run.local.sh` runs `conformance.py` THROUGH the gateway against the real model
+  and surfaces the JSON verdict (alias stays `qwen3-coder` — only the backend
+  swaps; `OLLAMA_MODEL` drives both the pull and what the gateway requests).
+  **Finding (surfaced, not hidden):** the gate returned `agent_capable=false` —
+  qwen2.5-coder (3b *and* 7b) leaks tool calls into content instead of emitting
+  structured `tool_calls` because it omits the `<tool_call>` wrapper Ollama's
+  template needs (reproduces direct-against-Ollama + both LiteLLM providers, so
+  it's the model+engine, not the gateway). That's the gate *working* against a
+  real backend — the profile's job. A green is a one-env-var model swap. Hard
+  constraint honoured: NEVER in CI — `run.sh`/CI use the mock profile only,
+  `docker compose config` validates the file in the fast tier but starts no
+  containers. Docs: e2e/README "Profile: local" + docs/08. Merge gate = mock
+  `e2e/run.sh` green. — PR #? (2026-07)
 - ✅ 14. Azure IaC skeleton — code only, offline-validated — Bicep (decision recorded over Terraform: `bicep build` validates fully offline; Azure-native; stateless) under `deploy/azure/`: `main.bicep` + modules for the gateway Container App (managed identity, Key Vault–referenced secrets, parameterised ingress), PostgreSQL Flexible Server (private persistent store), Key Vault (secrets + MI RBAC), and VNet (delegated subnets + NSG). Secrets are required `@secure()` params with no defaults; `main.example.bicepparam` carries commit-safe placeholders. `scripts/check.sh` fast tier gained an offline `bicep build`/`build-params` step (fails on ANY diagnostic, no cloud calls/creds), CI installs bicep via `az bicep install`, and the litellm image-pin guard now also covers `.bicep`. Parity doc [docs/11](docs/11-azure-iac.md) maps every dev-stack component to its Azure counterpart (with the deliberate gaps named). — PR #? (2026-07)

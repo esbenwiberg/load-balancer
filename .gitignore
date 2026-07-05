@@ -9,8 +9,19 @@
 secrets/
 *credentials*
 
-# LiteLLM / local config that may hold keys
+# LiteLLM / local config that may hold keys.
+# NOTE: e2e/litellm-config.local.yaml is the committed 'local' PROFILE config
+# (goal 4) — it carries NO keys (master_key via env, Ollama needs no auth), so
+# it's negated back in. Any OTHER *local config a dev drops (root, deploy/, …)
+# stays ignored as a personal-scratch/secret-bearing file.
 litellm-config.local.yaml
+!e2e/litellm-config.local.yaml
+
+# Conformance report + run logs from the local/mock profile runs (evidence
+# artifacts, not source).
+e2e/conformance.local.json
+e2e/run.local.log
+e2e/mockgate.log
 
 # Bicep — generated ARM JSON (we validate with `bicep build --stdout`; never commit
 # the transpiled output). Keep .bicep / .bicepparam source; ignore built artifacts.
