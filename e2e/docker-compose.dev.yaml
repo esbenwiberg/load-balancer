@@ -18,8 +18,12 @@
 #                               watch every prompt's route land live.
 #   :9400  control-plane      — goal-5 fleet state registry + heartbeat interface.
 #                               Exposes per-model {warm,in_flight,healthy,
-#                               agent_capable}. Comes up with an EMPTY registry;
-#                               goal 13 wires the heartbeat producers + display.
+#                               agent_capable}. Goal 13 wires it live: each mockd
+#                               workbench PUSHES heartbeats here (HEARTBEAT_URL),
+#                               and the dashboard (:9300) reads it back via
+#                               /api/fleet — so the fleet view shows real
+#                               per-workbench models, health, and in-flight load
+#                               as you drive traffic through :4000.
 #   db     postgres           — LiteLLM virtual-key store (in-network only)
 #
 # Each mockd is host-published on a DISTINCT port so you can drive /__control at
@@ -59,6 +63,11 @@ services:
       MOCKD_HOST: "0.0.0.0"
       MOCKD_INSTANCE: "workbench-a"
       MOCKD_DEBUG: "${MOCKD_DEBUG:-}"
+      # Goal 13 — push live heartbeats to the control-plane so the dashboard's
+      # Fleet view shows this workbench, the model it carries, its health, and
+      # its live in-flight count. workbench_id defaults to MOCKD_INSTANCE.
+      HEARTBEAT_URL: "http://control-plane:9400"
+      HEARTBEAT_MODELS: "qwen3-coder-a"
     ports:
       - "9101:9100"        # host-published so you can drive /__control per-instance
     healthcheck:
@@ -76,6 +85,8 @@ services:
       MOCKD_HOST: "0.0.0.0"
       MOCKD_INSTANCE: "workbench-b"
       MOCKD_DEBUG: "${MOCKD_DEBUG:-}"
+      HEARTBEAT_URL: "http://control-plane:9400"
+      HEARTBEAT_MODELS: "qwen3-coder-b"
     ports:
       - "9102:9100"
     healthcheck:
@@ -93,6 +104,9 @@ services:
       MOCKD_HOST: "0.0.0.0"
       MOCKD_INSTANCE: "mock-foundry"
       MOCKD_DEBUG: "${MOCKD_DEBUG:-}"
+      # The always-up Foundry tier carries the three fallback aliases.
+      HEARTBEAT_URL: "http://control-plane:9400"
+      HEARTBEAT_MODELS: "claude-sonnet,claude-opus,gpt"
     ports:
       - "9103:9100"
     healthcheck:
@@ -111,10 +125,14 @@ services:
     working_dir: /app
     volumes:
       - ./dashboard.py:/app/dashboard.py:ro
+    command: ["python", "dashboard.py"]
     environment:
       DASH_PORT: "9300"
       DASH_HOST: "0.0.0.0"
-    command: ["python", "dashboard.py"]
+      # Goal 13 — read the live fleet from the control-plane and render it under
+      # the Fleet section. In-network address; degrades to "fleet unavailable"
+      # if the control-plane is ever down.
+      CONTROL_PLANE_URL: "http://control-plane:9400"
     ports:
       - "9300:9300"
     healthcheck:

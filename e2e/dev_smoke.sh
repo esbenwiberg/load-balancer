@@ -92,9 +92,34 @@ else
   fail "responses: expected served_model=claude-sonnet@mock-foundry, got '${R_OUT:-<none>}'"
 fi
 
+# --- 4. fleet view: control-plane heartbeats surface on the dashboard (goal 13)
+# Each mockd workbench pushes heartbeats to the control-plane; the dashboard
+# reads them back via /api/fleet. Assert the fleet populated with the models the
+# three containers carry — proving the live registry->dashboard path in the dev
+# stack (mockd producer -> control-plane -> dashboard). Best-effort on the
+# endpoint being reachable; a real gap fails loudly.
+DASH_URL="${DASH_URL:-http://localhost:9300}"
+echo "--- [4/4] fleet view: control-plane heartbeats on the dashboard (goal 13) ---"
+FLEET_MODELS=$(curl -s "$DASH_URL/api/fleet" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print(','.join(sorted(m['model'] for m in d.get('models',[]))) if d.get('available') else 'UNAVAILABLE')" 2>/dev/null)
+echo "  fleet models: ${FLEET_MODELS:-<none>}"
+# The workbenches beat on an interval; give a couple of retries in case the smoke
+# runs within the first beat window after the stack came up.
+for _ in 1 2 3 4 5; do
+  [[ "$FLEET_MODELS" == *"qwen3-coder-a"* && "$FLEET_MODELS" == *"qwen3-coder-b"* && "$FLEET_MODELS" == *"claude-sonnet"* ]] && break
+  sleep 2
+  FLEET_MODELS=$(curl -s "$DASH_URL/api/fleet" \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(','.join(sorted(m['model'] for m in d.get('models',[]))) if d.get('available') else 'UNAVAILABLE')" 2>/dev/null)
+done
+if [[ "$FLEET_MODELS" == *"qwen3-coder-a"* && "$FLEET_MODELS" == *"qwen3-coder-b"* && "$FLEET_MODELS" == *"claude-sonnet"* ]]; then
+  ok "dashboard fleet shows the live workbenches (${FLEET_MODELS})"
+else
+  fail "dashboard fleet did not populate from heartbeats: got '${FLEET_MODELS:-<none>}'"
+fi
+
 echo
 if [[ "$FAILS" -eq 0 ]]; then
-  echo "DEV SMOKE PASSED — all three surfaces routed through the gateway to distinct containers."
+  echo "DEV SMOKE PASSED — all three surfaces routed through the gateway to distinct containers, and the fleet view is live."
   exit 0
 else
   echo "DEV SMOKE FAILED — $FAILS surface(s) did not route/stamp as expected." >&2

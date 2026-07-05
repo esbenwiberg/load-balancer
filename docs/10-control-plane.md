@@ -132,11 +132,33 @@ decision ([GOALS.md §Needs-a-human](../GOALS.md), goal 14 / first deploy).
 
 The dev stack ([`e2e/docker-compose.dev.yaml`](../e2e/docker-compose.dev.yaml))
 runs `control-plane` as a standing service on `:9400`, next to the gateway, the
-mock workbenches, and the goal-12 dashboard. It comes up healthy with an empty
-registry; goal 13 wires the heartbeat producers + the live display. It is **not**
-in the e2e stack ([`docker-compose.e2e.yaml`](../e2e/docker-compose.e2e.yaml)) —
-that stack is the up-test-down merge gate and has no need for a standing
-registry.
+mock workbenches, and the dashboard. **Goal 13 wired it live:** each mockd
+workbench now PUSHES heartbeats here (gated on `HEARTBEAT_URL` +
+`HEARTBEAT_MODELS`, set per instance in the dev compose), reporting the models it
+carries, `warm`/`healthy`, and its **live `in_flight`** (a counter around every
+chat/responses request). The goal-12 dashboard reads the registry back through
+its own `/api/fleet` endpoint and renders it under a Fleet section — so opening
+`http://localhost:9300` while the dev stack is up shows real per-workbench state,
+and the in-flight count moves as you drive traffic through `:4000`.
+
+The e2e stack ([`docker-compose.e2e.yaml`](../e2e/docker-compose.e2e.yaml)) also
+runs `control-plane` (goal 13 added it) — but **no mockd beats it there.** The
+up-test-down merge gate needs the registry present so the fleet assertion can
+push its own deterministic heartbeats and read them back through the dashboard;
+letting the mock backends beat asynchronously would make that assertion racy.
+The heartbeat *producer* wiring therefore lives only in the dev compose.
+
+### Why the dashboard PROXIES the registry (goal 13, reversible call)
+
+The dashboard reads `/models` from the control-plane **server-side** and re-serves
+it at its own `/api/fleet`, rather than having the browser fetch the control-plane
+directly. This keeps the registry→dashboard data path terminating in an endpoint
+*we* own (so the goal-13 assertion is deterministic, same reasoning as
+`/api/records`), avoids CORS, keeps the control-plane an internal-network daemon
+(only the dashboard is opened in a browser), and degrades gracefully — if the
+control-plane is unset or unreachable, `/api/fleet` returns `available:false` at
+HTTP 200 and the page shows "fleet unavailable" instead of erroring. Nothing here
+decides routing; it only DISPLAYS state (routing policy stays Needs-a-human).
 
 ## Tests
 

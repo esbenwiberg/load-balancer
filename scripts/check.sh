@@ -187,6 +187,21 @@ else
   skip "python3" "not installed"
 fi
 
+# --- dashboard fleet-view unit tests (goal 13 — offline, stdlib only) --------
+# The dashboard's fleet endpoint (_fetch_fleet) shapes the control-plane registry
+# and degrades gracefully when it's unreachable. Those pure/offline branches
+# belong in the fast tier; the e2e stack proves the live registry->dashboard path.
+step "dashboard fleet-view unit tests (e2e/dashboard_test.py)"
+if have python3; then
+  if (cd e2e && python3 dashboard_test.py); then
+    ok "dashboard_test.py"
+  else
+    fail "e2e/dashboard_test.py"
+  fi
+else
+  skip "python3" "not installed"
+fi
+
 # --- gitleaks: secret scan of the working tree ------------------------------
 step "gitleaks secret scan"
 if have gitleaks; then

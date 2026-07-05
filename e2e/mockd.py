@@ -52,6 +52,7 @@ import re
 import sys
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # --- Scenario contract ------------------------------------------------------
@@ -86,6 +87,121 @@ INSTANCE = os.environ.get("MOCKD_INSTANCE", "").strip()
 def _stamp(served_model: str) -> str:
     base = served_model or "?"
     return base + "@" + INSTANCE if INSTANCE else base
+
+
+# --- Live load counter ------------------------------------------------------
+# Tracks how many inference requests (chat + responses) this instance is
+# handling RIGHT NOW. The heartbeat producer reports this as `in_flight` so the
+# control-plane — and the goal-13 dashboard fleet view — shows real per-workbench
+# load. A plain guarded int: increment at request entry, decrement in a finally
+# so a faulted/errored request can't leak the count upward.
+
+
+class InFlight:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._n = 0
+
+    def __enter__(self):
+        with self._lock:
+            self._n += 1
+        return self
+
+    def __exit__(self, *exc):
+        with self._lock:
+            self._n -= 1
+        return False  # never swallow the handler's exception
+
+    def value(self) -> int:
+        with self._lock:
+            return self._n
+
+
+INFLIGHT = InFlight()
+
+
+# --- Heartbeat producer (goal 13) -------------------------------------------
+# A workbench PUSHES its state to the control-plane (goal 5's model: the box
+# knows its own warmth + load better than a prober can). This makes mockd a
+# faithful workbench stand-in: when HEARTBEAT_URL is set (the dev stack), a
+# daemon thread beats every HEARTBEAT_INTERVAL_MS with this instance's live
+# {warm, in_flight, agent_capable, healthy} for each model it serves.
+#
+# OFF BY DEFAULT (no HEARTBEAT_URL): the e2e + cli-auth profiles run mockd with
+# NO background beats, so their behaviour and the deterministic e2e fleet
+# assertion (which pushes its own heartbeats) are unaffected. Producer wiring
+# lives only in docker-compose.dev.yaml.
+
+
+def _heartbeat_config():
+    """Parse the heartbeat env. Returns None (disabled) unless HEARTBEAT_URL and
+    at least one model (HEARTBEAT_MODELS, comma-separated) are set."""
+    url = os.environ.get("HEARTBEAT_URL", "").strip().rstrip("/")
+    models = [
+        m.strip()
+        for m in os.environ.get("HEARTBEAT_MODELS", "").split(",")
+        if m.strip()
+    ]
+    if not url or not models:
+        return None
+    return {
+        "url": url + "/heartbeat",
+        "models": models,
+        "workbench_id": INSTANCE or os.environ.get("HEARTBEAT_WORKBENCH_ID", "mockd"),
+        "agent_capable": os.environ.get("HEARTBEAT_AGENT_CAPABLE", "1")
+        not in ("0", "", "false"),
+        "interval_s": max(
+            0.5, int(os.environ.get("HEARTBEAT_INTERVAL_MS", "2000")) / 1000.0
+        ),
+    }
+
+
+def _beat_once(cfg: dict) -> None:
+    """Push one full-snapshot heartbeat for every model this instance serves.
+    A mock is always warm + reported-healthy; in_flight is the LIVE counter (a
+    fleet-wide snapshot, so the same count is reported for each served model —
+    the box, not the model, is what's loaded)."""
+    payload = {
+        "workbench_id": cfg["workbench_id"],
+        "models": [
+            {
+                "model": m,
+                "warm": True,
+                "in_flight": INFLIGHT.value(),
+                "agent_capable": cfg["agent_capable"],
+                "healthy": True,
+            }
+            for m in cfg["models"]
+        ],
+    }
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        cfg["url"], data=data, headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=2.0) as resp:
+        resp.read()
+
+
+def _heartbeat_loop(cfg: dict) -> None:
+    while True:
+        try:
+            _beat_once(cfg)
+        except Exception as e:  # noqa: BLE001 — the control-plane being down must
+            # never crash the workbench; just log and retry next tick.
+            sys.stderr.write("[mockd] heartbeat failed: %s\n" % e)
+        time.sleep(cfg["interval_s"])
+
+
+def _start_heartbeat() -> None:
+    cfg = _heartbeat_config()
+    if not cfg:
+        return
+    sys.stderr.write(
+        "[mockd] heartbeat -> %s every %.1fs models=%s\n"
+        % (cfg["url"], cfg["interval_s"], ",".join(cfg["models"]))
+    )
+    t = threading.Thread(target=_heartbeat_loop, args=(cfg,), daemon=True)
+    t.start()
 
 
 # --- Control state ----------------------------------------------------------
@@ -392,10 +508,15 @@ class Handler(BaseHTTPRequestHandler):
             CONTROL.reset()
             OBSERVATIONS.reset()  # records must not leak across tests either
             return self._json(200, {"ok": True})
+        # Count real inference toward this instance's live load (goal 13), so the
+        # heartbeat producer reports a truthful in_flight. The `with` decrements
+        # in a finally even if the handler faults or the client disconnects.
         if self.path.startswith("/v1/chat/completions"):
-            return self._handle_chat()
+            with INFLIGHT:
+                return self._handle_chat()
         if self.path.startswith("/v1/responses"):
-            return self._handle_responses()
+            with INFLIGHT:
+                return self._handle_responses()
         return self._json(404, {"error": "not found: " + self.path})
 
     # --- directive resolution ----------------------------------------------
@@ -698,6 +819,8 @@ def main():
     host = os.environ.get("MOCKD_HOST", "0.0.0.0")
     server = ThreadingHTTPServer((host, port), Handler)
     ident = (" instance=%s" % INSTANCE) if INSTANCE else ""
+    # Start pushing heartbeats to the control-plane if configured (dev stack).
+    _start_heartbeat()
     print(
         "mockd listening on http://%s:%d (chat + responses + /__control + /__observe)%s"
         % (host, port, ident)

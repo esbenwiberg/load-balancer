@@ -32,6 +32,9 @@ import pytest
 GATEWAY = os.environ.get("GATEWAY_URL", "http://localhost:4000")
 MOCKD = os.environ.get("MOCKD_URL", "http://localhost:9100")
 DASH = os.environ.get("DASH_URL", "http://localhost:9300")  # goal-12 dashboard
+CTRL = os.environ.get(
+    "CONTROL_PLANE_URL", "http://localhost:9400"
+)  # goal-13 fleet registry
 KEY = os.environ.get("LITELLM_MASTER_KEY", "sk-e2e-master-test-key")
 
 AUTH = {"Authorization": "Bearer " + KEY}
@@ -54,9 +57,22 @@ def _reset_mockd():
     """
     httpx.post(MOCKD + "/__reset", timeout=TIMEOUT)
     _reset_dashboard()
+    _reset_control_plane()
     yield
     httpx.post(MOCKD + "/__reset", timeout=TIMEOUT)
     _reset_dashboard()
+    _reset_control_plane()
+
+
+def _reset_control_plane():
+    """Clear the goal-5 control-plane registry so fleet heartbeats never leak
+    across serially-run tests (same contract as mockd/dashboard resets).
+    Best-effort: a stack without the control-plane must not hard-fail here — the
+    goal-13 fleet tests surface a real misconfig on their own."""
+    try:
+        httpx.post(CTRL + "/__reset", timeout=TIMEOUT)
+    except httpx.HTTPError:
+        pass
 
 
 def _reset_dashboard():
@@ -1245,6 +1261,152 @@ def test_dashboard_page_renders():
     body = r.text
     assert "Router dashboard" in body, "dashboard page title missing"
     assert "api/records" in body, "dashboard page must fetch its data endpoint"
+    # Goal 13: the same page also renders + fetches the fleet view.
+    assert "api/fleet" in body, "dashboard page must fetch the fleet data endpoint"
+    assert "Fleet" in body, "dashboard page must render a Fleet section"
+
+
+# --- fleet dashboard v2: the control-plane registry, made visible (goal 13) --
+#
+# Goal 5 built the control-plane registry (e2e/control_plane.py): workbenches
+# PUSH heartbeats declaring {warm, in_flight, agent_capable, healthy} per model,
+# and it derives per-model aggregates. Goal 13 makes that LIVE on the dashboard:
+# the dashboard's /api/fleet endpoint (control-plane-e2e:9400 -> dashboard,
+# server-side) is what the Fleet section renders. These tests cover the
+# REGISTRY -> DASHBOARD data path end to end: push a heartbeat to the
+# control-plane, then assert it surfaces through the dashboard's owned endpoint.
+#
+# The TEST plays the workbench here (no mockd beats the control-plane in the e2e
+# stack — see docker-compose.e2e.yaml) so the fleet state is deterministic. The
+# dev stack is where real mockd workbenches beat live (docker-compose.dev.yaml).
+
+
+def _dash_fleet():
+    """The dashboard's fleet data endpoint — a server-side read of the
+    control-plane registry, and what the Fleet section renders."""
+    r = httpx.get(DASH + "/api/fleet", timeout=TIMEOUT)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _beat(workbench_id, model, **state):
+    """Push one heartbeat to the control-plane as `workbench_id`, declaring
+    `model` with the given {warm, in_flight, agent_capable, healthy} state."""
+    r = httpx.post(
+        CTRL + "/heartbeat",
+        json={"workbench_id": workbench_id, "models": [{"model": model, **state}]},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _poll_fleet(predicate, timeout=8.0):
+    """The dashboard reads the control-plane synchronously per request, so a
+    heartbeat is visible on the very next /api/fleet — but poll briefly anyway
+    to stay robust to container/scheduling hiccups."""
+    deadline = time.time() + timeout
+    data = _dash_fleet()
+    while time.time() < deadline:
+        if predicate(data):
+            return data
+        time.sleep(0.25)
+        data = _dash_fleet()
+    return data
+
+
+def _fleet_model(data, name):
+    for m in data.get("models", []):
+        if m.get("model") == name:
+            return m
+    return None
+
+
+def test_dashboard_fleet_reflects_control_plane_registry():
+    """Goal 13: two workbenches heartbeat the SAME model with load; the
+    dashboard's fleet endpoint must aggregate them — warm+healthy counts, summed
+    in-flight, agent_capable — AND list both workbenches as instances. This is
+    the registry -> dashboard data path, asserted on the endpoint the UI
+    renders."""
+    _beat(
+        "wb-alpha",
+        "qwen3-coder",
+        warm=True,
+        in_flight=3,
+        agent_capable=True,
+        healthy=True,
+    )
+    _beat(
+        "wb-bravo",
+        "qwen3-coder",
+        warm=True,
+        in_flight=2,
+        agent_capable=True,
+        healthy=True,
+    )
+
+    data = _poll_fleet(
+        lambda d: (
+            d.get("available")
+            and (_fleet_model(d, "qwen3-coder") or {}).get("healthy") == 2
+        )
+    )
+    assert data.get("available") is True, (
+        "fleet endpoint must be available with the control-plane up: %r" % data
+    )
+
+    m = _fleet_model(data, "qwen3-coder")
+    assert m, "fleet endpoint has no qwen3-coder model: %r" % data
+    assert m["healthy"] == 2, "both healthy instances must aggregate: %r" % m
+    assert m["warm"] == 2, "both warm instances must count: %r" % m
+    assert m["in_flight"] == 5, "in-flight must sum across instances (3+2): %r" % m
+    assert m["agent_capable"] is True, "model is agent-capable if any box is: %r" % m
+
+    # The per-workbench (instance) view — "which box is subscribed, how loaded".
+    insts = {
+        i["workbench_id"]: i
+        for i in data.get("instances", [])
+        if i.get("model") == "qwen3-coder"
+    }
+    assert set(insts) == {"wb-alpha", "wb-bravo"}, (
+        "fleet must list both workbenches as instances: %r" % data.get("instances")
+    )
+    assert insts["wb-alpha"]["in_flight"] == 3, insts["wb-alpha"]
+    assert insts["wb-alpha"]["healthy"] is True, insts["wb-alpha"]
+
+
+def test_dashboard_fleet_surfaces_derived_health():
+    """Goal 13: the control-plane DERIVES health (reported_healthy AND fresh); a
+    workbench reporting healthy=false must show as unhealthy on the dashboard AND
+    be excluded from the model's healthy/warm/in-flight aggregate — proving the
+    derived-health signal survives the whole registry -> dashboard path, not just
+    the raw counts."""
+    _beat("wb-live", "gpt", warm=True, in_flight=1, agent_capable=True, healthy=True)
+    _beat("wb-sick", "gpt", warm=True, in_flight=9, agent_capable=True, healthy=False)
+
+    data = _poll_fleet(
+        lambda d: d.get("available") and _fleet_model(d, "gpt") is not None
+    )
+    m = _fleet_model(data, "gpt")
+    assert m, "fleet endpoint has no gpt model: %r" % data
+    # Only the healthy box counts; the unhealthy one is visible but excluded.
+    assert m["healthy"] == 1, "only the healthy instance counts as healthy: %r" % m
+    assert m["warm"] == 1, "the unhealthy box's warm slot must not count: %r" % m
+    assert m["in_flight"] == 1, (
+        "the unhealthy box's in-flight (9) must be excluded from the aggregate: %r" % m
+    )
+    assert m["instances_total"] == 2, "both boxes are still listed: %r" % m
+
+    insts = {
+        i["workbench_id"]: i
+        for i in data.get("instances", [])
+        if i.get("model") == "gpt"
+    }
+    assert insts["wb-sick"]["healthy"] is False, (
+        "the workbench that reported unhealthy must show unhealthy: %r"
+        % insts["wb-sick"]
+    )
+    assert insts["wb-live"]["healthy"] is True, insts["wb-live"]
 
 
 # --- spend audit: users, teams, attribution, durability (goal 11b) -----------

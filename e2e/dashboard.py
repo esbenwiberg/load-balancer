@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-dashboard — the balancer's read-only "where did my prompt go?" view (goal 12).
+dashboard — the balancer's read-only view: "where did my prompt go?" (goal 12)
+plus "what's the fleet doing right now?" (goal 13 — dashboard v2).
 
 This is the visible face of goal 3's observability data. The gateway's
 obs_callback (e2e/obs_callback.py) already emits a routing record per backend
@@ -8,6 +9,30 @@ ATTEMPT (event=llm_call) and per DELIVERED response (event=delivered). This
 daemon is a SINK for those records plus a tiny read-only web UI that renders
 them, so a human (or an agent) can literally look at where each prompt was
 routed, whether it fell back, and how long it took.
+
+FLEET VIEW (goal 13 — dashboard v2): the second half of the vision. The
+control-plane (e2e/control_plane.py, goal 5) knows the live fleet state —
+per model, across every workbench that has heartbeat: {warm, in_flight,
+healthy, agent_capable}. This daemon READS that registry and renders it, so the
+same page that shows where a prompt went also shows which workbenches are
+subscribed, with which models, warm/healthy, and how loaded right now.
+
+HOW THE FLEET DATA GETS HERE (reversible call, documented per CLAUDE.md + docs/10):
+  SERVER-SIDE PROXY, not a browser-side fetch. `GET /api/fleet` reads the
+  control-plane's `/models` from THIS process (urllib) and returns it; the page
+  fetches only /api/fleet. Why:
+    * ONE read surface. The registry->dashboard data path terminates in an
+      endpoint WE own (/api/fleet), so the goal-13 assertion is deterministic —
+      the same reason /api/records is owned, not scraped from LiteLLM's SPA.
+    * No CORS, no second exposed port in the browser. The control-plane stays an
+      internal-network daemon; only the dashboard is opened.
+    * Graceful degrade. If CONTROL_PLANE_URL is unset or the control-plane is
+      unreachable, /api/fleet returns {"available": false, ...} (HTTP 200) and
+      the page shows "fleet unavailable" — it never 500s or hangs the viewer.
+      That keeps a control-plane-less stack (bare pytest, the cli-auth profile)
+      working exactly as before.
+    * Reversible. Nothing here decides routing (that's Needs-a-human, docs/10);
+      it only DISPLAYS state. Adopting a richer UI later forecloses nothing.
 
 BUILD-vs-REUSE (reversible call, documented per CLAUDE.md + docs/09):
   We BUILD a thin read-only page rather than reuse LiteLLM's bundled admin UI.
@@ -35,6 +60,10 @@ HTTP surface:
   GET  /api/records                          # {"records":[...], "requests":[...],
                                              #  "count":N} — the DATA ENDPOINT the
                                              #  UI fetches and the e2e test asserts
+  GET  /api/fleet                            # {"available":bool, "models":[...],
+                                             #  "instances":[...]} — the goal-13
+                                             #  fleet data endpoint: a server-side
+                                             #  read of the control-plane registry
   GET  /                                      # read-only HTML dashboard
   POST /__reset                               # clear all records (test isolation)
   GET  /health                                # 200 (liveness)
@@ -49,7 +78,17 @@ import json
 import os
 import sys
 import threading
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# The control-plane registry (goal 5) this dashboard reads its fleet view from.
+# Unset (default) => the fleet view degrades to "unavailable" and the rest of
+# the dashboard (routing records) works exactly as before. Set in the dev + e2e
+# compose files to the in-network control-plane address.
+CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "").rstrip("/")
+# Kept short so a slow/hung control-plane can never wedge the viewer: /api/fleet
+# fails fast to "unavailable" rather than blocking the page's poll.
+_FLEET_TIMEOUT_S = 2.0
 
 
 class Records:
@@ -128,6 +167,65 @@ def _attempts_view(records: list) -> list:
     return out
 
 
+# --- the fleet view (goal 13) -----------------------------------------------
+# A server-side read of the control-plane registry (goal 5). See the module
+# docstring for WHY this is a proxy and not a browser-side fetch.
+
+
+def _fetch_fleet() -> dict:
+    """Read the control-plane's per-model aggregate (`GET /models`) and reshape
+    it into the dashboard's fleet payload.
+
+    The control-plane's /models already embeds each model's per-instance rows
+    (its `instances` drill-down), each carrying the DERIVED health + staleness —
+    so a silent workbench shows up here as unhealthy without this daemon knowing
+    anything about TTLs. We surface two views:
+      * models     — the per-model aggregate (warm, healthy/total, in_flight,
+                     agent_capable) — the headline "what can the fleet do".
+      * instances  — a flat per-(workbench,model) list folded out of the models'
+                     drill-downs — the "which box is subscribed, is it healthy,
+                     how loaded" table.
+
+    Returns {"available": True, "control_plane_url", "models", "instances"} on a
+    clean read, or {"available": False, "error"} when the control-plane is
+    unconfigured / unreachable / speaking gibberish. NEVER raises — the caller
+    serves this at HTTP 200 so the page degrades to "fleet unavailable" instead
+    of erroring."""
+    if not CONTROL_PLANE_URL:
+        return {"available": False, "error": "CONTROL_PLANE_URL not configured"}
+    try:
+        req = urllib.request.Request(
+            CONTROL_PLANE_URL + "/models", headers={"Accept": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=_FLEET_TIMEOUT_S) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:  # noqa: BLE001 — any failure => degrade, never 500
+        return {
+            "available": False,
+            "control_plane_url": CONTROL_PLANE_URL,
+            "error": "control-plane unreachable: %s" % e,
+        }
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return {
+            "available": False,
+            "control_plane_url": CONTROL_PLANE_URL,
+            "error": "control-plane /models returned an unexpected shape",
+        }
+    instances = []
+    for m in models:
+        for inst in m.get("instances") or []:
+            instances.append(inst)
+    # Stable order for a deterministic table + assertion: workbench, then model.
+    instances.sort(key=lambda i: (i.get("workbench_id") or "", i.get("model") or ""))
+    return {
+        "available": True,
+        "control_plane_url": CONTROL_PLANE_URL,
+        "models": models,
+        "instances": instances,
+    }
+
+
 # --- the read-only page -----------------------------------------------------
 # Inlined HTML/CSS/JS: served from a container with no outbound network, so no
 # external assets. The page polls /api/records and re-renders; it never writes.
@@ -169,6 +267,13 @@ _PAGE = """<!doctype html>
   .badge.fall { color:var(--fall); border:1px solid var(--fall); }
   .badge.tier { color:var(--accent); border:1px solid var(--accent); }
   .badge.fail { color:var(--warn); border:1px solid var(--warn); }
+  .badge.healthy { color:var(--ok); border:1px solid var(--ok); }
+  .badge.unhealthy { color:var(--warn); border:1px solid var(--warn); }
+  .badge.stale { color:var(--fall); border:1px solid var(--fall); }
+  .badge.yes { color:var(--accent); border:1px solid var(--accent); }
+  .badge.no { color:var(--muted); border:1px solid var(--muted); }
+  .fleetstatus { text-transform:none; letter-spacing:0; font-weight:400;
+    color:var(--warn); margin-left:8px; }
   .num { text-align:right; font-variant-numeric:tabular-nums; }
   .empty { color:var(--muted); padding:18px 12px; }
   code { color:var(--fg); }
@@ -177,10 +282,31 @@ _PAGE = """<!doctype html>
 <body>
 <header>
   <h1>Router dashboard</h1>
-  <span class="sub">where did my prompt go? &middot; goal 12 (read-only view over goal-3 routing records)</span>
+  <span class="sub">where did my prompt go? &amp; what's the fleet doing? &middot; goals 12 + 13</span>
   <span class="status" id="status">loading&hellip;</span>
 </header>
 <div class="wrap">
+  <h2>Fleet &mdash; workbenches subscribed, models carried, health &amp; load
+    <span class="fleetstatus" id="fleetstatus"></span></h2>
+  <div class="tablewrap">
+    <table>
+      <thead><tr>
+        <th>model</th><th>health</th><th class="num">warm</th>
+        <th class="num">healthy</th><th class="num">in&#8209;flight</th><th>agent</th>
+      </tr></thead>
+      <tbody id="fleetmodels"><tr><td class="empty" colspan="6">no fleet data</td></tr></tbody>
+    </table>
+  </div>
+  <div class="tablewrap" style="margin-top:10px">
+    <table>
+      <thead><tr>
+        <th>workbench</th><th>model</th><th>health</th><th class="num">warm</th>
+        <th class="num">in&#8209;flight</th><th class="num">age</th>
+      </tr></thead>
+      <tbody id="fleetinstances"><tr><td class="empty" colspan="6">no workbenches subscribed</td></tr></tbody>
+    </table>
+  </div>
+
   <h2>Requests &mdash; requested alias &rarr; backend that served it</h2>
   <div class="tablewrap">
     <table>
@@ -239,6 +365,65 @@ function attRow(a){
     + '<td>'+err+'</td>'
     + '</tr>';
 }
+function healthBadge(inst){
+  if(inst.stale) return '<span class="badge stale">stale</span>';
+  return inst.healthy
+    ? '<span class="badge healthy">healthy</span>'
+    : '<span class="badge unhealthy">unhealthy</span>';
+}
+function fleetModelRow(m){
+  const anyStale = (m.instances||[]).some(i=>i.stale);
+  const health = m.healthy>0
+    ? '<span class="badge healthy">healthy</span>'
+    : '<span class="badge unhealthy">down</span>';
+  const agent = m.agent_capable
+    ? '<span class="badge yes">yes</span>' : '<span class="badge no">no</span>';
+  return '<tr>'
+    + '<td><code>'+esc(m.model)+'</code></td>'
+    + '<td>'+health+(anyStale?' <span class="badge stale">stale</span>':'')+'</td>'
+    + '<td class="num">'+esc(m.warm)+'</td>'
+    + '<td class="num">'+esc(m.healthy)+'/'+esc(m.instances_total)+'</td>'
+    + '<td class="num">'+esc(m.in_flight)+'</td>'
+    + '<td>'+agent+'</td>'
+    + '</tr>';
+}
+function fleetInstRow(i){
+  const warm = i.warm ? '<span class="badge yes">warm</span>' : '<span class="badge no">cold</span>';
+  const age = i.age_ms==null ? '&mdash;' : (Math.round(i.age_ms/100)/10+' s');
+  return '<tr>'
+    + '<td><code>'+esc(i.workbench_id)+'</code></td>'
+    + '<td><code>'+esc(i.model)+'</code></td>'
+    + '<td>'+healthBadge(i)+'</td>'
+    + '<td class="num">'+warm+'</td>'
+    + '<td class="num">'+esc(i.in_flight)+'</td>'
+    + '<td class="num">'+age+'</td>'
+    + '</tr>';
+}
+async function refreshFleet(){
+  const fs = document.getElementById('fleetstatus');
+  try {
+    const res = await fetch('api/fleet', {cache:'no-store'});
+    const data = await res.json();
+    if(!data.available){
+      fs.textContent = '\\u2014 fleet unavailable ('+esc(data.error||'no control-plane')+')';
+      document.getElementById('fleetmodels').innerHTML =
+        '<tr><td class="empty" colspan="6">control-plane not reachable</td></tr>';
+      document.getElementById('fleetinstances').innerHTML =
+        '<tr><td class="empty" colspan="6">&mdash;</td></tr>';
+      return;
+    }
+    const models = data.models||[], insts = data.instances||[];
+    fs.textContent = '';
+    document.getElementById('fleetmodels').innerHTML = models.length
+      ? models.map(fleetModelRow).join('')
+      : '<tr><td class="empty" colspan="6">no models registered</td></tr>';
+    document.getElementById('fleetinstances').innerHTML = insts.length
+      ? insts.map(fleetInstRow).join('')
+      : '<tr><td class="empty" colspan="6">no workbenches subscribed</td></tr>';
+  } catch(e) {
+    fs.textContent = '\\u2014 fleet endpoint error';
+  }
+}
 async function refresh(){
   try {
     const res = await fetch('api/records', {cache:'no-store'});
@@ -256,8 +441,9 @@ async function refresh(){
     document.getElementById('status').textContent = 'sink unreachable';
   }
 }
-refresh();
-setInterval(refresh, 2000);
+function tick(){ refresh(); refreshFleet(); }
+tick();
+setInterval(tick, 2000);
 </script>
 </body>
 </html>
@@ -309,6 +495,11 @@ class Handler(BaseHTTPRequestHandler):
                     "records": recs,
                 },
             )
+        # Goal 13 — the fleet DATA ENDPOINT the UI fetches and the e2e assertion
+        # covers: a server-side read of the control-plane registry. Always 200,
+        # even when the control-plane is down (available:false in the body).
+        if self.path.startswith("/api/fleet"):
+            return self._json(200, _fetch_fleet())
         if (
             self.path == "/"
             or self.path.startswith("/index")
