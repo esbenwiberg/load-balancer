@@ -144,6 +144,29 @@ The assertions live in `e2e/test_e2e.py`:
 `qwen3-coder → claude-sonnet` shows the request row *and* the 503 attempt row),
 and `test_dashboard_page_renders` (the page serves and is wired to `/api/records`).
 
+## The fleet view — "what's the fleet doing right now?" (goal 13)
+
+Dashboard **v2** adds the other half of the vision: the same page shows which
+workbenches are subscribed, with which models, warm/healthy, and how loaded. The
+data comes from the control-plane registry ([goal 5](10-control-plane.md)), not
+the routing records — the dashboard reads the control-plane's `/models`
+server-side and re-serves it at its own **`/api/fleet`** endpoint, which the page
+renders under a Fleet section (per-model aggregate + a per-workbench instance
+table). See [docs/10 "Why the dashboard PROXIES the registry"](10-control-plane.md)
+for the reversible design call (owned/assertable endpoint, no CORS, graceful
+degrade to `available:false`).
+
+In the **dev** stack each mockd workbench pushes real heartbeats, so the fleet
+view is live and `in_flight` moves as you drive traffic. In the **e2e** stack the
+test is the sole (deterministic) heartbeat producer. Assertions in
+`e2e/test_e2e.py`: `test_dashboard_fleet_reflects_control_plane_registry` (two
+workbenches heartbeat one model → the endpoint aggregates warm/healthy/summed
+in-flight and lists both instances) and
+`test_dashboard_fleet_surfaces_derived_health` (a workbench reporting
+`healthy:false` shows unhealthy *and* is excluded from the aggregate — the derived
+health signal survives the whole registry→dashboard path). Offline shaping +
+graceful-degrade branches are covered by `e2e/dashboard_test.py` (fast tier).
+
 ## What this is *not* (yet)
 
 - **Not durable.** All sinks are ephemeral (stdout ring / mockd + dashboard

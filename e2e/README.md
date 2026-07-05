@@ -242,6 +242,25 @@ that forced a fallback). We *built* this thin page rather than reuse LiteLLM's
 admin UI — the routing-record shape is ours, an owned JSON endpoint is
 assertable, and it keeps the zero-dependency floor; full reasoning in
 [docs/09](../docs/09-observability.md) and `dashboard.py`'s header.
+
+**Dashboard v2 — the Fleet view (goal 13).** The same page also shows *what the
+fleet is doing right now*: which workbenches are subscribed, with which models,
+warm/healthy, and their live in-flight load. That data is the control-plane
+registry ([goal 5](../docs/10-control-plane.md)) — the dashboard reads it
+server-side and re-serves it at its own `GET /api/fleet`:
+
+```bash
+curl -s localhost:9300/api/fleet | jq '.models[] | {model, healthy, warm, in_flight}'
+```
+
+In the **dev** stack each mockd workbench pushes real heartbeats
+(`HEARTBEAT_URL`/`HEARTBEAT_MODELS`), so the Fleet view is live — drive traffic
+through `:4000` and watch `in_flight` move. In the **e2e** stack no mockd beats
+(kept deterministic); the fleet assertion pushes its own heartbeats.
+`test_dashboard_fleet_reflects_control_plane_registry` and
+`test_dashboard_fleet_surfaces_derived_health` cover the registry→dashboard path;
+`dashboard_test.py` covers the offline shaping + graceful-degrade branches.
+
 `test_dashboard_data_endpoint_shows_direct_request`,
 `test_dashboard_data_endpoint_shows_fallback_route`, and
 `test_dashboard_page_renders` cover the data endpoint + page.
@@ -271,12 +290,18 @@ Topology (`docker-compose.dev.yaml`):
 | `workbench-a` | `:9101` | `workbench-a` | a Spark workbench slot (`qwen3-coder-a`) |
 | `workbench-b` | `:9102` | `workbench-b` | a second, distinct workbench slot (`qwen3-coder-b`) |
 | `foundry` | `:9103` | `mock-foundry` | the always-up fallback tier (`claude-sonnet` / `claude-opus` / `gpt`) |
-| `dashboard` | `:9300` | — | goal-12 "where did my prompt go?" viewer — open `http://localhost:9300` |
+| `dashboard` | `:9300` | — | goals 12+13 viewer — routes (`/api/records`) + fleet (`/api/fleet`); open `http://localhost:9300` |
+| `control-plane` | `:9400` | — | goal-5 fleet registry — each workbench heartbeats it; the dashboard renders it |
 | `db` | (internal) | — | Postgres — the virtual-key store |
 
 The dev gateway wires the same `obs_callback` and fans records to the dashboard
 (`OBS_WEBHOOK_URL=http://dashboard:9300/records`) — so with the stack up, every
 prompt you send through `:4000` shows up live at `http://localhost:9300`.
+
+Each `mockd` workbench also PUSHES heartbeats to the `control-plane`
+(`HEARTBEAT_URL`/`HEARTBEAT_MODELS`), so the dashboard's **Fleet** section shows
+the live fleet — per-workbench models, health, and in-flight load that moves as
+you drive traffic (goal 13). `dev_smoke.sh` asserts the fleet populates.
 
 Each `mockd` sets a distinct `MOCKD_INSTANCE`, so its reply stamps
 `served_model=<model>@<instance>` — that's how you tell two otherwise-identical
@@ -431,17 +456,20 @@ data** through it. Keep smoke prompts synthetic. If in doubt → **DISCO**.
 ```
 mockd.py                     controllable mock backend (stdlib, no deps; MOCKD_INSTANCE stamps identity) + /__observe sink
 obs_callback.py              observability callback: per-request routing records -> stdout + webhook(s) (docs/09)
-dashboard.py                 goal-12 read-only "where did my prompt go?" viewer + routing-record sink (:9300)
+dashboard.py                 goals 12+13 read-only viewer: routes (/api/records) + fleet (/api/fleet) + record sink (:9300)
+dashboard_test.py            stdlib unit tests for the fleet view shaping + graceful-degrade (goal 13, fast tier)
+control_plane.py             goal-5 fleet state registry + heartbeat interface (:9400)
+control_plane_test.py        stdlib unit tests for the registry state model + wire (goal 5, fast tier)
 litellm-config.e2e.yaml      mock-profile gateway config (all aliases -> one mockd)
-docker-compose.e2e.yaml      mock stack: litellm + mockd + dashboard + postgres
+docker-compose.e2e.yaml      mock stack: litellm + mockd + dashboard + control-plane + postgres
 test_e2e.py                  raw-HTTP pytest suite (the CI driver)
 run.sh                       up -> test -> conformance gate -> teardown
 requirements.txt             test-driver deps (httpx, pytest, openai)
 .env.e2e.example             mock-profile env (test-only, safe to commit)
 
 litellm-config.dev.yaml      dev-profile config (workbench-a/-b + foundry, distinct instances; obs -> dashboard)
-docker-compose.dev.yaml      dev stack: litellm + 2 workbenches + foundry + dashboard + postgres (stays up)
-dev_smoke.sh                 dev-profile smoke: all 3 surfaces -> 3 distinct containers
+docker-compose.dev.yaml      dev stack: litellm + 2 workbenches + foundry + dashboard + control-plane + postgres (stays up)
+dev_smoke.sh                 dev-profile smoke: all 3 surfaces -> 3 distinct containers + fleet view live
 
 litellm-config.cliauth.yaml  cli-auth gateway config (real providers, env-keyed)
 docker-compose.cliauth.yaml  cli-auth stack: litellm + postgres (no mockd)

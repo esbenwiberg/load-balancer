@@ -23,6 +23,7 @@ export LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-sk-e2e-master-test-key}"
 export GATEWAY_URL="${GATEWAY_URL:-http://localhost:4000}"
 export MOCKD_URL="${MOCKD_URL:-http://localhost:9100}"
 export DASH_URL="${DASH_URL:-http://localhost:9300}"   # goal-12 dashboard sink + data endpoint
+export CONTROL_PLANE_URL="${CONTROL_PLANE_URL:-http://localhost:9400}"  # goal-13 fleet registry
 
 cleanup() {
   if [[ "$KEEP" -eq 0 ]]; then

@@ -52,10 +52,11 @@ Priority is (a) completing the idea — control plane, observability, dashboard 
 and (b) hardening the harness + test setup. Recommended order:
 harness core (0 → 1 → 2 → 6 → 7 → 9) → dev stack (10) → observability +
 wallet guards (3 ✅ → 11b ✅) → dashboard v1 (12 ✅) → Ollama (4) → control plane
-(5 ✅) → dashboard v2 (13) → Azure IaC (14). Spark-infra-shaped work is parked.
-**Next up: 13** (dashboard v2) — now fully unblocked: both prerequisites (5 and
-12) are merged. **4** (Ollama local-model profile) remains an autonomy-friendly
-alternative.
+(5 ✅) → dashboard v2 (13 ✅) → Azure IaC (14). Spark-infra-shaped work is parked.
+**Next up: 14** (Azure IaC skeleton — code only, offline-validated) or **4**
+(Ollama local-model profile) — both autonomy-friendly. The control-plane + both
+dashboard halves (12, 13) are done, so the "complete the idea" arc is now
+essentially closed; 14 hardens the local↔cloud parity story.
 
 Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 [`docs/06`](docs/06-recommendation.md) (decision), [`docs/03`](docs/03-open-questions-and-risks.md) (risks).
@@ -72,16 +73,6 @@ workbench — it's the stand-in until real Sparks arrive.
 **Completion condition:**
 ```
 e2e has a documented 'local' profile (compose + config) running Ollama with a small coding model as the workbench, and conformance.py can be pointed at it; hard constraint: Ollama must NOT run in CI (too heavy) — the deliverable is the profile + docs, machine-verified by the mock profile still passing; e2e/run.sh (mock profile) exits 0 with its passing output surfaced in the conversation; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 40 turns and leave a draft PR describing the decision needed
-```
-
-### 13. Fleet dashboard v2 — who's subscribed, with what, under what load — risk: medium
-**Why:** the other half of the vision: which workbenches are registered, which
-models they carry, warm/healthy/in-flight right now. Reads from the
-control-plane skeleton — the *display* is autonomy-friendly even though the
-routing policy behind it isn't.
-**Completion condition:**
-```
-prerequisite: goals 5 and 12 must already be merged to main — if either is not, stop immediately and report that; the dashboard shows the control-plane registry live for the dev stack (per-workbench models, health, in-flight/load); an assertion covers the registry-to-dashboard data path; e2e/run.sh exits 0 with its passing output surfaced in the conversation; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 50 turns and leave a draft PR describing the decision needed
 ```
 
 ### 14. Azure IaC skeleton — code only, no deploy — risk: medium
@@ -157,4 +148,17 @@ decision is made.
 - ✅ 11b. Users, teams, and spend audit — per-model costs on `qwen3-coder` so mockd traffic accrues nonzero spend; keys minted bound to a user grouped into a team (`/team/new` → `/team/member_add` → `/key/generate`); `test_spend_attributed_to_key_user_team` proves a `SpendLogs` row + `/key|user|team/info` aggregates attribute spend to the right key+user+team, `test_spend_survives_gateway_restart` restarts the gateway container and proves the Postgres-backed ledger + issued key persist (the open persistence question answered); audit queries + SQL documented in e2e/README "Spend audit" — PR #? (2026-07)
 - ✅ 12. Routing dashboard v1 — "where did my prompt go?" — read-only stdlib dashboard (`e2e/dashboard.py`, `:9300`) over goal-3 routing records: a record **sink** (`POST /records`) + **data endpoint** (`GET /api/records`: per-request view {requested→served, fallback, tier, latency, tokens} + attempt trail) + read-only **page** (`GET /`). Build-vs-reuse fork decided **BUILD** (not LiteLLM's admin UI): the record shape is ours, an owned JSON endpoint is assertable, keeps the zero-dep floor, read-only, reversible — documented in `dashboard.py` header + [docs/09](docs/09-observability.md). `obs_callback` gained comma-separated multi-sink fan-out so e2e feeds both `mockd/__observe` (goal-3 suite unchanged) and the dashboard. Wired into e2e + dev stacks (dev had **no** obs wiring before this). `test_dashboard_data_endpoint_shows_direct_request` / `_shows_fallback_route` / `_page_renders`. — PR #21 (2026-07)
 - ✅ 5. Phase-1 control-plane skeleton — stdlib SQLite-backed fleet registry + heartbeat interface (`e2e/control_plane.py`, `:9400`) exposing per-model `{warm, in_flight, healthy, agent_capable}`; `healthy` is DERIVED (reported-healthy AND heartbeat-fresh, TTL decay) so a silent workbench self-decays; push heartbeats + full-snapshot upsert per (workbench,model); aggregates across workbenches (summed in_flight, any-healthy agent_capable). Registry+state+tests ONLY — routing policy + session-stickiness deliberately NOT built (Needs-a-human). 19 stdlib `unittest` tests (`e2e/control_plane_test.py`: Registry state model w/ injected clock + HTTP wire) wired into check.sh fast tier; standing `control-plane` service added to dev compose (empty registry; goal 13 wires producers). Decisions + open questions in [docs/10](docs/10-control-plane.md) — PR #? (2026-07)
+- ✅ 13. Fleet dashboard v2 — who's subscribed, with what, under what load — the
+  dashboard reads the goal-5 control-plane registry via its own owned `/api/fleet`
+  endpoint (server-side proxy of `/models`; reversible call — owned+assertable,
+  no CORS, degrades to `available:false`) and renders a Fleet section: per-model
+  {warm, healthy/total, in-flight, agent} + a per-workbench instance table with
+  derived health. `control-plane` added to the e2e stack; mockd gained an
+  optional heartbeat producer (gated on `HEARTBEAT_URL`) + a live in-flight
+  counter, wired in the **dev** stack so each workbench beats real state (e2e
+  keeps the test as the sole deterministic producer). Assertions:
+  `test_dashboard_fleet_reflects_control_plane_registry` +
+  `test_dashboard_fleet_surfaces_derived_health` (registry→dashboard path),
+  `dashboard_test.py` (offline shaping + degrade, fast tier), `dev_smoke.sh` step
+  4 (live fleet). Docs: [docs/09](docs/09-observability.md), [docs/10](docs/10-control-plane.md). — PR #? (2026-07)
 - ✅ 11. Budgets + rate limits per virtual key — `default_key_generate_params` (max_budget/rpm/tpm) in litellm-config.e2e.yaml so every issued key inherits a config default; e2e proves a bare key inherits the defaults, an over-budget key (max_budget:0) → clean 400 budget_exceeded, an over-rate-limit key (rpm:1) → clean 429 (never 5xx/hang); README documents the knobs + how to raise them + the goal-11/11b units boundary (dollar-spend accrual is 11b) — PR #? (2026-07)

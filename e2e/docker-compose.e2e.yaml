@@ -6,11 +6,17 @@
 #   :4000  LiteLLM gateway   — clients + the pytest suite hit this
 #   :9100  mockd             — published so tests can POST /__control to inject
 #                              faults; LiteLLM reaches it in-network at mockd:9100
-#   :9300  dashboard         — goal-12 "where did my prompt go?" viewer; the
-#                              gateway's obs_callback fans routing records here
-#                              (as well as to mockd/__observe). GET / for the UI,
-#                              GET /api/records for the data endpoint the suite
-#                              asserts on.
+#   :9300  dashboard         — goals 12+13 viewer; the gateway's obs_callback
+#                              fans routing records here (as well as to
+#                              mockd/__observe). GET / for the UI, GET
+#                              /api/records for the routing data endpoint, GET
+#                              /api/fleet for the control-plane fleet view. Both
+#                              data endpoints are asserted by the suite.
+#   :9400  control-plane     — goal-5 fleet registry. Here so the goal-13 fleet
+#                              assertion can push heartbeats (host-published) and
+#                              read them back through the dashboard's /api/fleet
+#                              (in-network). Unlike the dev stack, NO mockd beats
+#                              it — the test is the sole, deterministic producer.
 # =============================================================================
 
 services:
@@ -62,11 +68,39 @@ services:
     environment:
       DASH_PORT: "9300"
       DASH_HOST: "0.0.0.0"
+      # Goal 13: where the fleet view reads live state from. In-network address;
+      # /api/fleet degrades gracefully if it's ever unreachable.
+      CONTROL_PLANE_URL: "http://control-plane:9400"
     command: ["python", "dashboard.py"]
     ports:
       - "9300:9300"        # host-published so the pytest suite can read /api/records
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9300/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
+  control-plane:
+    # Goal 5 — fleet state registry + heartbeat interface. Present in the e2e
+    # stack (goal 13) so the fleet assertion can POST /heartbeat (host-published
+    # :9400) and read it back through the dashboard's /api/fleet. Stdlib-only
+    # (SQLite), no pip install. NO mockd here beats it: the test is the sole,
+    # deterministic heartbeat producer (the dev stack is where mockd beats live).
+    image: python:3.12-slim
+    container_name: control-plane-e2e
+    working_dir: /app
+    volumes:
+      - ./control_plane.py:/app/control_plane.py:ro
+    environment:
+      CONTROL_PLANE_PORT: "9400"
+      CONTROL_PLANE_HOST: "0.0.0.0"
+      CONTROL_PLANE_DB: "/tmp/control_plane.db"
+    command: ["python", "control_plane.py"]
+    ports:
+      - "9400:9400"        # host-published so the pytest suite can push heartbeats
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9400/health').status==200 else 1)"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -80,6 +114,8 @@ services:
       mockd:
         condition: service_healthy
       dashboard:
+        condition: service_healthy
+      control-plane:
         condition: service_healthy
       db:
         condition: service_healthy
