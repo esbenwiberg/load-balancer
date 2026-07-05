@@ -35,6 +35,8 @@ is lost between sessions.
 | [docs/07-next-session-prompt.md](docs/07-next-session-prompt.md) | Copy-paste handoff prompt to continue in a clean session. |
 | [docs/08-e2e-testing.md](docs/08-e2e-testing.md) | **E2E design:** test the balancer without Foundry/Sparks — mock + cli-auth profiles, trade-offs. |
 | [docs/09-observability.md](docs/09-observability.md) | **"Where did my prompt go?"** — the per-request routing records (backend, why, latency, tokens, fallback) and how to read them. |
+| [docs/10-control-plane.md](docs/10-control-plane.md) | **Fleet control plane** — the Phase-1 registry + heartbeat interface (per-model warm/in-flight/healthy/agent-capable) and why routing policy is deliberately not built yet. |
+| [docs/11-azure-iac.md](docs/11-azure-iac.md) | **Azure IaC & parity** — the Bicep skeleton (gateway, store, Key Vault, network), the bicep-vs-terraform decision, and every dev-stack component mapped to its Azure counterpart. |
 
 ## What's built (Phase-0 groundwork)
 
@@ -42,6 +44,7 @@ is lost between sessions.
 |-----|--------------|
 | [conformance/](conformance/) | Tool-calling **conformance harness** — drives a model through Read→Edit→Bash under streaming, counts leaked/malformed/unknown/runaway tool calls, emits pass/fail + a tool-call-error-rate. Sets `agent_capable`. Has an offline self-test. |
 | [deploy/](deploy/) | Runnable **Phase-0 scaffold** — `litellm-config.yaml` (env-parameterised, both blockers wired in), `docker-compose.yaml` (vetted version pin), `.env.example`, `run.sh`, and `RUNBOOK.md`. |
+| [deploy/azure/](deploy/azure/) | **Azure IaC skeleton** (goal 14) — Bicep for the gateway Container App, PostgreSQL store, Key Vault, and VNet. Code-only: compiles offline (`bicep build`), does not deploy. See [docs/11](docs/11-azure-iac.md). |
 | [e2e/](e2e/) | **E2E test harness** — test the balancer with no Foundry/Sparks. `mockd` (a controllable fake backend + scripted agent) drives a full `./run.sh` (pytest + conformance-through-the-gateway); `cli-auth` profile drives real Claude Code/Codex via provisioned keys. See [docs/08](docs/08-e2e-testing.md). |
 
 **Blockers resolved this round** (details in docs/03 risks 4 & 5):

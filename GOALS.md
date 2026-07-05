@@ -52,11 +52,11 @@ Priority is (a) completing the idea — control plane, observability, dashboard 
 and (b) hardening the harness + test setup. Recommended order:
 harness core (0 → 1 → 2 → 6 → 7 → 9) → dev stack (10) → observability +
 wallet guards (3 ✅ → 11b ✅) → dashboard v1 (12 ✅) → Ollama (4) → control plane
-(5 ✅) → dashboard v2 (13 ✅) → Azure IaC (14). Spark-infra-shaped work is parked.
-**Next up: 14** (Azure IaC skeleton — code only, offline-validated) or **4**
-(Ollama local-model profile) — both autonomy-friendly. The control-plane + both
-dashboard halves (12, 13) are done, so the "complete the idea" arc is now
-essentially closed; 14 hardens the local↔cloud parity story.
+(5 ✅) → dashboard v2 (13 ✅) → Azure IaC (14 ✅). Spark-infra-shaped work is parked.
+**Next up: 4** (Ollama local-model profile — the one autonomy-friendly goal left).
+The control-plane, both dashboard halves (12, 13), and the Azure IaC skeleton
+(14) are done, so the "complete the idea" arc is closed and the local↔cloud
+parity story is pinned; 4 adds real keyless tool-calling to the harness.
 
 Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 [`docs/06`](docs/06-recommendation.md) (decision), [`docs/03`](docs/03-open-questions-and-risks.md) (risks).
@@ -73,16 +73,6 @@ workbench — it's the stand-in until real Sparks arrive.
 **Completion condition:**
 ```
 e2e has a documented 'local' profile (compose + config) running Ollama with a small coding model as the workbench, and conformance.py can be pointed at it; hard constraint: Ollama must NOT run in CI (too heavy) — the deliverable is the profile + docs, machine-verified by the mock profile still passing; e2e/run.sh (mock profile) exits 0 with its passing output surfaced in the conversation; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 40 turns and leave a draft PR describing the decision needed
-```
-
-### 14. Azure IaC skeleton — code only, no deploy — risk: medium
-**Why:** the balancer must end up Azure-hosted, but a real deploy needs creds
-and a network-exposure decision (§ Needs-a-human). The IaC itself is just
-code: author it, validate it offline, and pin local↔cloud parity so the dev
-stack stays a faithful miniature.
-**Completion condition:**
-```
-IaC (bicep or terraform — a reversible call: decide it and document the reasons) describes the gateway container, its persistent store, key-vault wiring for secrets, and networking parameters; it validates in CI with offline tooling only (bicep build / terraform validate — no cloud calls, no deploy, no credentials); a parity doc maps every dev-stack component to its Azure counterpart; e2e/run.sh exits 0 with its passing output surfaced in the conversation; the change is squash-merged to main per CLAUDE.md's contract with the merge confirmation surfaced; if blocked, stop after 40 turns and leave a draft PR describing the decision needed
 ```
 
 ---
@@ -162,3 +152,4 @@ decision is made.
   `dashboard_test.py` (offline shaping + degrade, fast tier), `dev_smoke.sh` step
   4 (live fleet). Docs: [docs/09](docs/09-observability.md), [docs/10](docs/10-control-plane.md). — PR #? (2026-07)
 - ✅ 11. Budgets + rate limits per virtual key — `default_key_generate_params` (max_budget/rpm/tpm) in litellm-config.e2e.yaml so every issued key inherits a config default; e2e proves a bare key inherits the defaults, an over-budget key (max_budget:0) → clean 400 budget_exceeded, an over-rate-limit key (rpm:1) → clean 429 (never 5xx/hang); README documents the knobs + how to raise them + the goal-11/11b units boundary (dollar-spend accrual is 11b) — PR #? (2026-07)
+- ✅ 14. Azure IaC skeleton — code only, offline-validated — Bicep (decision recorded over Terraform: `bicep build` validates fully offline; Azure-native; stateless) under `deploy/azure/`: `main.bicep` + modules for the gateway Container App (managed identity, Key Vault–referenced secrets, parameterised ingress), PostgreSQL Flexible Server (private persistent store), Key Vault (secrets + MI RBAC), and VNet (delegated subnets + NSG). Secrets are required `@secure()` params with no defaults; `main.example.bicepparam` carries commit-safe placeholders. `scripts/check.sh` fast tier gained an offline `bicep build`/`build-params` step (fails on ANY diagnostic, no cloud calls/creds), CI installs bicep via `az bicep install`, and the litellm image-pin guard now also covers `.bicep`. Parity doc [docs/11](docs/11-azure-iac.md) maps every dev-stack component to its Azure counterpart (with the deliberate gaps named). — PR #? (2026-07)

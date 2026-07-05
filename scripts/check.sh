@@ -130,36 +130,107 @@ fi
 # 1.82.7/1.82.8 shipped credential-stealing malware; the bridge needs a vetted
 # 1.83.x-stable. That pin was enforced ONLY by eyeball. Here it's machine-checked
 # everywhere check.sh runs (pre-commit, Stop hook, CI): every ACTIVE reference to
-# the litellm image across compose files must be EXACTLY the vetted tag. Comments
-# (the digest-example line) and doc prose (the malware warnings) are not image
-# references, so they're ignored. If you deliberately move the pin — a new vetted
-# stable, or a verified @sha256 digest — bump VETTED_LITELLM here in the SAME
-# change, so the guard and the compose files can never silently diverge.
+# the litellm image across compose AND bicep files must be EXACTLY the vetted tag.
+# Comments (the digest-example line, bicep `//` notes) and doc prose (the malware
+# warnings) are not image references, so they're ignored. If you deliberately move
+# the pin — a new vetted stable, or a verified @sha256 digest — bump VETTED_LITELLM
+# here in the SAME change, so the guard, the compose files, and the Azure IaC
+# (deploy/azure/modules/gateway.bicep default) can never silently diverge.
 step "litellm image pin (docs/03 risk 8 — never 1.82.7/1.82.8)"
 VETTED_LITELLM="ghcr.io/berriai/litellm:v1.83.14-stable"
 PINF=()
 while IFS= read -r f; do PINF+=("$f"); done < <(
   find . -path ./.venv-e2e -prune -o -path ./.git -prune -o \
     \( -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' \
-       -o -name 'compose*.yml' -o -name 'compose*.yaml' \) -print | sort)
+       -o -name 'compose*.yml' -o -name 'compose*.yaml' \
+       -o -name '*.bicep' \) -print | sort)
 if [ "${#PINF[@]}" -eq 0 ]; then
   ok "no compose files to check"
 else
   PIN_BAD=0
-  # file:line:content for every litellm image mention, minus comment lines,
-  # minus the exact vetted pin -> whatever remains is an offending reference.
+  # file:line:content for every litellm image mention, minus comment lines
+  # (YAML `#` and bicep `//`), minus the exact vetted pin -> whatever remains is
+  # an offending reference.
   while IFS= read -r hit; do
     [ -z "$hit" ] && continue
     PIN_BAD=1
     printf '      offending: %s\n' "$hit"
   done < <(
     grep -nE 'ghcr\.io/berriai/litellm' "${PINF[@]}" 2>/dev/null \
-      | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' \
+      | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(#|//)' \
       | grep -vF "$VETTED_LITELLM" || true)
   if [ "$PIN_BAD" -eq 0 ]; then
     ok "litellm pin ($VETTED_LITELLM)"
   else
     fail "litellm image pin deviates from vetted $VETTED_LITELLM"
+  fi
+fi
+
+# --- Azure IaC: offline bicep build (goal 14 — no cloud calls, no creds) -----
+# The Azure IaC skeleton (deploy/azure/*.bicep) must compile offline. `bicep
+# build` transpiles Bicep -> ARM JSON purely locally: it makes NO cloud calls,
+# needs NO credentials, and does NOT deploy. We build every .bicep (main + each
+# module standalone) and every .bicepparam, all to stdout so no JSON artifacts
+# land in the tree. Two runners are supported — standalone `bicep` (positional
+# syntax) or `az bicep` (--file syntax); prefer standalone, fall back to az.
+# Missing both -> skip (fast-tier contract); CI installs bicep so nothing skips.
+step "bicep IaC build (deploy/azure — offline, no cloud calls, no creds)"
+BICEP_KIND=""
+if have bicep; then
+  BICEP_KIND="standalone"
+elif have az && az bicep version >/dev/null 2>&1; then
+  BICEP_KIND="az"
+fi
+bicep_build() {        # $1 = .bicep file
+  if [ "$BICEP_KIND" = "az" ]; then az bicep build --file "$1" --stdout
+  else bicep build "$1" --stdout; fi
+}
+bicep_build_params() { # $1 = .bicepparam file
+  if [ "$BICEP_KIND" = "az" ]; then az bicep build-params --file "$1" --stdout
+  else bicep build-params "$1" --stdout; fi
+}
+if [ -z "$BICEP_KIND" ]; then
+  skip "bicep" "not installed — 'az bicep install' or https://aka.ms/bicep-install"
+else
+  BC=()
+  while IFS= read -r f; do BC+=("$f"); done < <(
+    find . -path ./.venv-e2e -prune -o -path ./.git -prune -o -name '*.bicep' -print | sort)
+  BP=()
+  while IFS= read -r f; do BP+=("$f"); done < <(
+    find . -path ./.venv-e2e -prune -o -path ./.git -prune -o -name '*.bicepparam' -print | sort)
+  if [ "${#BC[@]}" -eq 0 ] && [ "${#BP[@]}" -eq 0 ]; then
+    ok "no bicep files found"
+  else
+    BICEP_BAD=0
+    for f in "${BC[@]}"; do
+      if out="$(bicep_build "$f" 2>&1 >/dev/null)"; then
+        # build succeeds on warnings; treat any diagnostic line as a hard fail so
+        # the IaC stays lint-clean (no accidental secure-default / unused params).
+        if [ -n "$out" ]; then
+          BICEP_BAD=1; fail "bicep build (diagnostics): $f"
+          printf '%s\n' "$out" | sed 's/^/      /'
+        else
+          ok "bicep build: $f"
+        fi
+      else
+        BICEP_BAD=1; fail "bicep build: $f"
+        printf '%s\n' "$out" | sed 's/^/      /'
+      fi
+    done
+    for f in "${BP[@]}"; do
+      if out="$(bicep_build_params "$f" 2>&1 >/dev/null)"; then
+        if [ -n "$out" ]; then
+          BICEP_BAD=1; fail "bicep build-params (diagnostics): $f"
+          printf '%s\n' "$out" | sed 's/^/      /'
+        else
+          ok "bicep build-params: $f"
+        fi
+      else
+        BICEP_BAD=1; fail "bicep build-params: $f"
+        printf '%s\n' "$out" | sed 's/^/      /'
+      fi
+    done
+    [ "$BICEP_BAD" -eq 0 ] && ok "bicep IaC compiles clean (offline)"
   fi
 fi
 
