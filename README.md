@@ -34,6 +34,7 @@ is lost between sessions.
 | [docs/06-recommendation.md](docs/06-recommendation.md) | **The decision:** what to build, phased, with a Phase-0 config. |
 | [docs/07-next-session-prompt.md](docs/07-next-session-prompt.md) | Copy-paste handoff prompt to continue in a clean session. |
 | [docs/08-e2e-testing.md](docs/08-e2e-testing.md) | **E2E design:** test the balancer without Foundry/Sparks — mock + cli-auth profiles, trade-offs. |
+| [docs/09-observability.md](docs/09-observability.md) | **"Where did my prompt go?"** — the per-request routing records (backend, why, latency, tokens, fallback) and how to read them. |
 
 ## What's built (Phase-0 groundwork)
 

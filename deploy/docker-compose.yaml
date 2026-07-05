@@ -21,6 +21,11 @@ services:
       - "4000:4000"
     volumes:
       - ./litellm-config.yaml:/app/config.yaml:ro
+      # Observability callback (goal 3) — SINGLE SOURCE OF TRUTH shared with the
+      # e2e stack. No OBS_WEBHOOK_URL is set here, so records go to stdout only
+      # (`docker logs litellm-gateway | grep ROUTING_RECORD`). See
+      # ../docs/09-observability.md.
+      - ../e2e/obs_callback.py:/app/obs_callback.py:ro
     env_file:
       - .env
     command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]

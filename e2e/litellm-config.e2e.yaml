@@ -89,6 +89,16 @@ router_settings:
 litellm_settings:
   drop_params: true
 
+  # --- Observability: per-request routing records (goal 3) ------------------
+  # obs_callback.py emits one JSON record per backend ATTEMPT (event=llm_call:
+  # backend, tier, latency, tokens, and on failure the error that triggered a
+  # fallback) and one per DELIVERED response (event=delivered: requested vs
+  # served backend => fallback flag, plus tokens/cost). Records go to stdout
+  # (ROUTING_RECORD <json>) always, and — because OBS_WEBHOOK_URL is set in the
+  # e2e compose — are POSTed to mockd's /__observe so the suite can read them
+  # back and assert a fallback is observable. See docs/09-observability.md.
+  callbacks: obs_callback.routing_recorder
+
   # --- Wallet guardrails (goal 11) ------------------------------------------
   # EVERY virtual key the gateway mints inherits these unless the /key/generate
   # call sets the field explicitly. LiteLLM applies each entry only where the

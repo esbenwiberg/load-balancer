@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -895,3 +896,174 @@ def test_concurrent_mixed_surface_streams_no_crosstalk():
         _assert_clean_stamped(
             "%s[%s]" % (surface, alias), expected, status, text, done_seen
         )
+
+
+# --- observability: per-request routing records (goal 3) ---------------------
+#
+# The gateway's obs_callback (litellm-config.e2e.yaml -> litellm_settings.
+# callbacks) publishes a routing record per backend ATTEMPT (event=llm_call) and
+# per DELIVERED response (event=delivered) to mockd's /__observe sink. These
+# prove we capture {chosen backend, why, latency, tokens, fallback-hit} for every
+# request with NO external observability stack. mockd is one process, so it
+# centralizes records across BOTH gateway workers; /__reset (autouse fixture)
+# clears them, so each test sees only its own. See docs/09-observability.md.
+
+
+def _observe():
+    """All routing records mockd has received so far."""
+    r = httpx.get(MOCKD + "/__observe", timeout=TIMEOUT)
+    assert r.status_code == 200, r.text
+    return r.json().get("records", [])
+
+
+def _poll_observe(predicate, timeout=8.0):
+    """The callback POSTs records AFTER the client response returns, so the store
+    lags the HTTP 200. Poll until `predicate(records)` holds (or time out), then
+    return the records — a final read either way so the assertion sees the best
+    available snapshot for its error message."""
+    deadline = time.time() + timeout
+    recs = _observe()
+    while time.time() < deadline:
+        if predicate(recs):
+            return recs
+        time.sleep(0.25)
+        recs = _observe()
+    return recs
+
+
+def test_fallback_is_observable_in_routing_record():
+    """Goal 3: a fallback must be OBSERVABLE in the captured records, not only in
+    the client-visible response. Force qwen3-coder -> claude-sonnet, then read the
+    records the gateway's obs_callback published and assert both halves of the
+    story are captured:
+
+      * a `delivered` record shows requested_model=qwen3-coder but
+        served_model=claude-sonnet with fallback=true, carrying token usage —
+        the CHOSEN backend and the FALLBACK-HIT flag; and
+      * an `llm_call` failure record for qwen3-coder with error_code 503, the
+        backend tier, and a captured latency — the WHY behind the fallback.
+
+    Together: the {chosen backend, why, latency, tokens, fallback-hit} the
+    observability goal requires. We poll for BOTH before asserting so the async
+    log flush can't race the read.
+    """
+    _inject({"model": "qwen3-coder", "status": 503})  # persistent -> fallback
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": "qwen3-coder",
+            "messages": [{"role": "user", "content": "ping"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+    assert "served_model=claude-sonnet" in _served_model(r.json()), r.text
+
+    def _both_captured(recs):
+        has_delivered = any(
+            x.get("event") == "delivered"
+            and x.get("requested_model") == "qwen3-coder"
+            and x.get("fallback") is True
+            for x in recs
+        )
+        has_failure = any(
+            x.get("event") == "llm_call"
+            and x.get("status") == "failure"
+            and x.get("requested_group") == "qwen3-coder"
+            for x in recs
+        )
+        return has_delivered and has_failure
+
+    recs = _poll_observe(_both_captured)
+
+    # (a) the delivered record: chosen backend + fallback flag + tokens
+    delivered = [
+        x
+        for x in recs
+        if x.get("event") == "delivered" and x.get("requested_model") == "qwen3-coder"
+    ]
+    assert delivered, "no delivered record for the qwen3-coder request: %r" % recs
+    d = delivered[-1]
+    assert d.get("fallback") is True, "delivered record must flag the fallback: %r" % d
+    assert d.get("served_model") == "claude-sonnet", (
+        "delivered record must name the backend that actually served: %r" % d
+    )
+    assert (d.get("tokens") or {}).get("total"), (
+        "delivered record must capture token usage: %r" % d
+    )
+
+    # (b) the failed-attempt record: the WHY (503 on the workbench) + latency
+    failed = [
+        x
+        for x in recs
+        if x.get("event") == "llm_call"
+        and x.get("status") == "failure"
+        and x.get("requested_group") == "qwen3-coder"
+    ]
+    assert failed, "no failed-attempt record explaining the fallback: %r" % recs
+    f = failed[-1]
+    assert str(f.get("error_code")) == "503", (
+        "failure record must capture the 503 that triggered the fallback: %r" % f
+    )
+    assert f.get("tier") == "local", (
+        "failure record should carry the faulted backend's tier: %r" % f
+    )
+    assert isinstance(f.get("latency_ms"), (int, float)), (
+        "failure record must capture per-attempt latency: %r" % f
+    )
+
+
+def test_direct_request_routing_record_no_fallback():
+    """The baseline the fallback case is distinguished against: a request its own
+    backend serves records fallback=false, names that backend, and the per-attempt
+    `llm_call` carries latency + tokens. Guards against a fallback flag that is
+    accidentally always-true (which would make the fallback assertion vacuous)."""
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": "claude-sonnet",
+            "messages": [{"role": "user", "content": "ping"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+
+    def _both_seen(recs):
+        # The `delivered` POST and the `llm_call` success POST arrive in no
+        # guaranteed order, so wait for BOTH — the test asserts on each.
+        has_delivered = any(
+            x.get("event") == "delivered"
+            and x.get("requested_model") == "claude-sonnet"
+            for x in recs
+        )
+        has_call = any(
+            x.get("event") == "llm_call" and x.get("status") == "success" for x in recs
+        )
+        return has_delivered and has_call
+
+    recs = _poll_observe(_both_seen)
+    delivered = [
+        x
+        for x in recs
+        if x.get("event") == "delivered" and x.get("requested_model") == "claude-sonnet"
+    ]
+    assert delivered, "no delivered record for the direct request: %r" % recs
+    d = delivered[-1]
+    assert d.get("fallback") is False, (
+        "a directly-served request must NOT be flagged as a fallback: %r" % d
+    )
+    assert d.get("served_model") == "claude-sonnet", d
+
+    calls = [
+        x for x in recs if x.get("event") == "llm_call" and x.get("status") == "success"
+    ]
+    assert calls, "no successful llm_call attempt record: %r" % recs
+    c = calls[-1]
+    assert isinstance(c.get("latency_ms"), (int, float)), (
+        "attempt record must capture latency: %r" % c
+    )
+    assert (c.get("tokens") or {}).get("total"), (
+        "attempt record must capture token usage: %r" % c
+    )

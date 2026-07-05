@@ -32,8 +32,13 @@ an internal compose network only):
                     "mode": "agent|leak|runaway|malformed|hangup|echo",
                     "count": 2}      # apply to next N requests, then auto-clear
   GET  /__control                    # dump current directives
-  POST /__reset                      # clear all directives
+  POST /__reset                      # clear all directives + routing records
   GET  /health                       # 200 (liveness)
+
+Observability sink (goal 3 — the gateway's obs_callback POSTs routing records
+here so the test suite can read them back and assert a fallback is observable):
+  POST /__observe  {<routing record>}  # append one record
+  GET  /__observe                       # {"records": [...]} — all so far
 
 A directive can also be injected inline in the prompt for one-offs, e.g. a user
 message containing [[mockd:status=500]] or [[mockd:mode=runaway]].
@@ -125,6 +130,40 @@ class Control:
 
 
 CONTROL = Control()
+
+
+class Observations:
+    """Thread-safe, in-memory sink for the gateway's routing records (goal 3).
+
+    The gateway's obs_callback POSTs one record per backend attempt / delivered
+    response to /__observe; the test suite reads them back via GET /__observe and
+    asserts a fallback is observable. Because mockd is a SINGLE process it
+    centralizes records across BOTH litellm workers (--num_workers 2), which an
+    in-callback list could not. Cleared by /__reset alongside fault directives so
+    records never leak across serially-run tests."""
+
+    _CAP = 5000  # bound memory across a long run; oldest are dropped.
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._records = []
+
+    def add(self, record: dict) -> None:
+        with self._lock:
+            self._records.append(record)
+            if len(self._records) > self._CAP:
+                self._records = self._records[-self._CAP :]
+
+    def all(self) -> list:
+        with self._lock:
+            return json.loads(json.dumps(self._records))
+
+    def reset(self) -> None:
+        with self._lock:
+            self._records = []
+
+
+OBSERVATIONS = Observations()
 
 # --- Inline directive parsing ----------------------------------------------
 
@@ -335,6 +374,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"status": "ok", "daemon": "mockd"})
         if self.path.startswith("/__control"):
             return self._json(200, CONTROL.dump())
+        if self.path.startswith("/__observe"):
+            # Routing records the gateway's obs_callback has POSTed so far.
+            return self._json(200, {"records": OBSERVATIONS.all()})
         return self._json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -342,8 +384,13 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_body()
             CONTROL.set(body)
             return self._json(200, {"ok": True, "state": CONTROL.dump()})
+        if self.path.startswith("/__observe"):
+            # The gateway's obs_callback publishes routing records here.
+            OBSERVATIONS.add(self._read_body())
+            return self._json(200, {"ok": True})
         if self.path.startswith("/__reset"):
             CONTROL.reset()
+            OBSERVATIONS.reset()  # records must not leak across tests either
             return self._json(200, {"ok": True})
         if self.path.startswith("/v1/chat/completions"):
             return self._handle_chat()
@@ -652,7 +699,7 @@ def main():
     server = ThreadingHTTPServer((host, port), Handler)
     ident = (" instance=%s" % INSTANCE) if INSTANCE else ""
     print(
-        "mockd listening on http://%s:%d (chat + responses + /__control)%s"
+        "mockd listening on http://%s:%d (chat + responses + /__control + /__observe)%s"
         % (host, port, ident)
     )
     try:

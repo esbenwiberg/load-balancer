@@ -145,6 +145,30 @@ key with a clean 4xx**. The over-budget test uses an explicit `max_budget: 0`
 key so the `spend >= max_budget` gate trips on the first request, deterministic
 without depending on async spend-flush or auth-cache TTL.
 
+### Observability — "where did my prompt go?" (goal 3)
+
+Every request leaves a per-request routing trail: **{chosen backend, why,
+latency, tokens, fallback-hit}**. It's captured by a LiteLLM callback
+(`obs_callback.py`, wired via `litellm_settings.callbacks`) with no external
+observability stack.
+
+The callback publishes two record shapes — `llm_call` (one per backend
+**attempt**: backend, tier, latency, tokens, and on failure the error that
+triggered a fallback) and `delivered` (one per **request**: requested vs served
+backend ⇒ `fallback` flag, plus tokens). Records go to **stdout**
+(`ROUTING_RECORD <json>`) always, and — because the e2e compose sets
+`OBS_WEBHOOK_URL=http://mockd:9100/__observe` — to mockd's in-memory sink so the
+suite can read them back:
+
+```bash
+./run.sh --keep
+curl -s localhost:9100/__observe | jq '.records'
+```
+
+`test_fallback_is_observable_in_routing_record` forces a fallback and asserts it
+shows up in the records. Full design (incl. the LiteLLM "fallback winner logs no
+success event" quirk, and the prod stdout path): **[docs/09](../docs/09-observability.md)**.
+
 ---
 
 ## Profile: dev — the standing self-validation fleet (goal 10)
@@ -323,7 +347,8 @@ data** through it. Keep smoke prompts synthetic. If in doubt → **DISCO**.
 ## Files
 
 ```
-mockd.py                     controllable mock backend (stdlib, no deps; MOCKD_INSTANCE stamps identity)
+mockd.py                     controllable mock backend (stdlib, no deps; MOCKD_INSTANCE stamps identity) + /__observe sink
+obs_callback.py              observability callback: per-request routing records -> stdout + webhook (docs/09)
 litellm-config.e2e.yaml      mock-profile gateway config (all aliases -> one mockd)
 docker-compose.e2e.yaml      mock stack: litellm + mockd + postgres
 test_e2e.py                  raw-HTTP pytest suite (the CI driver)
