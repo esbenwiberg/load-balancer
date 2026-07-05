@@ -50,10 +50,16 @@ jobs:
             -o /tmp/gitleaks.tgz
           tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
           sudo install /tmp/gitleaks /usr/local/bin/gitleaks
+          # Bicep for the offline IaC-build step (goal 14). azure-cli is
+          # preinstalled on ubuntu-latest; `az bicep install` fetches the bicep
+          # binary from GitHub releases — a TOOL download, NOT a cloud/Azure API
+          # call and NO credentials. check.sh then transpiles the .bicep offline.
+          az bicep install
           echo "--- tool versions ---"
           ruff --version
           shellcheck --version | head -2
           gitleaks version
+          az bicep version
           docker --version
           docker compose version
 
