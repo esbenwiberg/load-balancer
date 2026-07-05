@@ -171,6 +171,22 @@ else
   skip "python3" "not installed"
 fi
 
+# --- control-plane unit tests (goal 5 — offline, stdlib only) ----------------
+# The Phase-1 control-plane skeleton (e2e/control_plane.py) is stdlib-only and
+# has no docker footprint, so its unit tests belong in the FAST tier (like
+# selftest.py) — not gated behind the e2e docker stack. Registry state model +
+# TTL decay + the HTTP wire adapter, run in-process on an ephemeral port.
+step "control-plane unit tests (e2e/control_plane_test.py)"
+if have python3; then
+  if (cd e2e && python3 control_plane_test.py); then
+    ok "control_plane_test.py"
+  else
+    fail "e2e/control_plane_test.py"
+  fi
+else
+  skip "python3" "not installed"
+fi
+
 # --- gitleaks: secret scan of the working tree ------------------------------
 step "gitleaks secret scan"
 if have gitleaks; then

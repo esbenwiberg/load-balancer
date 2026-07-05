@@ -16,6 +16,10 @@
 #   :9300  dashboard          — goal-12 "where did my prompt go?" viewer. Open
 #                               http://localhost:9300 while the stack is up and
 #                               watch every prompt's route land live.
+#   :9400  control-plane      — goal-5 fleet state registry + heartbeat interface.
+#                               Exposes per-model {warm,in_flight,healthy,
+#                               agent_capable}. Comes up with an EMPTY registry;
+#                               goal 13 wires the heartbeat producers + display.
 #   db     postgres           — LiteLLM virtual-key store (in-network only)
 #
 # Each mockd is host-published on a DISTINCT port so you can drive /__control at
@@ -115,6 +119,33 @@ services:
       - "9300:9300"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9300/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
+  control-plane:
+    # Goal 5 — the Phase-1 control-plane skeleton: fleet state registry +
+    # heartbeat interface. Stdlib-only (SQLite), no pip install. Comes up with
+    # an empty registry; it REPORTS fleet state (per-model {warm, in_flight,
+    # healthy, agent_capable}) and never picks a backend (routing policy is a
+    # Needs-a-human decision — see docs/10). Goal 13 wires heartbeat producers.
+    image: python:3.12-slim
+    container_name: dev-control-plane
+    working_dir: /app
+    volumes:
+      - ./control_plane.py:/app/control_plane.py:ro
+    environment:
+      CONTROL_PLANE_PORT: "9400"
+      CONTROL_PLANE_HOST: "0.0.0.0"
+      # In-container path; the registry is a cache of live state, so a fresh
+      # /tmp on restart just means every row is instantly stale until re-beaten.
+      CONTROL_PLANE_DB: "/tmp/control_plane.db"
+    command: ["python", "control_plane.py"]
+    ports:
+      - "9400:9400"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9400/health').status==200 else 1)"]
       interval: 5s
       timeout: 3s
       retries: 5
