@@ -19,8 +19,10 @@ GATEWAY_URL / MOCKD_URL.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -1066,4 +1068,278 @@ def test_direct_request_routing_record_no_fallback():
     )
     assert (c.get("tokens") or {}).get("total"), (
         "attempt record must capture token usage: %r" % c
+    )
+
+
+# --- spend audit: users, teams, attribution, durability (goal 11b) -----------
+# Goal 11 proved the wallet GATES (over-budget / over-limit -> clean 4xx). Goal
+# 11b proves the LEDGER: with per-model costs configured (litellm-config.e2e.yaml
+# -> qwen3-coder input/output_cost_per_token) a request accrues NONZERO spend
+# that LiteLLM attributes to the calling key, its user, and its team, records per
+# request in LiteLLM_SpendLogs, and persists in Postgres across a gateway
+# restart. These endpoints are the audit surface documented in README "Spend
+# audit — who spent what". All of them require the master key.
+#
+# WHY POLL: spend is buffered in gateway memory and flushed to Postgres on an
+# interval (proxy_batch_write_at, default 60s). The DB-backed info/logs endpoints
+# only report spend AFTER a flush, so we poll — which also makes the flush our
+# durability precondition: once an endpoint reports spend, it's in Postgres, not
+# just in memory, so a restart genuinely tests persistence rather than a race.
+
+SPEND_POLL_TIMEOUT = 90.0  # generous: covers the default 60s flush even if the
+# proxy_batch_write_at knob is ignored by this build.
+
+
+def _unique(tag):
+    """A per-run-unique id so a --keep stack (or repeated runs) can't cross
+    ephemeral rows. pid+ms keeps it collision-free without needing randomness."""
+    return "e2e-%s-%d-%d" % (tag, os.getpid(), int(time.time() * 1000))
+
+
+def _admin_post(path, body):
+    r = httpx.post(GATEWAY + path, headers=AUTH, json=body, timeout=TIMEOUT)
+    assert r.status_code == 200, "%s failed (%s): %s" % (path, r.status_code, r.text)
+    return r.json()
+
+
+def _admin_get(path):
+    r = httpx.get(GATEWAY + path, headers=AUTH, timeout=TIMEOUT)
+    assert r.status_code == 200, "%s failed (%s): %s" % (path, r.status_code, r.text)
+    return r.json()
+
+
+def _dig_spend(info):
+    """Pull aggregate spend out of a /key|/user|/team info response, tolerating
+    the small shape differences between them (top-level `spend`, or nested under
+    `info` / `user_info` / `team_info`)."""
+    if not isinstance(info, dict):
+        return None
+    for c in (info, info.get("info"), info.get("user_info"), info.get("team_info")):
+        if isinstance(c, dict) and c.get("spend") is not None:
+            return float(c["spend"])
+    return None
+
+
+def _provision_team_user_key():
+    """Create a team, group a user into it, and mint a key bound to that
+    user+team. Returns (team_id, user_id, key). Ids are explicit + unique so the
+    audit queries are unambiguous even on a shared/--keep stack. Budgets are large
+    (1000 USD) so provisioning never trips the goal-11 gate — this is the LEDGER,
+    not the gate."""
+    team_id = _unique("team")
+    user_id = _unique("user")
+    _admin_post(
+        "/team/new", {"team_id": team_id, "team_alias": team_id, "max_budget": 1000}
+    )
+    # Group the user INTO the team (auto-creates the internal-user row). This is
+    # the "users can be grouped into teams" half of the goal, made queryable via
+    # /team/info.
+    _admin_post(
+        "/team/member_add",
+        {"team_id": team_id, "member": {"user_id": user_id, "role": "user"}},
+    )
+    gen = _admin_post(
+        "/key/generate",
+        {
+            "models": ["qwen3-coder"],
+            "user_id": user_id,
+            "team_id": team_id,
+            "max_budget": 1000,
+        },
+    )
+    return team_id, user_id, gen["key"]
+
+
+def _spend_traffic(key, n=2):
+    """Send n costed, non-streaming requests on `key` (non-stream so mockd's usage
+    block is present and LiteLLM can cost it)."""
+    for _ in range(n):
+        r = httpx.post(
+            GATEWAY + "/v1/chat/completions",
+            headers={"Authorization": "Bearer " + key},
+            json=_CHAT,
+            timeout=TIMEOUT,
+        )
+        assert r.status_code == 200, "costed request failed: %s" % r.text
+
+
+def _spend_log_rows_for(user_id):
+    """DB-backed per-request ledger (LiteLLM_SpendLogs) filtered to our user.
+    /spend/logs reads the table directly, so a row here == it's in Postgres. Try
+    the server-side user filter first, fall back to unfiltered + client filter,
+    and normalize the list shape either way."""
+    for path in ("/spend/logs?user_id=" + user_id, "/spend/logs"):
+        r = httpx.get(GATEWAY + path, headers=AUTH, timeout=TIMEOUT)
+        if r.status_code != 200:
+            continue
+        data = r.json()
+        rows = (
+            data
+            if isinstance(data, list)
+            else (data.get("data") or data.get("logs") or [])
+        )
+        rows = [x for x in rows if x.get("user") == user_id]
+        if rows:
+            return rows
+    return []
+
+
+def _poll(fn, ok, timeout=SPEND_POLL_TIMEOUT):
+    """Poll fn() until ok(result) or timeout; return the last result either way so
+    the caller's assertion can render the best available value."""
+    deadline = time.time() + timeout
+    val = fn()
+    while time.time() < deadline and not ok(val):
+        time.sleep(1.0)
+        val = fn()
+    return val
+
+
+def _nonzero(v):
+    return isinstance(v, (int, float)) and v > 0
+
+
+def test_spend_attributed_to_key_user_team():
+    """A costed request's spend is attributed to the RIGHT key, user, and team.
+
+    Provision team -> user-in-team -> key (all fresh, all zero-spend), send costed
+    traffic, then read the audit surface and assert:
+      * a per-request LiteLLM_SpendLogs row carries our user + team + model +
+        nonzero spend, hashed to OUR key — per-request attribution tying
+        key->user->team on a single row; and
+      * /key/info, /user/info, /team/info each report nonzero AGGREGATE spend.
+    Because these entities served only this test's traffic, nonzero spend on each
+    is unambiguous attribution.
+    """
+    team_id, user_id, key = _provision_team_user_key()
+    _spend_traffic(key, n=2)
+
+    # (1) per-request ledger row (also our "it's in Postgres" gate)
+    rows = _poll(lambda: _spend_log_rows_for(user_id), bool)
+    assert rows, (
+        "no SpendLogs row attributed to user %s within %ss — spend never "
+        "accrued/flushed" % (user_id, SPEND_POLL_TIMEOUT)
+    )
+    row = rows[-1]
+    assert row.get("team_id") == team_id, (
+        "spend-log row must carry the right team_id: %r" % row
+    )
+    assert "qwen3-coder" in str(row.get("model", "")), (
+        "spend-log row must name the served model: %r" % row
+    )
+    assert _nonzero(float(row.get("spend") or 0)), (
+        "per-request spend must be nonzero (costs are configured): %r" % row
+    )
+    # Tie the row to OUR key: LiteLLM stores the unsalted sha256 of the key.
+    assert row.get("api_key") == hashlib.sha256(key.encode()).hexdigest(), (
+        "spend-log row must be attributed to the issuing key's hash: %r" % row
+    )
+
+    # (2) aggregate ledgers: key, user, team each show nonzero spend
+    key_spend = _dig_spend(
+        _poll(
+            lambda: _admin_get("/key/info?key=" + key),
+            lambda i: _nonzero(_dig_spend(i)),
+        )
+    )
+    user_spend = _dig_spend(
+        _poll(
+            lambda: _admin_get("/user/info?user_id=" + user_id),
+            lambda i: _nonzero(_dig_spend(i)),
+        )
+    )
+    team_spend = _dig_spend(
+        _poll(
+            lambda: _admin_get("/team/info?team_id=" + team_id),
+            lambda i: _nonzero(_dig_spend(i)),
+        )
+    )
+    assert _nonzero(key_spend), "key ledger must show nonzero spend: %r" % key_spend
+    assert _nonzero(user_spend), "user ledger must show nonzero spend: %r" % user_spend
+    assert _nonzero(team_spend), "team ledger must show nonzero spend: %r" % team_spend
+
+
+def _restart_gateway_and_wait():
+    """Restart the gateway CONTAINER (not the db) and block until it's healthy
+    again. Gated on E2E_ALLOW_RESTART because it shells out to `docker` — run.sh
+    sets it, so the durability proof runs in the arbiter; a bare `pytest` against a
+    manual or remote stack skips rather than killing someone's gateway."""
+    if os.environ.get("E2E_ALLOW_RESTART") != "1":
+        pytest.skip("restart durability needs E2E_ALLOW_RESTART=1 (set by run.sh)")
+    container = os.environ.get("E2E_LITELLM_CONTAINER", "litellm-e2e")
+    subprocess.run(
+        ["docker", "restart", container], check=True, capture_output=True, timeout=120
+    )
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        try:
+            if httpx.get(GATEWAY + "/health/liveliness", timeout=5).status_code == 200:
+                return
+        except httpx.HTTPError:
+            pass
+        time.sleep(2)
+    raise AssertionError("gateway did not become healthy after restart")
+
+
+def test_spend_survives_gateway_restart():
+    """Durability: spend written to Postgres must still be there after the gateway
+    process restarts (in-memory buffers cleared, caches cold). This answers the
+    open persistence question for good — issued keys AND their spend live in
+    Postgres, not gateway memory.
+
+    Provision + spend, poll until the ledger is confirmed IN THE DB (a SpendLogs
+    row plus nonzero user/team aggregates — all DB reads), snapshot it, restart the
+    gateway, then re-read and assert the ledger is intact (>= snapshot, still
+    nonzero) and the issued key still exists.
+    """
+    team_id, user_id, key = _provision_team_user_key()
+    _spend_traffic(key, n=2)
+
+    rows_before = _poll(lambda: _spend_log_rows_for(user_id), bool)
+    assert rows_before, (
+        "spend never reached Postgres within %ss; cannot test durability"
+        % SPEND_POLL_TIMEOUT
+    )
+    user_before = _dig_spend(
+        _poll(
+            lambda: _admin_get("/user/info?user_id=" + user_id),
+            lambda i: _nonzero(_dig_spend(i)),
+        )
+    )
+    team_before = _dig_spend(
+        _poll(
+            lambda: _admin_get("/team/info?team_id=" + team_id),
+            lambda i: _nonzero(_dig_spend(i)),
+        )
+    )
+    assert _nonzero(user_before), (
+        "user spend not persisted pre-restart: %r" % user_before
+    )
+    assert _nonzero(team_before), (
+        "team spend not persisted pre-restart: %r" % team_before
+    )
+
+    _restart_gateway_and_wait()  # skips here if E2E_ALLOW_RESTART != 1
+
+    # Cold restart: the gateway must serve the SAME ledger straight from Postgres.
+    rows_after = _spend_log_rows_for(user_id)
+    assert rows_after, (
+        "SpendLogs row for %s vanished after restart — spend was not durable" % user_id
+    )
+    assert rows_after[-1].get("team_id") == team_id, (
+        "restored spend-log row lost its team attribution: %r" % rows_after[-1]
+    )
+    user_after = _dig_spend(_admin_get("/user/info?user_id=" + user_id))
+    team_after = _dig_spend(_admin_get("/team/info?team_id=" + team_id))
+    key_after = _dig_spend(_admin_get("/key/info?key=" + key))  # key row survived too
+    assert _nonzero(user_after) and user_after >= user_before, (
+        "user spend must persist across restart: before=%r after=%r"
+        % (user_before, user_after)
+    )
+    assert _nonzero(team_after) and team_after >= team_before, (
+        "team spend must persist across restart: before=%r after=%r"
+        % (team_before, team_after)
+    )
+    assert _nonzero(key_after), (
+        "issued key + its spend must persist across restart: %r" % key_after
     )

@@ -135,15 +135,68 @@ loop, not a throttle on normal traffic.
 | rate limit (`rpm`/`tpm`)       | `429` | rate-limit message |
 
 **Units caveat (the goal-11 / goal-11b boundary).** `max_budget` is USD of
-*spend*, and spend = tokens × per-model cost. The mock models carry **no cost**,
-so real dollar spend stays `$0` on this stack — a budget can't be crossed by
-volume here. That's deliberate: dollar-denominated enforcement (accruing spend
-past a budget, attributed per user/team, surviving a restart) is **goal 11b**,
-which adds per-model costs and durable Postgres spend. What this profile proves
-is the client-visible *contract* — the budget and rate-limit **gates refuse a
-key with a clean 4xx**. The over-budget test uses an explicit `max_budget: 0`
-key so the `spend >= max_budget` gate trips on the first request, deterministic
-without depending on async spend-flush or auth-cache TTL.
+*spend*, and spend = tokens × per-model cost. The goal-11 **gate** tests stay
+cost-independent on purpose: the over-budget test uses an explicit `max_budget:
+0` key so the `spend >= max_budget` gate trips on the first request, without
+depending on async spend-flush or auth-cache TTL. Goal **11b** adds the other
+half — a per-token cost on the `qwen3-coder` alias, so mockd traffic now accrues
+**nonzero, attributable, durable** spend. See [Spend audit](#spend-audit--who-spent-what-goal-11b).
+
+### Spend audit — who spent what (goal 11b)
+
+Budgets (goal 11) cap the damage; this makes spend **attributable and durable**.
+Every key belongs to a **user**, users group into **teams**, and every request's
+dollar spend is queryable per key / user / team after the fact — and survives a
+gateway restart because it lives in Postgres, not gateway memory.
+
+**How spend comes to exist.** The `qwen3-coder` alias carries a per-token cost
+(`litellm-config.e2e.yaml` → `litellm_params.input_cost_per_token` /
+`output_cost_per_token`). mockd returns a usage block on every reply, so
+`spend = tokens × cost > 0`. LiteLLM buffers spend in memory and flushes it to
+Postgres on an interval (`general_settings.proxy_batch_write_at`, set low here so
+tests are fast); the audit endpoints below read the DB, so they report spend only
+*after* a flush.
+
+**The hierarchy** — team → user → key:
+
+```bash
+MASTER="$LITELLM_MASTER_KEY"; H="Authorization: Bearer $MASTER"
+# 1. a team
+curl -sX POST localhost:4000/team/new    -H "$H" -d '{"team_id":"acme","team_alias":"acme","max_budget":1000}'
+# 2. a user, grouped INTO that team
+curl -sX POST localhost:4000/team/member_add -H "$H" -d '{"team_id":"acme","member":{"user_id":"alice","role":"user"}}'
+# 3. a key bound to that user + team
+curl -sX POST localhost:4000/key/generate -H "$H" -d '{"models":["qwen3-coder"],"user_id":"alice","team_id":"acme"}'
+```
+
+> **Data governance:** `user_id` / `team_id` are synthetic handles — never put a
+> real name or email here (no PII), per the CLAUDE.md guardrail.
+
+**The audit queries** (all require the master key):
+
+| Question | Query |
+|----------|-------|
+| What did this **key** spend? | `GET /key/info?key=sk-…` → `info.spend` |
+| What did this **user** spend? | `GET /user/info?user_id=alice` → `spend` |
+| What did this **team** spend? | `GET /team/info?team_id=acme` → `spend` |
+| Per-**request** ledger (who/what/how much) | `GET /spend/logs?user_id=alice` → rows of `{request_id, api_key (sha256), user, team_id, model, spend, total_tokens}` |
+
+`/spend/logs` is the per-request truth table straight out of `LiteLLM_SpendLogs`;
+the `*/info` endpoints are the running aggregates on `LiteLLM_VerificationToken`
+(key), `LiteLLM_UserTable`, and `LiteLLM_TeamTable`. Direct SQL against Postgres
+is an equivalent audit path (`docker compose -f docker-compose.e2e.yaml exec db
+psql -U litellm -c 'select api_key,user,team_id,model,spend from "LiteLLM_SpendLogs";'`).
+
+**What the suite proves.** `test_spend_attributed_to_key_user_team` provisions a
+fresh team→user→key (all zero-spend), sends costed traffic, and asserts a
+`SpendLogs` row carries the right user + team + model + nonzero spend hashed to
+that key, and that all three `*/info` aggregates read nonzero.
+`test_spend_survives_gateway_restart` then confirms the ledger in Postgres,
+**restarts the gateway container** (run.sh sets `E2E_ALLOW_RESTART=1`), and
+re-reads it: spend and the issued key are still there. That's the open
+persistence question answered — **keys and their spend survive a restart.**
+(`prod`/`deploy` today runs stateless with no DB; the same endpoints and audit
+work identically once a Postgres is wired behind it.)
 
 ### Observability — "where did my prompt go?" (goal 3)
 

@@ -60,6 +60,12 @@ for i in $(seq 1 60); do
 done
 
 # --- pytest suite (raw-HTTP client emulation) -------------------------------
+# E2E_ALLOW_RESTART lets the spend-durability test (goal 11b) restart the gateway
+# CONTAINER to prove Postgres-backed spend survives a cold gateway process. It's
+# opt-in so a bare `pytest` against a manual/remote stack can't kill the gateway;
+# run.sh owns the compose stack, so it's always safe to grant here.
+export E2E_ALLOW_RESTART=1
+export E2E_LITELLM_CONTAINER="${E2E_LITELLM_CONTAINER:-litellm-e2e}"
 echo "--- pytest e2e suite ---"
 "$VENV/bin/python" -m pytest test_e2e.py -v
 
