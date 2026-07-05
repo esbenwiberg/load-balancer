@@ -1,0 +1,71 @@
+# =============================================================================
+# LOCAL profile gateway config (goal 4) — the SAME gateway (SUT), but the
+# workbench alias points at a REAL small coding model served by Ollama, with NO
+# API keys and NO ToS: qwen2.5-coder:3b running CPU-only inside Docker.
+#
+# WHY THIS PROFILE EXISTS: the mock profile (litellm-config.e2e.yaml) proves all
+# of the balancer's LOGIC deterministically, but by design its backend can't give
+# a VERDICT on a real model — mockd replays a script, so it would always "pass".
+# Conformance (agent_capable) needs a real model. cli-auth gives that but needs
+# keys + hits the internet. This profile is the third leg: run the real gate
+# against a real model, offline + keyless. See docs/08.
+#
+# FINDING: with qwen2.5-coder the gate returns agent_capable=FALSE (the model
+# leaks tool calls on Ollama instead of emitting structured tool_calls). That's
+# the gate working against a real backend — see e2e/README "What conformance
+# found". Swapping OLLAMA_MODEL (below) is how you point it at a passing model.
+#
+# NOT A SECRET: master_key comes from the environment and Ollama needs no auth
+# (api_key: dummy is ignored). This file carries no keys, so it is COMMITTED
+# (unlike a personal scratch config) — see the matching .gitignore negation.
+#
+# HARD CONSTRAINT: this profile is NEVER run in CI (Ollama + a multi-GB model +
+# CPU inference is too heavy). CI and e2e/run.sh use the MOCK profile only. Bring
+# this up by hand with e2e/run.local.sh.
+#
+# NO Postgres here (unlike the mock/dev stacks): this profile mints no virtual
+# keys — conformance authenticates with the master key directly — so the DB-only
+# key store is dropped to keep the stack to two containers and boot fast.
+# =============================================================================
+
+model_list:
+  # The stable workbench alias — the SAME name every profile uses; only the
+  # BACKEND swaps. Here it fronts qwen2.5-coder:3b on Ollama's OpenAI-compatible
+  # surface (http://ollama:11434/v1). Point conformance.py at the gateway with
+  # `--model qwen3-coder` exactly as against the mock profile.
+  - model_name: qwen3-coder
+    litellm_params:
+      # The backend model is read from OLLAMA_MODEL (set by compose, default
+      # qwen2.5-coder:3b) so ONE env var switches BOTH what the Ollama entrypoint
+      # pulls AND what the gateway requests — otherwise `OLLAMA_MODEL=...:7b` (the
+      # documented fallback) would pull 7b but the gateway would still ask for 3b.
+      # It's a bare Ollama tag (no provider prefix), so we force the provider:
+      model: os.environ/OLLAMA_MODEL
+      custom_llm_provider: openai   # talk to Ollama's OpenAI-compatible surface...
+      api_base: http://ollama:11434/v1   # ...at :11434/v1
+      api_key: dummy            # Ollama ignores auth; a placeholder keeps the SDK happy.
+      # Bridge /v1/responses (Codex path) down to the chat surface, same as the
+      # mock + prod configs — so the Responses bridge is exercised against a REAL
+      # model here too, not only against mockd.
+      use_chat_completions_api: true
+    model_info:
+      backend_tier: local
+      # agent_capable is DELIBERATELY UNSET here (the mock config asserts it true
+      # because mockd is scripted-compliant). For a REAL model it must be EARNED
+      # by conformance.py, not declared: run.local.sh runs the gate and the JSON
+      # verdict is the evidence. LiteLLM defaults the flag off when omitted.
+
+router_settings:
+  num_retries: 1
+  # CPU inference on a 3b model is SLOW — unlike mockd's instant replies, a cold
+  # multi-turn Read->Edit->Bash run can take minutes. Generous so a real run
+  # isn't cut off mid-generation (the mock config uses 30s; prod uses 600s).
+  timeout: 600
+
+litellm_settings:
+  # Ollama's OpenAI surface rejects some OpenAI-only params; drop them rather
+  # than surface a 400 (same setting the mock + prod configs use).
+  drop_params: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

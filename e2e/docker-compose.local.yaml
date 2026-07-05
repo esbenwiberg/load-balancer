@@ -1,0 +1,93 @@
+# =============================================================================
+# LOCAL profile (goal 4) — the real LiteLLM gateway (SUT) in front of a REAL
+# small coding model served by Ollama. The one thing the mock profile can't
+# give: an `agent_capable` VERDICT on a real model (mockd would always "pass"),
+# offline, with NO API keys and NO ToS.
+#
+#   :4000   LiteLLM gateway  — clients + conformance.py hit this (SUT, unchanged)
+#   :11434  ollama           — serves qwen2.5-coder:3b; the gateway reaches it
+#                              in-network at ollama:11434, host-published so you
+#                              can poke it directly (e.g. `curl :11434/api/tags`)
+#
+# Bring it up with e2e/run.local.sh (NOT run.sh — that's the mock gate). This
+# stack is HEAVY (a multi-GB model + CPU inference) and is NEVER run in CI:
+# nothing here is referenced by e2e/run.sh or the CI workflow. `docker compose
+# config` (the fast-tier lint) validates this file's SCHEMA but starts no
+# containers — validation is not a run.
+#
+# vs the mock/dev stacks: NO Postgres (this profile mints no virtual keys —
+# conformance uses the master key directly), NO mockd, NO dashboard/control-plane
+# (real tool-calling is the only thing under test here).
+#
+#   docker compose -f docker-compose.local.yaml up -d      # or: ./run.local.sh
+#   docker compose -f docker-compose.local.yaml down -v     # explicit teardown
+# =============================================================================
+
+services:
+  ollama:
+    # Ollama serves an OpenAI-compatible surface at :11434/v1, so the gateway
+    # fronts it with the plain `openai/` provider — same wire path as the mock
+    # profile, but a REAL model behind it.
+    #
+    # Tag DELIBERATELY unpinned (`latest`): this is a local-only, never-in-CI
+    # exploratory harness where we WANT the newest tool-call templates/parsers
+    # (they fix real agent_capable regressions). Reversible — pin a specific tag
+    # here if a `latest` bump ever regresses the conformance run. (The check.sh
+    # litellm image-pin guard covers only the LiteLLM image, not this one.)
+    image: ollama/ollama:latest
+    container_name: ollama-local
+    working_dir: /app
+    entrypoint: ["/bin/sh", "/app/ollama-entrypoint.sh"]
+    volumes:
+      - ./ollama-entrypoint.sh:/app/ollama-entrypoint.sh:ro
+      # Persist pulled models across runs so only the FIRST bring-up downloads.
+      - ollama-models:/root/.ollama
+    environment:
+      # The coding model the workbench serves. 3b is small enough to run CPU-only
+      # in Docker Desktop's Linux VM on a Mac; bump to qwen2.5-coder:7b (the
+      # documented fallback) if 3b's tool-calling can't clear the conformance
+      # threshold — a reversible call, no other change needed.
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen2.5-coder:3b}"
+    ports:
+      - "11434:11434"       # host-published so you can curl the model directly
+    healthcheck:
+      # Ready == the daemon answers now AND the entrypoint finished pull+warm.
+      # `ollama list` proves the daemon is live; the marker proves the model is
+      # actually pulled and loaded (see ollama-entrypoint.sh).
+      test: ["CMD-SHELL", "test -f /tmp/.ollama-ready && ollama list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      # Generous: the first run downloads the model (a few GB) before ready.
+      retries: 120
+      start_period: 10s
+
+  litellm:
+    # Same pinned, vetted image as deploy/ + e2e/ + dev/ (docs/03 risk 8 — never
+    # 1.82.7/1.82.8). The check.sh pin guard enforces this exact tag.
+    image: ghcr.io/berriai/litellm:v1.83.14-stable
+    container_name: litellm-local
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./litellm-config.local.yaml:/app/config.yaml:ro
+    environment:
+      # Test-only master key — NOT a secret. Overridable via your env.
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-local-master-test-key}"
+      # Same var (same default) the ollama service uses, so one OLLAMA_MODEL
+      # switch drives BOTH the pull and what the gateway requests. The config
+      # reads it via `model: os.environ/OLLAMA_MODEL` + custom_llm_provider.
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen2.5-coder:3b}"
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  # Named volume so pulled models survive `down` (use `down -v` to wipe them).
+  ollama-models:

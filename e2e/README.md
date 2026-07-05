@@ -1,23 +1,26 @@
 # End-to-end test harness — the balancer, without Foundry or Sparks
 
-Test the balancer (the LiteLLM gateway now; router + control plane later) with
-**zero real backends**. Two profiles behind the same gateway config:
+Test the balancer (the LiteLLM gateway now; router + control plane later)
+without real Foundry or Sparks. Four profiles behind the same gateway config:
 
 | Profile | Backends | Proves | Cost / deps |
 |---|---|---|---|
 | **mock** (default, CI) | ONE `mockd` — a controllable fake speaking OpenAI Chat + Responses, serving every alias | protocol translation, the Responses bridge, fallback, cooldown, virtual-key scoping, streaming | free, offline, deterministic |
 | **dev** (standing fixture) | THREE `mockd` containers — two distinct workbench slots + a mock-Foundry, each stamping its own instance identity | the full local topology as a leave-it-running dev target you point a real client at; per-instance load/faults | free, offline; stays up until torn down |
+| **local** (opt-in, manual) | REAL small coding model (`qwen2.5-coder:3b`) served by **Ollama** as the workbench | runs the `agent_capable` gate against a **real** model, **no keys, no ToS, offline** | free, offline; heavy (multi-GB model + CPU inference). **Never in CI** |
 | **cli-auth** (opt-in, manual) | REAL hosted models — Haiku as the "workbench", bigger models as "Foundry" | the real Claude Code / Codex client path end-to-end | needs API keys; hits the internet |
 
-Both leave the **system under test** — the gateway + its config — identical to
+All leave the **system under test** — the gateway + its config — identical to
 what ships in [`../deploy/`](../deploy/). Only the backends swap.
 
-> **Why two, not one?** Two different things hide under "test it e2e":
+> **Why four, not one?** Two different things hide under "test it e2e":
 > the balancer's *logic* (routing/fallback/translation/auth — needs
 > *controllable* backends, not smart ones) and a model's *tool-calling quality*
 > (the `agent_capable` gate — needs a *real* model, and
-> [`../conformance/`](../conformance/) already does that). The mock profile owns
-> the first; cli-auth + conformance own the second. See
+> [`../conformance/`](../conformance/) already does that). The **mock** + **dev**
+> profiles own the first; **local** + **cli-auth** + conformance own the second —
+> `local` runs the `agent_capable` gate against a real model offline and keyless,
+> `cli-auth` gets you the real hosted client path. See
 > [`../docs/08-e2e-testing.md`](../docs/08-e2e-testing.md) for the full design.
 
 ---
@@ -394,6 +397,120 @@ third deployment in `litellm-config.dev.yaml` when that lands.
 
 ---
 
+## Profile: local — the `agent_capable` gate against a real model, offline & keyless (goal 4)
+
+The one thing the mock profile **can't** give: a verdict on a *real* model.
+`mockd` replays a scripted Read→Edit→Bash sequence — perfect for testing the
+balancer's logic, useless for measuring a model's `agent_capable` quality (it
+would always "pass"). `cli-auth` gives a real model but needs API keys and hits
+the internet. The **local** profile is the third leg: it points
+[`conformance.py`](../conformance/conformance.py) — the harness that *earns*
+`agent_capable` — at a real small coding model (**`qwen2.5-coder:3b`** on
+[Ollama](https://ollama.com)) behind the gateway, with **no keys, no ToS, and no
+network** once the model is pulled. It's the closest analog to a Spark workbench
+until real Sparks arrive — and the stand-in for one meanwhile.
+
+> **What the gate actually returns here is a *real result*, not a rubber stamp.**
+> Pointed at `qwen2.5-coder`, conformance reports **`agent_capable=false`** — the
+> model leaks tool calls into content instead of emitting structured `tool_calls`
+> (see [What conformance found](#what-conformance-found-the-gate-works) below).
+> That's the profile working *correctly*: it ran the real gate against a real
+> backend and the gate discriminated — exactly what mockd can't do for you.
+
+```bash
+cd e2e
+./run.local.sh                 # up -> conformance (anthropic, 1 run) -> down
+./run.local.sh --keep          # leave the stack up to poke :4000 / :11434
+./run.local.sh --api chat      # wire protocol: chat | responses | anthropic
+./run.local.sh --runs 3        # more runs for a stabler error rate
+```
+
+`run.local.sh` brings up `docker-compose.local.yaml` (just **Ollama + the
+gateway** — no Postgres, no mockd), waits until the model is pulled *and loaded*,
+then runs [`../conformance/conformance.py`](../conformance/conformance.py)
+**through the gateway** against the real model and prints the JSON verdict. The
+alias is the same `qwen3-coder` every profile uses — only the backend swaps — so
+you point conformance at it exactly as against the mock profile:
+
+```bash
+../.venv-e2e/bin/python ../conformance/conformance.py \
+  --base-url http://localhost:4000/v1 --api anthropic \
+  --model qwen3-coder --api-key "$LITELLM_MASTER_KEY" --runs 3
+```
+
+### Self-contained bring-up (pull is entrypoint-gated)
+
+The Ollama container is self-contained: [`ollama-entrypoint.sh`](ollama-entrypoint.sh)
+starts the daemon, **pulls the model**, warms it into memory, then serves. The
+compose **healthcheck** gates the gateway's `depends_on` until both the daemon
+answers *and* the pull+warm finished (a readiness marker), so the gateway never
+boots against an empty Ollama. Pulled models persist on a named volume, so only
+the **first** run downloads (`docker compose -f docker-compose.local.yaml down -v`
+wipes them).
+
+### The Mac CPU-only-in-Docker caveat
+
+On a Mac, Docker Desktop runs Linux containers in a **lightweight VM with no GPU
+passthrough** — so Ollama here runs **CPU-only**. `qwen2.5-coder:3b` is chosen to
+fit that: small enough to run on CPU in the VM. Consequences:
+
+- **It's slow.** A cold multi-turn Read→Edit→Bash run can take minutes (the
+  config sets a 600s gateway timeout for exactly this). This is why the profile
+  is **manual and never in CI** — see below.
+- **The backend model is one env var.** `OLLAMA_MODEL` drives **both** what the
+  Ollama entrypoint pulls **and** what the gateway requests (the config reads it
+  via `model: os.environ/OLLAMA_MODEL`), so swapping the model is a single knob
+  with no other change:
+  ```bash
+  OLLAMA_MODEL=qwen2.5-coder:7b ./run.local.sh   # the documented larger sibling
+  ```
+
+### What conformance found (the gate works)
+
+The first bring-up pointed conformance at `qwen2.5-coder` through the gateway and
+surfaced a **real** result — the kind of thing the gate exists to catch:
+
+| Model | Tool call emitted | Structured `tool_calls`? | `agent_capable` |
+|---|---|---|---|
+| `qwen2.5-coder:3b` | `{"city": {"type":"string","value":"Paris"}}` — **malformed** (echoes the schema) | ❌ leaked into content | **false** |
+| `qwen2.5-coder:7b` | `{"city": "Paris"}` — **valid args** | ❌ *still* leaked into content | **false** |
+
+**Root cause (diagnosed, not guessed):** qwen2.5-coder's Ollama template requires
+the model to wrap calls in `<tool_call>…</tool_call>` for Ollama's parser to
+populate structured `tool_calls`. Both sizes emit the bare JSON *without* the
+wrapper, so Ollama returns it unparsed in `content` and conformance's leak
+detector (correctly) flags it. This reproduces **direct against Ollama** (both
+its native `/api/chat` and OpenAI-compat `/v1`) and through **both** LiteLLM
+providers (`openai/` and `ollama_chat/`) — so it's the **model+engine**, not the
+gateway. The gateway faithfully passes through what Ollama returns.
+
+This is the whole point of separating *plumbing* from *model quality* (see
+[docs/08](../docs/08-e2e-testing.md)): the profile's job is to run the real gate
+against a real backend and report a trustworthy verdict — which it does. Getting
+a **green** is then a model-choice question: swap `OLLAMA_MODEL` to a model whose
+Ollama build emits structured tool calls (e.g. a `llama3.1` / `qwen3`-family tag
+with a working tool template). That swap is the reversible knob above; the
+profile, config, and conformance wiring don't change.
+
+### Hard constraint: NEVER in CI
+
+Ollama + a multi-GB model + CPU inference is far too heavy for the CI gate.
+Nothing wires it there: `e2e/run.sh` (the merge gate) and the CI workflow use the
+**mock** profile only, and `docker-compose.local.yaml` is referenced by nothing
+but `run.local.sh`. `scripts/check.sh`'s fast tier *does* run `docker compose
+config` on this file — but that's pure schema validation, **not** `up`; it starts
+no containers. The deliverable is the **profile + docs**, machine-verified by the
+mock profile staying green.
+
+### Org data-governance guardrail
+
+The local profile is **offline and keyless** — the model runs entirely on your
+machine, nothing leaves it — so it's the *safest* place to poke at real
+tool-calling. Keep prompts synthetic anyway (the conformance scenarios already
+are). No Foundry, no hosted model, no data egress.
+
+---
+
 ## Profile: cli-auth (real models, opt-in)
 
 Drive **real** Claude Code / Codex through the balancer, with a small model
@@ -470,6 +587,11 @@ requirements.txt             test-driver deps (httpx, pytest, openai)
 litellm-config.dev.yaml      dev-profile config (workbench-a/-b + foundry, distinct instances; obs -> dashboard)
 docker-compose.dev.yaml      dev stack: litellm + 2 workbenches + foundry + dashboard + control-plane + postgres (stays up)
 dev_smoke.sh                 dev-profile smoke: all 3 surfaces -> 3 distinct containers + fleet view live
+
+litellm-config.local.yaml    local-profile config (workbench alias -> real qwen2.5-coder:3b on Ollama; committed, keyless)
+docker-compose.local.yaml    local stack: litellm + ollama only (no postgres/mockd); NEVER run in CI
+ollama-entrypoint.sh         ollama container entrypoint: pull + warm the model, healthcheck-gated (self-contained)
+run.local.sh                 up -> conformance THROUGH the gateway vs the real model -> teardown (manual, heavy)
 
 litellm-config.cliauth.yaml  cli-auth gateway config (real providers, env-keyed)
 docker-compose.cliauth.yaml  cli-auth stack: litellm + postgres (no mockd)

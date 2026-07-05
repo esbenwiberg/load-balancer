@@ -45,7 +45,7 @@ to [`../deploy/`](../deploy/). Only the backends swap, by profile:
 
 | # | Decision | Why | Trade-off accepted |
 |---|----------|-----|--------------------|
-| 1 | **Two profiles: `mock` + `cli-auth`.** Skipped a local-Ollama profile. | mock covers all *logic* deterministically in CI; cli-auth covers the *real client path*. The user's "workbench runs a small model" is satisfied by Haiku in cli-auth. | No offline-but-real tier. If we later want real tool-calling with no keys/ToS, add Ollama as a third profile — the config is already parameterised for it. |
+| 1 | **Started with `mock` + `cli-auth`; added `local` (Ollama) in goal 4.** | mock covers all *logic* deterministically in CI; cli-auth covers the *real client path*. The gap they leave — real tool-calling with **no keys/ToS, offline** — is now filled by the `local` profile (§ *The local profile* below). | `local` is heavy (multi-GB model + CPU inference) so it's **manual, never in CI**; the merge gate stays the mock profile. The config was already parameterised for it, as predicted. |
 | 2 | **mockd doubles as a scripted-compliant agent.** | Turns `conformance.py` through LiteLLM into a *deterministic* CI gate for the **Responses→ChatCompletions bridge** (Blocker A) — the plumbing that was "confirmed on paper, smoke test pending". | It proves bridge **mechanics**, not model quality. A real model still has to earn `agent_capable` separately (cli-auth + conformance). |
 | 3 | **Every backend is `openai/` in the mock profile — including `claude-*`.** | The balancer's interesting translation is *client-side* (Anthropic-in, Responses-in), which is provider-agnostic. Mocking the `azure_ai/`+`/anthropic` **backend** wire format faithfully would mean reverse-engineering Azure's surface. | The `azure_ai/` backend serialization is **not** covered here — it's validated only against real Foundry (RUNBOOK). Documented, not papered over. |
 | 4 | **Fault injection via an out-of-band control endpoint** (`/__control`), not just prompt markers. | The test sits *upstream* of LiteLLM; it can't easily set backend headers. A side channel lets a test arm a fault, then drive through the gateway normally. | mockd holds mutable global state → tests must reset between cases (an autouse fixture does). |
@@ -89,6 +89,79 @@ Building it flushed out two real bugs before they hit anyone:
 
 Both are logged as risks worth carrying into deploy validation.
 
+## The local profile — the `agent_capable` gate against a real model, offline & keyless (goal 4)
+
+The mock profile can prove every *logic* path but, by construction, can never
+give a verdict on a *real* model — `mockd` replays a script, so it would always
+"pass" the gate. `cli-auth` gives a real model but needs API keys and hits the
+internet. The **`local`** profile closes that gap: it points `conformance.py`
+(the harness that *earns* `agent_capable`) at a real small coding model
+(`qwen2.5-coder:3b`) served by **Ollama** behind the same gateway, with **no
+keys, no ToS, and no network** once the model is pulled. Runnable bits:
+[`../e2e/docker-compose.local.yaml`](../e2e/docker-compose.local.yaml),
+[`../e2e/litellm-config.local.yaml`](../e2e/litellm-config.local.yaml),
+[`../e2e/run.local.sh`](../e2e/run.local.sh).
+
+**Why keyless local real tool-calling matters.** `agent_capable` is the gate
+that decides whether a backend is fit to serve a coding agent at all, and it can
+*only* be earned by a real model — a fake one that replays clean tool calls
+proves nothing. Every other way to get a real model costs something that blocks
+an unattended/offline run: Foundry costs money and trips data-governance;
+cli-auth needs a provisioned key and the public internet. Ollama serving a small
+coding model is the only path that is simultaneously **real, free, offline, and
+ToS-clean** — which also makes it the closest analog we have to a Spark
+workbench (a box running a small local model) until real Sparks are provisioned.
+It's the stand-in for one meanwhile.
+
+**The Mac CPU-only-in-Docker caveat.** On a Mac, Docker Desktop runs Linux
+containers in a lightweight VM with **no GPU passthrough**, so Ollama here runs
+**CPU-only**. `qwen2.5-coder:3b` is chosen to fit that envelope. Two
+consequences: (1) it's *slow* — a cold multi-turn Read→Edit→Bash run can take
+minutes (the config carries a 600s gateway timeout for exactly this), which is a
+core reason the profile is manual and never in CI; and (2) the backend model is a
+single knob — `OLLAMA_MODEL` drives both what the entrypoint pulls and what the
+gateway requests (`model: os.environ/OLLAMA_MODEL`), so swapping it (e.g.
+`OLLAMA_MODEL=qwen2.5-coder:7b ./run.local.sh`) needs no other change.
+
+**What the first bring-up found (the gate discriminates).** Pointed at
+`qwen2.5-coder`, conformance returned **`agent_capable=false`** — a *real*
+result, not a rubber stamp. Both `:3b` and `:7b` emit a tool call but **leak it
+into `content`** instead of structured `tool_calls` (3b's args are malformed —
+it echoes the JSON schema; 7b's args are valid — `{"city":"Paris"}` — but still
+unwrapped). Root cause, diagnosed not guessed: qwen2.5-coder's Ollama template
+requires the model to wrap calls in `<tool_call>…</tool_call>` for Ollama's
+parser to structure them, and the model omits the wrapper. It reproduces
+**direct against Ollama** (native `/api/chat` *and* OpenAI-compat `/v1`) and
+through **both** LiteLLM providers (`openai/`, `ollama_chat/`) — so it's the
+model+engine, not the gateway, which faithfully passes Ollama's output through.
+This is precisely the *plumbing-vs-quality* split this doc is built on: the
+profile's job is to run the real gate against a real backend and report a
+trustworthy verdict, which it does. A **green** is a model-choice question — swap
+`OLLAMA_MODEL` to a tag whose Ollama build emits structured tool calls (a
+`llama3.1`/`qwen3`-family template) — and nothing else changes. We kept
+`qwen2.5-coder` (the goal's named coding model) and documented the finding rather
+than chase a green with another family: the deliverable is the profile + a
+trustworthy gate, not a particular model passing.
+
+**How to point conformance at it.** The workbench alias is the same `qwen3-coder`
+every profile uses (only the backend swaps), so conformance targets it exactly as
+against the mock profile — `run.local.sh` does this for you and prints the JSON
+verdict:
+
+```bash
+../.venv-e2e/bin/python ../conformance/conformance.py \
+  --base-url http://localhost:4000/v1 --api anthropic \
+  --model qwen3-coder --api-key "$LITELLM_MASTER_KEY" --runs 3
+```
+
+**Hard constraint — never in CI.** Ollama + a multi-GB model + CPU inference is
+far too heavy for the CI gate, and nothing wires it there: `run.sh` (the merge
+gate) and the CI workflow use the mock profile only, and `docker-compose.local.yaml`
+is referenced by nothing but `run.local.sh`. `scripts/check.sh` *does* `docker
+compose config`-validate the file in its fast tier, but that is schema
+validation, not `up` — it starts no containers. The deliverable is the profile +
+docs, **machine-verified by the mock profile staying green**.
+
 ## Not covered here (know the edges)
 
 - The `azure_ai/`+`/anthropic` **backend** wire format (decision 3) — real
@@ -100,8 +173,8 @@ Both are logged as risks worth carrying into deploy validation.
 
 ## Next
 
-- Wire `e2e/run.sh` (mock profile) into CI — it's already exit-code clean.
-- When Sparks land, add an Ollama third profile (decision 1) for offline
-  real-tool-calling without keys.
-- Add a mid-stream-`hangup` fallback assertion once retry/stream semantics are
-  pinned (docs/03 risk 7).
+- ~~Wire `e2e/run.sh` (mock profile) into CI~~ — done (goal 1).
+- ~~Add an Ollama profile for offline real-tool-calling without keys~~ — done
+  (goal 4, § *The local profile* above). Landed ahead of Sparks: with Spark
+  intake parked, it's the stand-in for a workbench, not just a future addition.
+- ~~Add a mid-stream-`hangup` fallback assertion~~ — done (goal 2).
