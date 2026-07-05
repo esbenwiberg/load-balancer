@@ -89,6 +89,13 @@ litellm_settings:
   drop_params: true       # tolerate params a given backend doesn't support
   # request_timeout, num_retries etc. can also live here; keep router_settings authoritative.
 
+  # Observability: per-request routing records (goal 3). Same callback as the
+  # e2e stack (docker-compose mounts ../e2e/obs_callback.py). Emits one JSON
+  # record per backend attempt + per delivered response to stdout as
+  # `ROUTING_RECORD <json>` — {chosen backend, why, latency, tokens, fallback}.
+  # No webhook here, so stdout is the sink. See ../docs/09-observability.md.
+  callbacks: obs_callback.routing_recorder
+
 general_settings:
   # Master key mints per-user virtual keys (attribution + revocation). NEVER
   # commit it — it comes from the environment.

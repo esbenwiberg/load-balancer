@@ -59,12 +59,20 @@ services:
       - "4000:4000"
     volumes:
       - ./litellm-config.e2e.yaml:/app/config.yaml:ro
+      # Observability callback (goal 3) — sits next to the config so LiteLLM can
+      # import `obs_callback.routing_recorder` (it adds the config dir to sys.path).
+      - ./obs_callback.py:/app/obs_callback.py:ro
     environment:
       # Test-only master key — NOT a secret. Overridable via .env.e2e.
       LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-e2e-master-test-key}"
       # LiteLLM runs its prisma migrations against this on boot; enables the
       # /key/generate virtual-key store.
       DATABASE_URL: "postgresql://litellm:litellm@db:5432/litellm"
+      # Observability sink (goal 3): the routing-record callback POSTs each
+      # record here so the test suite can read them back via GET /__observe.
+      # In-network address; mockd is a single process so it centralizes records
+      # across BOTH litellm workers (--num_workers 2).
+      OBS_WEBHOOK_URL: "http://mockd:9100/__observe"
     command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]
