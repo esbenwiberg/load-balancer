@@ -13,6 +13,9 @@
 #   :9101  workbench-a        — mockd, instance "workbench-a"  (a Spark slot)
 #   :9102  workbench-b        — mockd, instance "workbench-b"  (2nd Spark slot)
 #   :9103  foundry            — mockd, instance "mock-foundry" (always-up tier)
+#   :9300  dashboard          — goal-12 "where did my prompt go?" viewer. Open
+#                               http://localhost:9300 while the stack is up and
+#                               watch every prompt's route land live.
 #   db     postgres           — LiteLLM virtual-key store (in-network only)
 #
 # Each mockd is host-published on a DISTINCT port so you can drive /__control at
@@ -95,6 +98,28 @@ services:
       retries: 5
       start_period: 2s
 
+  dashboard:
+    # Goal 12 — the read-only "where did my prompt go?" viewer + routing-record
+    # sink. Leave the dev stack up and open http://localhost:9300 to watch routes
+    # land live as you drive Claude Code / Codex / dev_smoke.sh through :4000.
+    image: python:3.12-slim
+    container_name: dev-dashboard
+    working_dir: /app
+    volumes:
+      - ./dashboard.py:/app/dashboard.py:ro
+    environment:
+      DASH_PORT: "9300"
+      DASH_HOST: "0.0.0.0"
+    command: ["python", "dashboard.py"]
+    ports:
+      - "9300:9300"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9300/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
   litellm:
     # Same pinned, vetted image as deploy/ + e2e/ (docs/03 risk 8 — never
     # 1.82.7/1.82.8). The check.sh pin guard enforces this exact tag.
@@ -107,16 +132,27 @@ services:
         condition: service_healthy
       foundry:
         condition: service_healthy
+      dashboard:
+        condition: service_healthy
       db:
         condition: service_healthy
     ports:
       - "4000:4000"
     volumes:
       - ./litellm-config.dev.yaml:/app/config.yaml:ro
+      # Observability callback (goal 3) — sits next to the config so LiteLLM can
+      # import `obs_callback.routing_recorder` (it adds the config dir to sys.path).
+      # The dev stack had NO obs wiring before goal 12; this + OBS_WEBHOOK_URL is
+      # what makes the dashboard show live routes here.
+      - ./obs_callback.py:/app/obs_callback.py:ro
     environment:
       # Test-only master key — NOT a secret. Overridable via .env.e2e / your env.
       LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-dev-master-test-key}"
       DATABASE_URL: "postgresql://litellm:litellm@db:5432/litellm"
+      # Fan routing records to the dashboard sink (goal 12). Dev has no mockd
+      # /__observe central sink (mockd here are the BACKENDS), so the dashboard
+      # is the sole webhook target; stdout ROUTING_RECORD lines still emit too.
+      OBS_WEBHOOK_URL: "http://dashboard:9300/records"
     command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]

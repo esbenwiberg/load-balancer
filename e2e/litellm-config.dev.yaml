@@ -106,6 +106,12 @@ router_settings:
 
 litellm_settings:
   drop_params: true
+  # Routing-record observability (goal 3) — emits one record per backend attempt
+  # (event=llm_call) + per delivered response (event=delivered). The dev stack
+  # fans these to the dashboard sink (docker-compose.dev.yaml OBS_WEBHOOK_URL) so
+  # http://localhost:9300 shows every prompt's route live. Same callback the e2e
+  # + deploy configs use — single source of truth in obs_callback.py.
+  callbacks: obs_callback.routing_recorder
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY

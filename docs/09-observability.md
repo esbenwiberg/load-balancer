@@ -91,13 +91,68 @@ a log shipper at the container. When a real observability backend is chosen
 queryable spend), it slots in as an additional callback; these stdout/webhook
 records stay as the dependency-free floor.
 
+## The dashboard — "where did my prompt go?" (goal 12)
+
+Goal 3 is the data layer; **goal 12** is the read-only view over it. `e2e/dashboard.py`
+is a stdlib-only daemon (same shape as mockd) that is *both* a routing-record
+**sink** and a tiny **read-only web page**:
+
+| route | purpose |
+|-------|---------|
+| `POST /records` | obs_callback webhook target — append one record |
+| `GET /api/records` | the **data endpoint** the page fetches: `{count, requests[], attempts[], records[]}` |
+| `GET /` | the read-only HTML page (auto-refreshes off `/api/records` every 2s) |
+| `POST /__reset` | clear the sink (test isolation, like mockd's `/__reset`) |
+
+The page shows two tables: **Requests** (requested alias → served backend, a
+`direct`/`fallback` badge, provider, tokens, cost — folded from the `delivered`
+records) and the **Attempt trail** (every `llm_call`: backend, tier, status,
+latency, and on failure the error that triggered a fallback — the "why").
+
+### Build-vs-reuse (a reversible call, decided per CLAUDE.md)
+
+We **build** this thin page rather than **reuse** LiteLLM's bundled admin UI:
+
+- **The data is ours.** The `{requested alias, backend served, fallback?, tier,
+  latency, tokens}` shape is produced by obs_callback (goal 3). LiteLLM's UI
+  renders its own SpendLogs/keys/teams and has no notion of our fallback *why*
+  (the 503 that triggered it, the backend tier).
+- **Machine-verifiable.** Goal 12 requires an e2e assertion on the data endpoint;
+  an owned JSON endpoint is deterministically assertable, a React SPA behind
+  master-key auth is not.
+- **Dependency-free floor.** Keeps the "zero external observability stack"
+  invariant this doc opens with — no Langfuse/OTEL, stdlib only.
+- **Read-only, minimal auth surface.** LiteLLM's UI is read-write (mint keys) and
+  needs the master key in-browser; this view only reads.
+- **Reversible.** Records still flow to stdout + Postgres, so adopting LiteLLM's
+  UI or Grafana later forecloses nothing.
+
+### Where records flow now
+
+obs_callback's `OBS_WEBHOOK_URL` accepts a **comma-separated list** and fans each
+record to every sink. The **e2e** stack sets it to *both*
+`http://mockd:9100/__observe` (the goal-3 suite reads records back there) *and*
+`http://dashboard:9300/records` (the goal-12 page + its data-endpoint test). The
+**dev** stack (which had no obs wiring before goal 12) sets it to the dashboard
+only — its mockd containers are the *backends*, so there's no central mockd sink;
+`docker compose -f docker-compose.dev.yaml up -d` then open `http://localhost:9300`
+to watch routes land live. `deploy/` stays stdout-only.
+
+The assertions live in `e2e/test_e2e.py`:
+`test_dashboard_data_endpoint_shows_direct_request` (a direct route appears,
+`fallback:false`), `test_dashboard_data_endpoint_shows_fallback_route` (a forced
+`qwen3-coder → claude-sonnet` shows the request row *and* the 503 attempt row),
+and `test_dashboard_page_renders` (the page serves and is wired to `/api/records`).
+
 ## What this is *not* (yet)
 
-- **Not durable.** Both sinks are ephemeral (stdout ring / mockd in-memory).
-  Durable, queryable, per-user/team spend is [goal 11b](../GOALS.md) (Postgres
-  spend logs).
-- **Not a dashboard.** The read-only "where did my prompt go?" UI over these
-  records is [goal 12](../GOALS.md); this goal is the data layer it reads.
+- **Not durable.** All sinks are ephemeral (stdout ring / mockd + dashboard
+  in-memory). Durable, queryable, per-user/team spend is [goal 11b](../GOALS.md)
+  (Postgres spend logs).
+- **Not per-request hard-correlated.** The dashboard's per-request rows come from
+  `delivered` records, which carry no `trace_id` (see the quirk box above), so
+  the attempt trail is shown *alongside* requests, not joined to them by id.
+  Fleet-level correlation is a later refinement.
 - **Streaming latency caveat.** `latency_ms` on an `llm_call` is LiteLLM's
   `response_time`; for streamed responses that reflects time-to-completion of the
   logged call, not time-to-first-token. TTFT is a later refinement.

@@ -6,6 +6,11 @@
 #   :4000  LiteLLM gateway   — clients + the pytest suite hit this
 #   :9100  mockd             — published so tests can POST /__control to inject
 #                              faults; LiteLLM reaches it in-network at mockd:9100
+#   :9300  dashboard         — goal-12 "where did my prompt go?" viewer; the
+#                              gateway's obs_callback fans routing records here
+#                              (as well as to mockd/__observe). GET / for the UI,
+#                              GET /api/records for the data endpoint the suite
+#                              asserts on.
 # =============================================================================
 
 services:
@@ -46,12 +51,35 @@ services:
       retries: 5
       start_period: 2s
 
+  dashboard:
+    # Goal 12 — the read-only "where did my prompt go?" viewer + routing-record
+    # sink. Stdlib-only daemon, same shape as mockd (no pip install).
+    image: python:3.12-slim
+    container_name: dashboard
+    working_dir: /app
+    volumes:
+      - ./dashboard.py:/app/dashboard.py:ro
+    environment:
+      DASH_PORT: "9300"
+      DASH_HOST: "0.0.0.0"
+    command: ["python", "dashboard.py"]
+    ports:
+      - "9300:9300"        # host-published so the pytest suite can read /api/records
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9300/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
   litellm:
     # Same pinned, vetted image as deploy/ (docs/03 risk 8 — never 1.82.7/1.82.8).
     image: ghcr.io/berriai/litellm:v1.83.14-stable
     container_name: litellm-e2e
     depends_on:
       mockd:
+        condition: service_healthy
+      dashboard:
         condition: service_healthy
       db:
         condition: service_healthy
@@ -68,11 +96,13 @@ services:
       # LiteLLM runs its prisma migrations against this on boot; enables the
       # /key/generate virtual-key store.
       DATABASE_URL: "postgresql://litellm:litellm@db:5432/litellm"
-      # Observability sink (goal 3): the routing-record callback POSTs each
-      # record here so the test suite can read them back via GET /__observe.
-      # In-network address; mockd is a single process so it centralizes records
+      # Observability sinks (goal 3 + goal 12): the routing-record callback fans
+      # each record out to BOTH sinks (comma-separated). mockd/__observe backs
+      # the goal-3 suite (read records back, assert a fallback is captured); the
+      # dashboard/records sink backs the goal-12 viewer + its data-endpoint test.
+      # In-network addresses; each is a single process so it centralizes records
       # across BOTH litellm workers (--num_workers 2).
-      OBS_WEBHOOK_URL: "http://mockd:9100/__observe"
+      OBS_WEBHOOK_URL: "http://mockd:9100/__observe,http://dashboard:9300/records"
     command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]
