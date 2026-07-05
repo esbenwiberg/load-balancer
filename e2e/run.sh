@@ -22,6 +22,7 @@ COMPOSE="docker compose -f docker-compose.e2e.yaml"
 export LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-sk-e2e-master-test-key}"
 export GATEWAY_URL="${GATEWAY_URL:-http://localhost:4000}"
 export MOCKD_URL="${MOCKD_URL:-http://localhost:9100}"
+export DASH_URL="${DASH_URL:-http://localhost:9300}"   # goal-12 dashboard sink + data endpoint
 
 cleanup() {
   if [[ "$KEEP" -eq 0 ]]; then

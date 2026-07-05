@@ -209,18 +209,42 @@ The callback publishes two record shapes — `llm_call` (one per backend
 **attempt**: backend, tier, latency, tokens, and on failure the error that
 triggered a fallback) and `delivered` (one per **request**: requested vs served
 backend ⇒ `fallback` flag, plus tokens). Records go to **stdout**
-(`ROUTING_RECORD <json>`) always, and — because the e2e compose sets
-`OBS_WEBHOOK_URL=http://mockd:9100/__observe` — to mockd's in-memory sink so the
-suite can read them back:
+(`ROUTING_RECORD <json>`) always, and `OBS_WEBHOOK_URL` fans each record to a
+**comma-separated list** of webhook sinks. The e2e compose points it at *both*
+`http://mockd:9100/__observe` (so the suite can read records back) *and*
+`http://dashboard:9300/records` (the goal-12 dashboard, below):
 
 ```bash
 ./run.sh --keep
-curl -s localhost:9100/__observe | jq '.records'
+curl -s localhost:9100/__observe | jq '.records'      # raw record stream
 ```
 
 `test_fallback_is_observable_in_routing_record` forces a fallback and asserts it
 shows up in the records. Full design (incl. the LiteLLM "fallback winner logs no
 success event" quirk, and the prod stdout path): **[docs/09](../docs/09-observability.md)**.
+
+### The dashboard — a read-only view of the above (goal 12)
+
+`dashboard.py` (`:9300`, stdlib-only, same shape as mockd) is the **visible face**
+of that data: a routing-record **sink** (`POST /records`) plus a read-only **page**
+(`GET /`) and its **data endpoint** (`GET /api/records`). Open it while any stack
+is up and watch every prompt's route land live:
+
+```bash
+./run.sh --keep                                       # or the dev stack (below)
+open http://localhost:9300                            # the page
+curl -s localhost:9300/api/records | jq '.requests'   # per-request routing rows
+```
+
+It shows **Requests** (requested alias → served backend, `direct`/`fallback`
+badge, tokens, cost) and the **Attempt trail** (every backend tried + the error
+that forced a fallback). We *built* this thin page rather than reuse LiteLLM's
+admin UI — the routing-record shape is ours, an owned JSON endpoint is
+assertable, and it keeps the zero-dependency floor; full reasoning in
+[docs/09](../docs/09-observability.md) and `dashboard.py`'s header.
+`test_dashboard_data_endpoint_shows_direct_request`,
+`test_dashboard_data_endpoint_shows_fallback_route`, and
+`test_dashboard_page_renders` cover the data endpoint + page.
 
 ---
 
@@ -247,7 +271,12 @@ Topology (`docker-compose.dev.yaml`):
 | `workbench-a` | `:9101` | `workbench-a` | a Spark workbench slot (`qwen3-coder-a`) |
 | `workbench-b` | `:9102` | `workbench-b` | a second, distinct workbench slot (`qwen3-coder-b`) |
 | `foundry` | `:9103` | `mock-foundry` | the always-up fallback tier (`claude-sonnet` / `claude-opus` / `gpt`) |
+| `dashboard` | `:9300` | — | goal-12 "where did my prompt go?" viewer — open `http://localhost:9300` |
 | `db` | (internal) | — | Postgres — the virtual-key store |
+
+The dev gateway wires the same `obs_callback` and fans records to the dashboard
+(`OBS_WEBHOOK_URL=http://dashboard:9300/records`) — so with the stack up, every
+prompt you send through `:4000` shows up live at `http://localhost:9300`.
 
 Each `mockd` sets a distinct `MOCKD_INSTANCE`, so its reply stamps
 `served_model=<model>@<instance>` — that's how you tell two otherwise-identical
@@ -401,16 +430,17 @@ data** through it. Keep smoke prompts synthetic. If in doubt → **DISCO**.
 
 ```
 mockd.py                     controllable mock backend (stdlib, no deps; MOCKD_INSTANCE stamps identity) + /__observe sink
-obs_callback.py              observability callback: per-request routing records -> stdout + webhook (docs/09)
+obs_callback.py              observability callback: per-request routing records -> stdout + webhook(s) (docs/09)
+dashboard.py                 goal-12 read-only "where did my prompt go?" viewer + routing-record sink (:9300)
 litellm-config.e2e.yaml      mock-profile gateway config (all aliases -> one mockd)
-docker-compose.e2e.yaml      mock stack: litellm + mockd + postgres
+docker-compose.e2e.yaml      mock stack: litellm + mockd + dashboard + postgres
 test_e2e.py                  raw-HTTP pytest suite (the CI driver)
 run.sh                       up -> test -> conformance gate -> teardown
 requirements.txt             test-driver deps (httpx, pytest, openai)
 .env.e2e.example             mock-profile env (test-only, safe to commit)
 
-litellm-config.dev.yaml      dev-profile config (workbench-a/-b + foundry, distinct instances)
-docker-compose.dev.yaml      dev stack: litellm + 2 workbenches + foundry + postgres (stays up)
+litellm-config.dev.yaml      dev-profile config (workbench-a/-b + foundry, distinct instances; obs -> dashboard)
+docker-compose.dev.yaml      dev stack: litellm + 2 workbenches + foundry + dashboard + postgres (stays up)
 dev_smoke.sh                 dev-profile smoke: all 3 surfaces -> 3 distinct containers
 
 litellm-config.cliauth.yaml  cli-auth gateway config (real providers, env-keyed)

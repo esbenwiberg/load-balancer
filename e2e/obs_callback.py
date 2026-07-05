@@ -29,11 +29,14 @@ Sinks (independent, both optional):
               This is the production-friendly, dependency-free path: scrape it
               with `docker logs ... | grep ROUTING_RECORD` or ship it to any log
               collector. See docs/09-observability.md.
-  * webhook — only if OBS_WEBHOOK_URL is set: POST each record there. The e2e
-              stack points this at mockd's /__observe so the test suite can read
-              records back over HTTP and assert on them. Fire-and-forget with a
-              short timeout; ANY failure is swallowed so observability can never
-              break the request path (logging runs post-response anyway).
+  * webhook — only if OBS_WEBHOOK_URL is set: POST each record there. Accepts a
+              COMMA-SEPARATED list of URLs and fans the record out to every one,
+              independently — so a single record can land in more than one sink.
+              The e2e stack points this at BOTH mockd's /__observe (so the goal-3
+              suite can read records back) AND the dashboard's /records (goal 12,
+              the "where did my prompt go?" viewer). Fire-and-forget with a short
+              timeout; ANY failure on ANY sink is swallowed so observability can
+              never break the request path (logging runs post-response anyway).
 
 Wire-up (litellm-config.*.yaml):  litellm_settings: { callbacks: obs_callback.routing_recorder }
 The file must sit next to the config so LiteLLM can import it (it adds the
@@ -52,7 +55,11 @@ try:  # httpx ships with litellm; guard anyway so an import hiccup can't wedge b
 except Exception:  # pragma: no cover - defensive
     httpx = None
 
-_WEBHOOK_URL = os.environ.get("OBS_WEBHOOK_URL", "").strip()
+# One or more sinks, comma-separated. Blanks are dropped so a trailing comma or
+# an unset value can't produce a bogus empty URL.
+_WEBHOOK_URLS = [
+    u.strip() for u in os.environ.get("OBS_WEBHOOK_URL", "").split(",") if u.strip()
+]
 _WEBHOOK_TIMEOUT = float(os.environ.get("OBS_WEBHOOK_TIMEOUT", "2.0"))
 _STDOUT_PREFIX = "ROUTING_RECORD "
 
@@ -72,15 +79,17 @@ def _emit(record: dict) -> None:
         print(_STDOUT_PREFIX + json.dumps(record, default=str), flush=True)
     except Exception:  # pragma: no cover - defensive
         pass
-    if not _WEBHOOK_URL or httpx is None:
+    if not _WEBHOOK_URLS or httpx is None:
         return
-    # Blocking POST to a local sink (mockd is instant); runs post-response so it
-    # adds no client latency. Any error is swallowed — observability is
-    # best-effort and must never surface to the caller.
-    try:
-        httpx.post(_WEBHOOK_URL, json=record, timeout=_WEBHOOK_TIMEOUT)
-    except Exception:  # pragma: no cover - defensive
-        pass
+    # Blocking POST to each local sink (mockd/dashboard are instant); runs
+    # post-response so it adds no client latency. Each sink is independent — an
+    # error on one must not starve the others, and any error is swallowed:
+    # observability is best-effort and must never surface to the caller.
+    for url in _WEBHOOK_URLS:
+        try:
+            httpx.post(url, json=record, timeout=_WEBHOOK_TIMEOUT)
+        except Exception:  # pragma: no cover - defensive
+            pass
 
 
 def _tier(kwargs) -> str | None:

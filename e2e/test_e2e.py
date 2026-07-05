@@ -31,6 +31,7 @@ import pytest
 
 GATEWAY = os.environ.get("GATEWAY_URL", "http://localhost:4000")
 MOCKD = os.environ.get("MOCKD_URL", "http://localhost:9100")
+DASH = os.environ.get("DASH_URL", "http://localhost:9300")  # goal-12 dashboard
 KEY = os.environ.get("LITELLM_MASTER_KEY", "sk-e2e-master-test-key")
 
 AUTH = {"Authorization": "Bearer " + KEY}
@@ -52,8 +53,22 @@ def _reset_mockd():
     which is cooldown-independent.
     """
     httpx.post(MOCKD + "/__reset", timeout=TIMEOUT)
+    _reset_dashboard()
     yield
     httpx.post(MOCKD + "/__reset", timeout=TIMEOUT)
+    _reset_dashboard()
+
+
+def _reset_dashboard():
+    """Clear the goal-12 dashboard's record sink so routing records never leak
+    across serially-run tests, exactly like mockd's /__reset. Best-effort: a
+    bare `pytest` against a stack without the dashboard shouldn't hard-fail here,
+    so a connection error is tolerated (the dashboard tests will surface a real
+    misconfig loudly on their own)."""
+    try:
+        httpx.post(DASH + "/__reset", timeout=TIMEOUT)
+    except httpx.HTTPError:
+        pass
 
 
 def _inject(directive):
@@ -1069,6 +1084,167 @@ def test_direct_request_routing_record_no_fallback():
     assert (c.get("tokens") or {}).get("total"), (
         "attempt record must capture token usage: %r" % c
     )
+
+
+# --- routing dashboard v1: "where did my prompt go?" (goal 12) ---------------
+#
+# The dashboard (e2e/dashboard.py) is the read-only, visible face of goal-3's
+# routing records. The gateway's obs_callback fans each record to BOTH sinks
+# (mockd/__observe AND dashboard/records — see docker-compose.e2e.yaml
+# OBS_WEBHOOK_URL). The dashboard folds them into a per-REQUEST view (requested
+# alias -> served backend, fallback flag, tokens) + a per-ATTEMPT trail (the
+# "why" behind a fallback). GET /api/records is the DATA ENDPOINT the UI fetches;
+# these tests assert on it directly, so a green suite proves the data the page
+# renders is really there. See docs/09-observability.md.
+#
+# BUILD-vs-REUSE (reversible call, documented in dashboard.py + docs/09): we BUILD
+# a thin read-only page over goal-3 data rather than reuse LiteLLM's admin UI —
+# the routing-record shape (fallback "why", backend tier) is ours, not LiteLLM's,
+# and an owned JSON endpoint is deterministically assertable where a React SPA
+# behind master-key auth is not.
+
+
+def _dash_api():
+    """The dashboard's data endpoint — what the read-only page fetches."""
+    r = httpx.get(DASH + "/api/records", timeout=TIMEOUT)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _poll_dash(predicate, timeout=8.0):
+    """Records reach the dashboard via a post-response webhook, so the sink lags
+    the client's HTTP 200 (same race as mockd/__observe). Poll until the
+    predicate holds, then return the latest snapshot either way."""
+    deadline = time.time() + timeout
+    data = _dash_api()
+    while time.time() < deadline:
+        if predicate(data):
+            return data
+        time.sleep(0.25)
+        data = _dash_api()
+    return data
+
+
+def test_dashboard_data_endpoint_shows_direct_request():
+    """Goal 12: a prompt just sent through the gateway shows up in the dashboard's
+    data endpoint as a per-request routing record — requested alias == served
+    backend (no fallback), with token usage. This is the endpoint the read-only
+    page renders, asserted directly."""
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": "claude-sonnet",
+            "messages": [{"role": "user", "content": "ping dashboard direct"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+
+    def _has_request(data):
+        return any(
+            rq.get("requested_model") == "claude-sonnet"
+            for rq in data.get("requests", [])
+        )
+
+    data = _poll_dash(_has_request)
+    reqs = [
+        rq
+        for rq in data.get("requests", [])
+        if rq.get("requested_model") == "claude-sonnet"
+    ]
+    assert reqs, (
+        "dashboard data endpoint has no request row for claude-sonnet: %r" % data
+    )
+    rq = reqs[0]  # newest first
+    assert rq.get("served_model") == "claude-sonnet", rq
+    assert rq.get("fallback") is False, (
+        "a directly-served request must not be flagged a fallback on the dashboard: %r"
+        % rq
+    )
+    assert rq.get("tokens_total"), (
+        "dashboard request row must carry token usage: %r" % rq
+    )
+
+
+def test_dashboard_data_endpoint_shows_fallback_route():
+    """Goal 12: the dashboard must make a FALLBACK legible — the whole point of
+    "where did my prompt go?". Force qwen3-coder -> claude-sonnet, then assert the
+    data endpoint carries BOTH halves:
+
+      * a per-request row: requested qwen3-coder, served claude-sonnet, fallback
+        flagged true; and
+      * a per-attempt failure row for qwen3-coder naming the 503 that triggered
+        the fallback (the "why") with its tier.
+    """
+    _inject({"model": "qwen3-coder", "status": 503})  # persistent -> fallback
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": "qwen3-coder",
+            "messages": [{"role": "user", "content": "ping dashboard fallback"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+    assert "served_model=claude-sonnet" in _served_model(r.json()), r.text
+
+    def _both(data):
+        req = any(
+            rq.get("requested_model") == "qwen3-coder" and rq.get("fallback") is True
+            for rq in data.get("requests", [])
+        )
+        att = any(
+            a.get("requested_group") == "qwen3-coder" and a.get("status") == "failure"
+            for a in data.get("attempts", [])
+        )
+        return req and att
+
+    data = _poll_dash(_both)
+
+    # (a) the per-request row — the fallback made visible.
+    reqs = [
+        rq
+        for rq in data.get("requests", [])
+        if rq.get("requested_model") == "qwen3-coder"
+    ]
+    assert reqs, "dashboard has no request row for the qwen3-coder prompt: %r" % data
+    rq = reqs[0]
+    assert rq.get("fallback") is True, "dashboard must flag the fallback: %r" % rq
+    assert rq.get("served_model") == "claude-sonnet", (
+        "dashboard must name the backend that actually served: %r" % rq
+    )
+
+    # (b) the per-attempt failure row — the WHY behind the fallback.
+    fails = [
+        a
+        for a in data.get("attempts", [])
+        if a.get("requested_group") == "qwen3-coder" and a.get("status") == "failure"
+    ]
+    assert fails, (
+        "dashboard attempt trail is missing the failed qwen3-coder attempt: %r" % data
+    )
+    f = fails[0]
+    assert str(f.get("error_code")) == "503", (
+        "dashboard attempt row must carry the 503 that triggered the fallback: %r" % f
+    )
+    assert f.get("tier") == "local", (
+        "dashboard attempt row should carry the backend tier: %r" % f
+    )
+
+
+def test_dashboard_page_renders():
+    """The read-only page itself serves (GET /) and is wired to its data endpoint.
+    Not a headless-browser test — we assert the HTML is served and references the
+    /api/records fetch, so the served page and the asserted data endpoint can't
+    silently drift apart."""
+    r = httpx.get(DASH + "/", timeout=TIMEOUT)
+    assert r.status_code == 200, r.text
+    assert "text/html" in r.headers.get("content-type", ""), r.headers
+    body = r.text
+    assert "Router dashboard" in body, "dashboard page title missing"
+    assert "api/records" in body, "dashboard page must fetch its data endpoint"
 
 
 # --- spend audit: users, teams, attribution, durability (goal 11b) -----------
