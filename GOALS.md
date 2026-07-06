@@ -160,6 +160,15 @@ decision is made.
   `docker compose config` validates the file in the fast tier but starts no
   containers. Docs: e2e/README "Profile: local" + docs/08. Merge gate = mock
   `e2e/run.sh` green. — PR #25 (2026-07)
+- ✅ 4 (follow-up 2). Local profile GPU fast path — `run.local.sh --native-ollama`
+  keeps the gateway containerized (prod parity + pinned image) but points it at a
+  **host-run Ollama** on the Mac's Metal GPU via `OLLAMA_API_BASE` (new env knob:
+  `api_base: os.environ/OLLAMA_API_BASE`; `docker-compose.local-native.yaml` =
+  gateway-only, no Ollama container). Runner preflights the host (install-check,
+  starts the daemon on `0.0.0.0`, pulls the model). Verified end-to-end: qwen3:8b
+  on Metal (`size_vram=5.6GB`), `agent_capable=true`, ~28 tok/s vs single-digit
+  CPU-in-Docker. Fully-containerized default unchanged (portable + CI; the GPU
+  path on a Linux/NVIDIA host). Docs: e2e/README "Fast path" + docs/08. — PR #? (2026-07)
 - ✅ 4 (follow-up). Local profile made GREEN — default model → `qwen3:8b`, which
   clears the conformance gate for real (`agent_capable=true`): structured tool
   calls, the full multi-turn Read→Edit→Bash task, and both probes, over streaming.

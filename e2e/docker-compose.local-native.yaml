@@ -1,0 +1,59 @@
+# =============================================================================
+# LOCAL profile — NATIVE-OLLAMA variant (Mac GPU fast path).
+#
+# Runs ONLY the gateway in Docker and points it at a REAL Ollama running
+# NATIVELY on the host (`brew install ollama` / the Ollama.app), which uses the
+# Mac's Metal GPU via unified memory. That's 10-50x faster than the CPU-only
+# containerized Ollama (Docker Desktop can't pass Metal into its Linux VM — see
+# e2e/README "The Mac CPU-only-in-Docker caveat").
+#
+# Use it via the runner (handles the host-Ollama preflight + model pull):
+#   ./run.local.sh --native-ollama
+# Or by hand:
+#   OLLAMA_HOST=0.0.0.0 ollama serve        # host daemon, reachable from the VM
+#   ollama pull qwen3:8b
+#   docker compose -f docker-compose.local-native.yaml up -d
+#
+# This is a STANDALONE gateway definition (not `extends` of the base file):
+# current Docker Compose copies `depends_on` through `extends` and won't let us
+# drop the base's dependency on the (absent) Ollama container, so the ~1 service
+# is spelled out here. It mirrors the `litellm` service in docker-compose.local.yaml
+# MINUS `depends_on: ollama`, PLUS host networking. Keep the two in sync; the
+# check.sh litellm image-pin guard covers both files, so the pinned tag can't drift.
+#
+# The gateway (LiteLLM) stays containerized on purpose: prod parity with deploy/
+# + the vetted, pinned image (never a host `pip install litellm` — that's the
+# supply-chain vector docs/03 risk 8 guards against). Only the GPU-bound model
+# runner moves to the host. See e2e/README "Profile: local" -> native variant.
+# =============================================================================
+
+services:
+  litellm:
+    # Same pinned, vetted image as the base local/mock/dev/deploy stacks
+    # (docs/03 risk 8 — never 1.82.7/1.82.8). The check.sh pin guard enforces it.
+    image: ghcr.io/berriai/litellm:v1.83.14-stable
+    container_name: litellm-local
+    # NO depends_on: the model runs on the host, not in a container here.
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./litellm-config.local.yaml:/app/config.yaml:ro
+    # host.docker.internal resolves to the Mac host from inside the VM; the host
+    # Ollama must listen on an interface the VM can reach (OLLAMA_HOST=0.0.0.0,
+    # which run.local.sh --native-ollama sets when it starts the daemon).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Test-only master key — NOT a secret.
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-local-master-test-key}"
+      # Selects the model; the HOST Ollama must have it pulled (the runner does that).
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen3:8b}"
+      # The one difference from the container path: talk to the HOST Ollama.
+      OLLAMA_API_BASE: "http://host.docker.internal:11434/v1"
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s

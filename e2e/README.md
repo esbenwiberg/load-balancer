@@ -471,6 +471,38 @@ passthrough** — so Ollama here runs **CPU-only**. Consequences:
   OLLAMA_MODEL=qwen2.5-coder:3b ./run.local.sh   # faster, but red (see the ladder)
   ```
 
+### Fast path: native Ollama on the host (GPU)
+
+The CPU-only slowness is a **Docker-on-Mac** limit, not a model limit: Apple's GPU
+is reachable only through **Metal**, which needs a native macOS process — Docker
+Desktop runs Linux containers in a VM with no Metal passthrough, so *any* Mac
+container is CPU-only (same for Colima/Podman/Apple's `container` — all Linux VMs).
+GPU-in-Docker only works on a **Linux host with an NVIDIA GPU**.
+
+So on a Mac, run the **model** natively (Metal, fast) but keep the **gateway**
+containerized (prod parity + the vetted pinned image — never a host `pip install
+litellm`, the supply-chain vector [docs/03 risk 8](../docs/03-open-questions-and-risks.md)
+guards against). One flag does it:
+
+```bash
+brew install ollama          # once
+./run.local.sh --native-ollama
+```
+
+`--native-ollama` uses [`docker-compose.local-native.yaml`](docker-compose.local-native.yaml)
+(gateway only) and preflights the host: installs-check, starts the daemon with
+`OLLAMA_HOST=0.0.0.0` (so the container can reach it over `host.docker.internal`),
+and pulls `$OLLAMA_MODEL`. The gateway then talks to the host Ollama via
+`OLLAMA_API_BASE=http://host.docker.internal:11434/v1` (the same
+`api_base: os.environ/OLLAMA_API_BASE` knob the container path uses). Everything
+else — the `qwen3-coder` alias, conformance, the JSON verdict — is identical; only
+where the model runs changes. **Measured:** qwen3:8b ran on Metal at **~28 tok/s**
+(vs single-digit tok/s CPU-in-Docker) — same green `agent_capable=true`, inference
+in minutes instead of tens of minutes.
+
+The default (no flag) stays fully containerized, so the profile is still portable
+and CI-shaped (and on a Linux/NVIDIA box the container path *is* the GPU path).
+
 ### The model ladder (what passes, and what doesn't)
 
 Getting a real model green on this stack is a *model-quality* question — the
@@ -600,6 +632,7 @@ dev_smoke.sh                 dev-profile smoke: all 3 surfaces -> 3 distinct con
 
 litellm-config.local.yaml    local-profile config (workbench alias -> real qwen3:8b on Ollama; committed, keyless)
 docker-compose.local.yaml    local stack: litellm + ollama only (no postgres/mockd); NEVER run in CI
+docker-compose.local-native.yaml  local NATIVE variant: gateway only -> host Ollama (Mac GPU fast path)
 ollama-entrypoint.sh         ollama container entrypoint: pull + warm the model, healthcheck-gated (self-contained)
 run.local.sh                 up -> conformance THROUGH the gateway vs the real model -> teardown (manual, heavy)
 

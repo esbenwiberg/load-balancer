@@ -42,7 +42,12 @@ model_list:
       # It's a bare Ollama tag (no provider prefix), so we force the provider:
       model: os.environ/OLLAMA_MODEL
       custom_llm_provider: openai   # talk to Ollama's OpenAI-compatible surface...
-      api_base: http://ollama:11434/v1   # ...at :11434/v1
+      # ...at whatever host OLLAMA_API_BASE points to. Default (set in
+      # docker-compose.local.yaml) is the in-network container ollama:11434; the
+      # `--native-ollama` variant (docker-compose.local-native.yaml) overrides it
+      # to host.docker.internal:11434 so the gateway talks to a REAL host-run
+      # Ollama using the Mac's Metal GPU (fast) instead of the CPU-only container.
+      api_base: os.environ/OLLAMA_API_BASE
       api_key: dummy            # Ollama ignores auth; a placeholder keeps the SDK happy.
       # Bridge /v1/responses (Codex path) down to the chat surface, same as the
       # mock + prod configs — so the Responses bridge is exercised against a REAL
