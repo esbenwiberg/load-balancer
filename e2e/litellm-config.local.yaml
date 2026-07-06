@@ -1,7 +1,7 @@
 # =============================================================================
 # LOCAL profile gateway config (goal 4) — the SAME gateway (SUT), but the
 # workbench alias points at a REAL small coding model served by Ollama, with NO
-# API keys and NO ToS: qwen2.5-coder:3b running CPU-only inside Docker.
+# API keys and NO ToS: qwen3:8b running CPU-only inside Docker.
 #
 # WHY THIS PROFILE EXISTS: the mock profile (litellm-config.e2e.yaml) proves all
 # of the balancer's LOGIC deterministically, but by design its backend can't give
@@ -10,10 +10,10 @@
 # keys + hits the internet. This profile is the third leg: run the real gate
 # against a real model, offline + keyless. See docs/08.
 #
-# FINDING: with qwen2.5-coder the gate returns agent_capable=FALSE (the model
-# leaks tool calls on Ollama instead of emitting structured tool_calls). That's
-# the gate working against a real backend — see e2e/README "What conformance
-# found". Swapping OLLAMA_MODEL (below) is how you point it at a passing model.
+# RESULT: the default qwen3:8b clears the gate (agent_capable=TRUE) — structured
+# tool calls + the full multi-turn task + both probes, over streaming. Other
+# models fail in real, distinct ways (qwen2.5-coder leaks; qwen3:4b won't drive
+# the loop) — see e2e/README "The model ladder". Model is one OLLAMA_MODEL knob.
 #
 # NOT A SECRET: master_key comes from the environment and Ollama needs no auth
 # (api_key: dummy is ignored). This file carries no keys, so it is COMMITTED
@@ -30,15 +30,15 @@
 
 model_list:
   # The stable workbench alias — the SAME name every profile uses; only the
-  # BACKEND swaps. Here it fronts qwen2.5-coder:3b on Ollama's OpenAI-compatible
-  # surface (http://ollama:11434/v1). Point conformance.py at the gateway with
+  # BACKEND swaps. Here it fronts qwen3:8b on Ollama's OpenAI-compatible surface
+  # (http://ollama:11434/v1). Point conformance.py at the gateway with
   # `--model qwen3-coder` exactly as against the mock profile.
   - model_name: qwen3-coder
     litellm_params:
       # The backend model is read from OLLAMA_MODEL (set by compose, default
-      # qwen2.5-coder:3b) so ONE env var switches BOTH what the Ollama entrypoint
-      # pulls AND what the gateway requests — otherwise `OLLAMA_MODEL=...:7b` (the
-      # documented fallback) would pull 7b but the gateway would still ask for 3b.
+      # qwen3:8b) so ONE env var switches BOTH what the Ollama entrypoint pulls
+      # AND what the gateway requests — otherwise `OLLAMA_MODEL=qwen2.5-coder:3b`
+      # would pull that but the gateway would still ask for qwen3:8b.
       # It's a bare Ollama tag (no provider prefix), so we force the provider:
       model: os.environ/OLLAMA_MODEL
       custom_llm_provider: openai   # talk to Ollama's OpenAI-compatible surface...

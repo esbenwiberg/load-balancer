@@ -10,10 +10,10 @@
 # (that's run.sh, the mock profile). Nothing here runs in CI; Ollama + a multi-GB
 # model + CPU inference is too heavy. See e2e/README "Profile: local" + docs/08.
 #
-# NOTE: with the default qwen2.5-coder the gate returns agent_capable=FALSE (the
-# model leaks tool calls on Ollama — a real finding; see e2e/README "What
-# conformance found"). That's the gate working. A non-zero exit here is EXPECTED
-# for that model and is NOT a merge blocker.
+# NOTE: the default qwen3:8b CLEARS the gate (agent_capable=true) — but it's slow
+# CPU-only (reasoning mode); a full run can take 10-20+ min. Lighter models are a
+# one-var swap but go red (see e2e/README "The model ladder"). This is never a
+# merge gate regardless — that's the mock e2e/run.sh.
 #
 #   ./run.local.sh                 # up -> conformance (anthropic, 1 run) -> down
 #   ./run.local.sh --keep          # leave the stack up to poke :4000 / :11434
@@ -109,8 +109,8 @@ if [[ "$RC" -eq 0 ]]; then
   echo "LOCAL PROFILE: agent_capable=true — the real model cleared the gate through the gateway"
 else
   echo "LOCAL PROFILE: agent_capable=false (exit $RC) — the gate ran against the real model and the JSON above is the verdict."
-  echo "  For qwen2.5-coder this is EXPECTED (it leaks tool calls on Ollama — see e2e/README 'What conformance found')."
-  echo "  To chase a green, point at a model whose Ollama build emits structured tool_calls: OLLAMA_MODEL=<tag> ./run.local.sh"
+  echo "  The default qwen3:8b is expected to PASS; a red here usually means a swapped-in lighter model"
+  echo "  (qwen3:4b won't drive the loop; qwen2.5-coder leaks tool calls). See e2e/README 'The model ladder'."
 fi
 # Exit with conformance's verdict WITHOUT an explicit `exit` keyword: that would
 # make shellcheck mark the `trap cleanup EXIT` handler unreachable (SC2317 on

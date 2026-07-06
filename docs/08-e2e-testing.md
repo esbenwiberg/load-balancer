@@ -96,8 +96,9 @@ give a verdict on a *real* model — `mockd` replays a script, so it would alway
 "pass" the gate. `cli-auth` gives a real model but needs API keys and hits the
 internet. The **`local`** profile closes that gap: it points `conformance.py`
 (the harness that *earns* `agent_capable`) at a real small coding model
-(`qwen2.5-coder:3b`) served by **Ollama** behind the same gateway, with **no
-keys, no ToS, and no network** once the model is pulled. Runnable bits:
+(`qwen3:8b` by default — it passes; see the ladder below) served by **Ollama**
+behind the same gateway, with **no keys, no ToS, and no network** once the model
+is pulled. Runnable bits:
 [`../e2e/docker-compose.local.yaml`](../e2e/docker-compose.local.yaml),
 [`../e2e/litellm-config.local.yaml`](../e2e/litellm-config.local.yaml),
 [`../e2e/run.local.sh`](../e2e/run.local.sh).
@@ -115,33 +116,37 @@ It's the stand-in for one meanwhile.
 
 **The Mac CPU-only-in-Docker caveat.** On a Mac, Docker Desktop runs Linux
 containers in a lightweight VM with **no GPU passthrough**, so Ollama here runs
-**CPU-only**. `qwen2.5-coder:3b` is chosen to fit that envelope. Two
-consequences: (1) it's *slow* — a cold multi-turn Read→Edit→Bash run can take
-minutes (the config carries a 600s gateway timeout for exactly this), which is a
-core reason the profile is manual and never in CI; and (2) the backend model is a
-single knob — `OLLAMA_MODEL` drives both what the entrypoint pulls and what the
-gateway requests (`model: os.environ/OLLAMA_MODEL`), so swapping it (e.g.
-`OLLAMA_MODEL=qwen2.5-coder:7b ./run.local.sh`) needs no other change.
+**CPU-only**. Two consequences: (1) it's *slow* — a cold multi-turn Read→Edit→Bash
+run can take minutes to tens of minutes (the config carries a 600s gateway timeout
+for exactly this), and the green default `qwen3:8b` (reasoning mode) is at the slow
+end, which is a core reason the profile is manual and never in CI; and (2) the
+backend model is a single knob — `OLLAMA_MODEL` drives both what the entrypoint
+pulls and what the gateway requests (`model: os.environ/OLLAMA_MODEL`), so swapping
+it (e.g. `OLLAMA_MODEL=qwen2.5-coder:3b ./run.local.sh`) needs no other change.
 
-**What the first bring-up found (the gate discriminates).** Pointed at
-`qwen2.5-coder`, conformance returned **`agent_capable=false`** — a *real*
-result, not a rubber stamp. Both `:3b` and `:7b` emit a tool call but **leak it
-into `content`** instead of structured `tool_calls` (3b's args are malformed —
-it echoes the JSON schema; 7b's args are valid — `{"city":"Paris"}` — but still
-unwrapped). Root cause, diagnosed not guessed: qwen2.5-coder's Ollama template
-requires the model to wrap calls in `<tool_call>…</tool_call>` for Ollama's
-parser to structure them, and the model omits the wrapper. It reproduces
-**direct against Ollama** (native `/api/chat` *and* OpenAI-compat `/v1`) and
-through **both** LiteLLM providers (`openai/`, `ollama_chat/`) — so it's the
-model+engine, not the gateway, which faithfully passes Ollama's output through.
-This is precisely the *plumbing-vs-quality* split this doc is built on: the
-profile's job is to run the real gate against a real backend and report a
-trustworthy verdict, which it does. A **green** is a model-choice question — swap
-`OLLAMA_MODEL` to a tag whose Ollama build emits structured tool calls (a
-`llama3.1`/`qwen3`-family template) — and nothing else changes. We kept
-`qwen2.5-coder` (the goal's named coding model) and documented the finding rather
-than chase a green with another family: the deliverable is the profile + a
-trustworthy gate, not a particular model passing.
+**What the bring-ups found — the model ladder (the gate discriminates).** The
+gateway wiring is identical for every model; whether one goes green is a pure
+*model-quality* question, and the gate reports it faithfully:
+
+| Model | Structures `tool_calls`? | Probes | Drives the task? | `agent_capable` |
+|---|---|---|---|---|
+| `qwen3:8b` (default) | ✅ (thinking kept out of `content`) | ✅ both | ✅ read→edit→test→pass | **✅ true** |
+| `qwen3:4b` | ✅ | ✅ both | ❌ answers in prose, 0 calls | ❌ false |
+| `qwen2.5-coder:7b` | ❌ leaks (valid args, unwrapped) | — | — | ❌ false |
+| `qwen2.5-coder:3b` | ❌ leaks (malformed args) | — | — | ❌ false |
+
+Two distinct, real failure modes: (1) **qwen2.5-coder never structures a call** —
+its Ollama template needs the model to wrap calls in `<tool_call>…</tool_call>` and
+the model omits the wrapper, so Ollama returns it unparsed in `content`
+(reproduces direct-against-Ollama on native `/api/chat` *and* `/v1`, and through
+both `openai/` and `ollama_chat/` providers — model+engine, not the gateway); and
+(2) **qwen3:4b structures calls but won't drive the loop** — it passes both
+single-turn probes yet answers the open-ended task in prose instead of calling
+tools. `qwen3:8b` clears both hurdles (structured calls *and* completes the
+multi-turn task, over streaming, both probes honored) — the green default. This is
+precisely the *plumbing-vs-quality* split this doc is built on: the profile runs
+the real gate against a real backend and returns a trustworthy verdict, and the
+model is a reversible one-env-var choice.
 
 **How to point conformance at it.** The workbench alias is the same `qwen3-coder`
 every profile uses (only the backend swaps), so conformance targets it exactly as
