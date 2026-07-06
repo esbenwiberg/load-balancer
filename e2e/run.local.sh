@@ -20,7 +20,15 @@
 #   ./run.local.sh --api chat      # wire protocol: chat | responses | anthropic
 #   ./run.local.sh --runs 3        # more runs for a stabler error rate
 #   ./run.local.sh --no-probes     # skip the parallel + tool_choice:required probes
-#   OLLAMA_MODEL=qwen2.5-coder:7b ./run.local.sh   # the documented 3b fallback
+#   ./run.local.sh --native-ollama # GPU FAST PATH: gateway in Docker -> host Ollama
+#   OLLAMA_MODEL=qwen2.5-coder:3b ./run.local.sh   # swap the model (see the ladder)
+#
+# --native-ollama: skip the CPU-only Ollama CONTAINER and point the (still
+# containerized) gateway at a REAL Ollama running natively on the host, which
+# uses the Mac's Metal GPU — 10-50x faster. Requires host Ollama (`brew install
+# ollama`); this preflights it, starts the daemon if needed, and pulls the model.
+# Why keep the gateway in Docker: prod parity + the vetted pinned image (never a
+# host `pip install litellm` — docs/03 risk 8). See e2e/README "Profile: local".
 #
 # Exit code is conformance.py's verdict (0 == agent_capable). A sub-threshold
 # real model still SURFACES its JSON — that's the evidence; the merge gate is
@@ -32,6 +40,7 @@ cd "$(dirname "$0")"
 KEEP=0
 API="anthropic"
 RUNS=1
+NATIVE=0
 EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -39,14 +48,21 @@ while [[ $# -gt 0 ]]; do
     --api) API="$2"; shift 2 ;;
     --runs) RUNS="$2"; shift 2 ;;
     --no-probes) EXTRA_ARGS+=("--no-probes"); shift ;;
+    --native-ollama) NATIVE=1; shift ;;
     *) EXTRA_ARGS+=("$1"); shift ;;
   esac
 done
 
-COMPOSE="docker compose -f docker-compose.local.yaml"
 export LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-sk-local-master-test-key}"
 export GATEWAY_URL="${GATEWAY_URL:-http://localhost:4000}"
+export OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3:8b}"
 REPORT="${CONFORMANCE_JSON_OUT:-conformance.local.json}"
+
+if [[ "$NATIVE" -eq 1 ]]; then
+  COMPOSE="docker compose -f docker-compose.local-native.yaml"
+else
+  COMPOSE="docker compose -f docker-compose.local.yaml"
+fi
 
 cleanup() {
   if [[ "$KEEP" -eq 0 ]]; then
@@ -66,13 +82,45 @@ if [[ ! -x "$VENV/bin/python" ]]; then
 fi
 "$VENV/bin/pip" install -q --disable-pip-version-check -r requirements.txt
 
+# --- native-ollama preflight: ensure a host daemon has the model -------------
+# In native mode there is NO Ollama container; the gateway talks to a host-run
+# Ollama over host.docker.internal. Make sure it's installed, running (bound so
+# the VM can reach it), and has the model pulled — otherwise the gateway would
+# come up healthy but every request would fail to connect.
+if [[ "$NATIVE" -eq 1 ]]; then
+  echo "--- native-ollama: preflighting host Ollama (GPU fast path) ---"
+  if ! command -v ollama >/dev/null 2>&1; then
+    echo "ERROR: --native-ollama needs Ollama installed on the HOST." >&2
+    echo "  Install it:  brew install ollama   (or https://ollama.com/download)" >&2
+    echo "  Then re-run. Or drop --native-ollama to use the CPU-only container." >&2
+    exit 1
+  fi
+  if ! curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
+    echo "host Ollama daemon not up — starting it (OLLAMA_HOST=0.0.0.0 so the VM can reach it)..."
+    # 0.0.0.0 so the container can reach it via host.docker.internal, not just 127.0.0.1.
+    OLLAMA_HOST=0.0.0.0 nohup ollama serve >/tmp/ollama-native.log 2>&1 &
+    for i in $(seq 1 30); do
+      curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 && break
+      [[ "$i" -eq 30 ]] && { echo "ERROR: host Ollama did not come up; see /tmp/ollama-native.log" >&2; exit 1; }
+      sleep 1
+    done
+  fi
+  echo "host Ollama up — pulling ${OLLAMA_MODEL} (no-op if already present; GPU, fast)..."
+  ollama pull "$OLLAMA_MODEL"
+fi
+
 # --- up + wait for health ---------------------------------------------------
-echo "--- bringing up LOCAL stack (Ollama pulls the model on first run — be patient) ---"
+if [[ "$NATIVE" -eq 1 ]]; then
+  echo "--- bringing up gateway only (native Ollama on the host, GPU) ---"
+else
+  echo "--- bringing up LOCAL stack (Ollama pulls the model on first run — be patient) ---"
+fi
 $COMPOSE up -d
 
-echo "--- waiting for Ollama to pull + load the model (this is the slow part) ---"
-# The compose healthcheck already gates litellm on ollama being ready; here we
-# just wait for the gateway to answer, which implies Ollama is healthy.
+echo "--- waiting for the gateway to become healthy ---"
+# Container mode: the compose healthcheck gates litellm on the Ollama container
+# being ready, so gateway-healthy implies model-served. Native mode: the model is
+# already pulled+served on the host (preflight above), so this is quick.
 for i in $(seq 1 180); do
   if curl -sf "$GATEWAY_URL/health/liveliness" >/dev/null 2>&1; then
     echo "gateway healthy (Ollama model is served)"

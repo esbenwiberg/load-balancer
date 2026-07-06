@@ -124,6 +124,19 @@ backend model is a single knob — `OLLAMA_MODEL` drives both what the entrypoin
 pulls and what the gateway requests (`model: os.environ/OLLAMA_MODEL`), so swapping
 it (e.g. `OLLAMA_MODEL=qwen2.5-coder:3b ./run.local.sh`) needs no other change.
 
+**Fast path — native Ollama on the host (GPU).** The slowness is a Docker-on-Mac
+limit, not a model limit: Apple's GPU is reachable only via Metal, which needs a
+native macOS process, and no Mac container runtime (Docker Desktop, Colima, Podman,
+Apple's `container` — all Linux VMs) exposes Metal to the guest; GPU-in-Docker is a
+Linux+NVIDIA thing. So `./run.local.sh --native-ollama` keeps the *gateway*
+containerized (prod parity + the pinned image — never a host `pip install litellm`,
+per risk 8) but points it at a *host-run* Ollama on the Metal GPU via
+`OLLAMA_API_BASE=http://host.docker.internal:11434/v1` (the same
+`api_base: os.environ/OLLAMA_API_BASE` knob). Inference drops from tens of minutes
+to a few. The fully-containerized default stays for portability + CI (and *is* the
+GPU path on a Linux/NVIDIA host). Decision: containerize where Docker helps (the
+SUT gateway), go native where it hurts (the GPU-bound model runner).
+
 **What the bring-ups found — the model ladder (the gate discriminates).** The
 gateway wiring is identical for every model; whether one goes green is a pure
 *model-quality* question, and the gate reports it faithfully:

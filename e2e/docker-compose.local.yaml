@@ -85,6 +85,11 @@ services:
       # switch drives BOTH the pull and what the gateway requests. The config
       # reads it via `model: os.environ/OLLAMA_MODEL` + custom_llm_provider.
       OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen3:8b}"
+      # Where the gateway reaches Ollama. Default = the in-network CONTAINER
+      # (CPU-only on a Mac). The --native-ollama variant overrides this to
+      # host.docker.internal so the gateway hits a host-run Ollama on the GPU.
+      # The config reads it via `api_base: os.environ/OLLAMA_API_BASE`.
+      OLLAMA_API_BASE: "${OLLAMA_API_BASE:-http://ollama:11434/v1}"
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]
