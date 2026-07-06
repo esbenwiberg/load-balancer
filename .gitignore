@@ -27,6 +27,9 @@ e2e/mockgate.log
 # the transpiled output). Keep .bicep / .bicepparam source; ignore built artifacts.
 deploy/azure/**/*.json
 
+# Playwright MCP session artifacts (browser traces/screenshots from agent runs)
+.playwright-mcp/
+
 # OS / editor
 .DS_Store
 *.swp
