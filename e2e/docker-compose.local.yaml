@@ -43,11 +43,16 @@ services:
       # Persist pulled models across runs so only the FIRST bring-up downloads.
       - ollama-models:/root/.ollama
     environment:
-      # The coding model the workbench serves. 3b is small enough to run CPU-only
-      # in Docker Desktop's Linux VM on a Mac; bump to qwen2.5-coder:7b (the
-      # documented fallback) if 3b's tool-calling can't clear the conformance
-      # threshold — a reversible call, no other change needed.
-      OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen2.5-coder:3b}"
+      # The coding model the workbench serves. Default qwen3:8b is the one that
+      # actually clears the conformance gate on this stack (agent_capable=true) —
+      # it structures tool calls AND drives the multi-turn Read->Edit->Bash loop.
+      # It's heavier/slower CPU-only in Docker Desktop's Linux VM on a Mac (thinking
+      # mode + 8B), so lighter alternatives are documented (each a one-var swap):
+      #   qwen3:4b        - structures tool calls + passes both probes, but won't
+      #                     drive the open-ended loop (answers in prose) -> red
+      #   qwen2.5-coder:3b/:7b - fast, but leak tool calls on Ollama -> red
+      # See e2e/README "Profile: local" -> "The model ladder". Reversible call.
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen3:8b}"
     ports:
       - "11434:11434"       # host-published so you can curl the model directly
     healthcheck:
@@ -79,7 +84,7 @@ services:
       # Same var (same default) the ollama service uses, so one OLLAMA_MODEL
       # switch drives BOTH the pull and what the gateway requests. The config
       # reads it via `model: os.environ/OLLAMA_MODEL` + custom_llm_provider.
-      OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen2.5-coder:3b}"
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen3:8b}"
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]

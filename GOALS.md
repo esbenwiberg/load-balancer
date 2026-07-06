@@ -150,20 +150,21 @@ decision is made.
 - ✅ 11. Budgets + rate limits per virtual key — `default_key_generate_params` (max_budget/rpm/tpm) in litellm-config.e2e.yaml so every issued key inherits a config default; e2e proves a bare key inherits the defaults, an over-budget key (max_budget:0) → clean 400 budget_exceeded, an over-rate-limit key (rpm:1) → clean 429 (never 5xx/hang); README documents the knobs + how to raise them + the goal-11/11b units boundary (dollar-spend accrual is 11b) — PR #? (2026-07)
 - ✅ 4. Local-model (Ollama) e2e profile — a dedicated `local` profile
   (`docker-compose.local.yaml` + committed keyless `litellm-config.local.yaml`)
-  running Ollama serving `qwen2.5-coder:3b` as the workbench behind the same
-  gateway; self-contained bring-up (`ollama-entrypoint.sh` pulls+warms the model,
-  healthcheck-gated so the gateway never boots against an empty Ollama);
+  running Ollama serving a real small coding model as the workbench behind the
+  same gateway; self-contained bring-up (`ollama-entrypoint.sh` pulls+warms the
+  model, healthcheck-gated so the gateway never boots against an empty Ollama);
   `run.local.sh` runs `conformance.py` THROUGH the gateway against the real model
   and surfaces the JSON verdict (alias stays `qwen3-coder` — only the backend
   swaps; `OLLAMA_MODEL` drives both the pull and what the gateway requests).
-  **Finding (surfaced, not hidden):** the gate returned `agent_capable=false` —
-  qwen2.5-coder (3b *and* 7b) leaks tool calls into content instead of emitting
-  structured `tool_calls` because it omits the `<tool_call>` wrapper Ollama's
-  template needs (reproduces direct-against-Ollama + both LiteLLM providers, so
-  it's the model+engine, not the gateway). That's the gate *working* against a
-  real backend — the profile's job. A green is a one-env-var model swap. Hard
-  constraint honoured: NEVER in CI — `run.sh`/CI use the mock profile only,
+  Hard constraint honoured: NEVER in CI — `run.sh`/CI use the mock profile only,
   `docker compose config` validates the file in the fast tier but starts no
   containers. Docs: e2e/README "Profile: local" + docs/08. Merge gate = mock
-  `e2e/run.sh` green. — PR #? (2026-07)
+  `e2e/run.sh` green. — PR #25 (2026-07)
+- ✅ 4 (follow-up). Local profile made GREEN — default model → `qwen3:8b`, which
+  clears the conformance gate for real (`agent_capable=true`): structured tool
+  calls, the full multi-turn Read→Edit→Bash task, and both probes, over streaming.
+  Established the model ladder (documented in e2e/README + docs/08): `qwen3:8b`
+  passes; `qwen3:4b` structures calls + passes probes but won't drive the loop
+  (answers in prose); `qwen2.5-coder:3b/:7b` leak tool calls (no `<tool_call>`
+  wrapper). Slow CPU-only (reasoning mode) but never a CI/merge gate. — PR #? (2026-07)
 - ✅ 14. Azure IaC skeleton — code only, offline-validated — Bicep (decision recorded over Terraform: `bicep build` validates fully offline; Azure-native; stateless) under `deploy/azure/`: `main.bicep` + modules for the gateway Container App (managed identity, Key Vault–referenced secrets, parameterised ingress), PostgreSQL Flexible Server (private persistent store), Key Vault (secrets + MI RBAC), and VNet (delegated subnets + NSG). Secrets are required `@secure()` params with no defaults; `main.example.bicepparam` carries commit-safe placeholders. `scripts/check.sh` fast tier gained an offline `bicep build`/`build-params` step (fails on ANY diagnostic, no cloud calls/creds), CI installs bicep via `az bicep install`, and the litellm image-pin guard now also covers `.bicep`. Parity doc [docs/11](docs/11-azure-iac.md) maps every dev-stack component to its Azure counterpart (with the deliberate gaps named). — PR #? (2026-07)

@@ -7,7 +7,7 @@ without real Foundry or Sparks. Four profiles behind the same gateway config:
 |---|---|---|---|
 | **mock** (default, CI) | ONE `mockd` — a controllable fake speaking OpenAI Chat + Responses, serving every alias | protocol translation, the Responses bridge, fallback, cooldown, virtual-key scoping, streaming | free, offline, deterministic |
 | **dev** (standing fixture) | THREE `mockd` containers — two distinct workbench slots + a mock-Foundry, each stamping its own instance identity | the full local topology as a leave-it-running dev target you point a real client at; per-instance load/faults | free, offline; stays up until torn down |
-| **local** (opt-in, manual) | REAL small coding model (`qwen2.5-coder:3b`) served by **Ollama** as the workbench | runs the `agent_capable` gate against a **real** model, **no keys, no ToS, offline** | free, offline; heavy (multi-GB model + CPU inference). **Never in CI** |
+| **local** (opt-in, manual) | REAL small coding model (`qwen3:8b`) served by **Ollama** as the workbench | runs the `agent_capable` gate against a **real** model (default passes: `agent_capable=true`), **no keys, no ToS, offline** | free, offline; heavy (multi-GB model + CPU inference). **Never in CI** |
 | **cli-auth** (opt-in, manual) | REAL hosted models — Haiku as the "workbench", bigger models as "Foundry" | the real Claude Code / Codex client path end-to-end | needs API keys; hits the internet |
 
 All leave the **system under test** — the gateway + its config — identical to
@@ -405,17 +405,18 @@ balancer's logic, useless for measuring a model's `agent_capable` quality (it
 would always "pass"). `cli-auth` gives a real model but needs API keys and hits
 the internet. The **local** profile is the third leg: it points
 [`conformance.py`](../conformance/conformance.py) — the harness that *earns*
-`agent_capable` — at a real small coding model (**`qwen2.5-coder:3b`** on
+`agent_capable` — at a real small coding model (**`qwen3:8b`** on
 [Ollama](https://ollama.com)) behind the gateway, with **no keys, no ToS, and no
 network** once the model is pulled. It's the closest analog to a Spark workbench
 until real Sparks arrive — and the stand-in for one meanwhile.
 
-> **What the gate actually returns here is a *real result*, not a rubber stamp.**
-> Pointed at `qwen2.5-coder`, conformance reports **`agent_capable=false`** — the
-> model leaks tool calls into content instead of emitting structured `tool_calls`
-> (see [What conformance found](#what-conformance-found-the-gate-works) below).
-> That's the profile working *correctly*: it ran the real gate against a real
-> backend and the gate discriminated — exactly what mockd can't do for you.
+> **The default model clears the gate for real: `agent_capable=true`.** Pointed at
+> `qwen3:8b`, conformance passes end-to-end — structured tool calls (no leak into
+> content), the full Read→Edit→Bash task completed, and both probes (parallel +
+> `tool_choice:required`) honored, all over streaming. Not every model does — see
+> [The model ladder](#the-model-ladder-what-passes-and-what-doesnt) below for what
+> fails and why. That's the profile working *correctly*: it runs the real gate
+> against a real backend and the gate *discriminates* — exactly what mockd can't.
 
 ```bash
 cd e2e
@@ -424,6 +425,11 @@ cd e2e
 ./run.local.sh --api chat      # wire protocol: chat | responses | anthropic
 ./run.local.sh --runs 3        # more runs for a stabler error rate
 ```
+
+> **Heads-up: the green default is slow on CPU.** `qwen3:8b` uses reasoning
+> ("thinking") mode, which is what lets it drive the multi-step loop — but on a Mac
+> (CPU-only, see below) a full run can take **10–20+ minutes**. That's the price of
+> a real green here; lighter (red) models are one env var away — see the ladder.
 
 `run.local.sh` brings up `docker-compose.local.yaml` (just **Ollama + the
 gateway** — no Postgres, no mockd), waits until the model is pulled *and loaded*,
@@ -451,46 +457,50 @@ wipes them).
 ### The Mac CPU-only-in-Docker caveat
 
 On a Mac, Docker Desktop runs Linux containers in a **lightweight VM with no GPU
-passthrough** — so Ollama here runs **CPU-only**. `qwen2.5-coder:3b` is chosen to
-fit that: small enough to run on CPU in the VM. Consequences:
+passthrough** — so Ollama here runs **CPU-only**. Consequences:
 
-- **It's slow.** A cold multi-turn Read→Edit→Bash run can take minutes (the
-  config sets a 600s gateway timeout for exactly this). This is why the profile
-  is **manual and never in CI** — see below.
+- **It's slow.** A cold multi-turn Read→Edit→Bash run can take minutes to tens of
+  minutes (the config sets a 600s gateway timeout for exactly this) — and the
+  green default `qwen3:8b`, with reasoning mode, is at the slow end. This is a
+  core reason the profile is **manual and never in CI** — see below.
 - **The backend model is one env var.** `OLLAMA_MODEL` drives **both** what the
   Ollama entrypoint pulls **and** what the gateway requests (the config reads it
   via `model: os.environ/OLLAMA_MODEL`), so swapping the model is a single knob
   with no other change:
   ```bash
-  OLLAMA_MODEL=qwen2.5-coder:7b ./run.local.sh   # the documented larger sibling
+  OLLAMA_MODEL=qwen2.5-coder:3b ./run.local.sh   # faster, but red (see the ladder)
   ```
 
-### What conformance found (the gate works)
+### The model ladder (what passes, and what doesn't)
 
-The first bring-up pointed conformance at `qwen2.5-coder` through the gateway and
-surfaced a **real** result — the kind of thing the gate exists to catch:
+Getting a real model green on this stack is a *model-quality* question — the
+gateway wiring is identical for all of them. What we measured (CPU-only, Mac):
 
-| Model | Tool call emitted | Structured `tool_calls`? | `agent_capable` |
-|---|---|---|---|
-| `qwen2.5-coder:3b` | `{"city": {"type":"string","value":"Paris"}}` — **malformed** (echoes the schema) | ❌ leaked into content | **false** |
-| `qwen2.5-coder:7b` | `{"city": "Paris"}` — **valid args** | ❌ *still* leaked into content | **false** |
+| Model | Structured `tool_calls`? | Probes (parallel + `tool_choice`) | Drives the multi-turn task? | `agent_capable` |
+|---|---|---|---|---|
+| **`qwen3:8b`** (default) | ✅ clean (thinking kept out of `content`) | ✅ both honored | ✅ read→edit→test→pass in ~4 turns | **✅ true** |
+| `qwen3:4b` | ✅ clean | ✅ both honored | ❌ answers in prose, makes 0 tool calls | ❌ false |
+| `qwen2.5-coder:7b` | ❌ leaks (`{"city":"Paris"}` valid args, but unwrapped) | — | — | ❌ false |
+| `qwen2.5-coder:3b` | ❌ leaks (`{"city":{"type":"string",…}}` malformed) | — | — | ❌ false |
 
-**Root cause (diagnosed, not guessed):** qwen2.5-coder's Ollama template requires
-the model to wrap calls in `<tool_call>…</tool_call>` for Ollama's parser to
-populate structured `tool_calls`. Both sizes emit the bare JSON *without* the
-wrapper, so Ollama returns it unparsed in `content` and conformance's leak
-detector (correctly) flags it. This reproduces **direct against Ollama** (both
-its native `/api/chat` and OpenAI-compat `/v1`) and through **both** LiteLLM
-providers (`openai/` and `ollama_chat/`) — so it's the **model+engine**, not the
-gateway. The gateway faithfully passes through what Ollama returns.
+Two distinct failure modes, both real and both caught by the gate:
+
+1. **qwen2.5-coder leaks (never structures a call).** Its Ollama template requires
+   the model to wrap calls in `<tool_call>…</tool_call>` for Ollama's parser to
+   populate structured `tool_calls`; the model omits the wrapper, so Ollama returns
+   the call unparsed in `content`. Reproduces **direct against Ollama** (native
+   `/api/chat` *and* OpenAI-compat `/v1`) and through **both** LiteLLM providers
+   (`openai/`, `ollama_chat/`) — so it's the model+engine, not the gateway.
+2. **qwen3:4b structures calls but won't *drive* the loop.** It nails direct
+   single-turn imperatives (both probes pass) but, on the open-ended task, thinks
+   and then answers in *prose* instead of calling tools — despite the system prompt
+   forbidding exactly that. A capability gap the 8B doesn't have.
 
 This is the whole point of separating *plumbing* from *model quality* (see
-[docs/08](../docs/08-e2e-testing.md)): the profile's job is to run the real gate
-against a real backend and report a trustworthy verdict — which it does. Getting
-a **green** is then a model-choice question: swap `OLLAMA_MODEL` to a model whose
-Ollama build emits structured tool calls (e.g. a `llama3.1` / `qwen3`-family tag
-with a working tool template). That swap is the reversible knob above; the
-profile, config, and conformance wiring don't change.
+[docs/08](../docs/08-e2e-testing.md)): the profile runs the real gate against a
+real backend and returns a trustworthy verdict. `qwen3:8b` earns the green;
+swapping `OLLAMA_MODEL` (the reversible knob above) points it at any other model
+without touching the profile, config, or conformance wiring.
 
 ### Hard constraint: NEVER in CI
 
@@ -588,7 +598,7 @@ litellm-config.dev.yaml      dev-profile config (workbench-a/-b + foundry, disti
 docker-compose.dev.yaml      dev stack: litellm + 2 workbenches + foundry + dashboard + control-plane + postgres (stays up)
 dev_smoke.sh                 dev-profile smoke: all 3 surfaces -> 3 distinct containers + fleet view live
 
-litellm-config.local.yaml    local-profile config (workbench alias -> real qwen2.5-coder:3b on Ollama; committed, keyless)
+litellm-config.local.yaml    local-profile config (workbench alias -> real qwen3:8b on Ollama; committed, keyless)
 docker-compose.local.yaml    local stack: litellm + ollama only (no postgres/mockd); NEVER run in CI
 ollama-entrypoint.sh         ollama container entrypoint: pull + warm the model, healthcheck-gated (self-contained)
 run.local.sh                 up -> conformance THROUGH the gateway vs the real model -> teardown (manual, heavy)
