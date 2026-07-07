@@ -23,6 +23,12 @@ It emits two record shapes, keyed by `event`:
                 the delivered tokens and cost. This reliably names the chosen
                 backend even when it was reached via fallback.
 
+                WHO asked (goal 15): also carries {key_alias, user_id, team_id}
+                sourced from the request's UserAPIKeyAuth — the virtual key's
+                alias and the user/team it was minted for (goal 11b). All three
+                are null under the master key / no key store, so the bare-pytest
+                and cli-auth profiles are unaffected.
+
 Sinks (independent, both optional):
 
   * stdout  — ALWAYS. One JSON object per line, prefixed `ROUTING_RECORD `.
@@ -97,6 +103,34 @@ def _tier(kwargs) -> str | None:
     return (md.get("model_info") or {}).get("backend_tier")
 
 
+def _identity(user_api_key_dict) -> dict:
+    """The synthetic identity of the CALLER, read off LiteLLM's UserAPIKeyAuth
+    (the `user_api_key_dict` the success hook receives and, until goal 15, threw
+    away). Answers *who* asked — the alias of the virtual key, and the user/team
+    it was minted for (goal 11b's key->user->team binding).
+
+    All three are None when the MASTER KEY or NO key store is in play: the master
+    key carries no alias/user/team, and the bare-pytest + cli-auth profiles
+    authenticate with the master key. So those profiles keep working and simply
+    carry a null identity — never a crash, never a bogus id. Any attribute-read
+    hiccup also degrades to None (identity must never break the request path)."""
+
+    def _get(attr):
+        try:
+            v = getattr(user_api_key_dict, attr, None)
+        except Exception:  # pragma: no cover - defensive
+            return None
+        # Treat empty string / "default" sentinels the same as absent so a
+        # rollup groups them under "no key" rather than a phantom identity.
+        return v if v not in ("", None) else None
+
+    return {
+        "key_alias": _get("key_alias"),
+        "user_id": _get("user_id"),
+        "team_id": _get("team_id"),
+    }
+
+
 def _llm_call_record(kwargs, fallback_status: str) -> dict:
     """Build an `llm_call` record from a success/failure event's kwargs."""
     slo = kwargs.get("standard_logging_object") or {}
@@ -149,25 +183,28 @@ class RoutingRecorder(CustomLogger):
         usage_d = usage.model_dump() if hasattr(usage, "model_dump") else {}
         requested = data.get("model")
         served = getattr(response, "model", None)
-        _emit(
-            {
-                "event": "delivered",
-                "requested_model": requested,
-                "served_model": served,
-                "served_model_id": (hp.get("model_id") or "")[:12] or None,
-                "api_base": hp.get("api_base"),
-                "provider": hp.get("custom_llm_provider"),
-                "response_cost": hp.get("response_cost"),
-                "tokens": {
-                    "prompt": usage_d.get("prompt_tokens"),
-                    "completion": usage_d.get("completion_tokens"),
-                    "total": usage_d.get("total_tokens"),
-                },
-                # A fallback served the request iff the backend that answered is
-                # not the alias the client requested.
-                "fallback": bool(requested and served and requested != served),
-            }
-        )
+        record = {
+            "event": "delivered",
+            "requested_model": requested,
+            "served_model": served,
+            "served_model_id": (hp.get("model_id") or "")[:12] or None,
+            "api_base": hp.get("api_base"),
+            "provider": hp.get("custom_llm_provider"),
+            "response_cost": hp.get("response_cost"),
+            "tokens": {
+                "prompt": usage_d.get("prompt_tokens"),
+                "completion": usage_d.get("completion_tokens"),
+                "total": usage_d.get("total_tokens"),
+            },
+            # A fallback served the request iff the backend that answered is
+            # not the alias the client requested.
+            "fallback": bool(requested and served and requested != served),
+        }
+        # WHO asked (goal 15): stamp the caller's synthetic identity onto the
+        # delivered record. Null under the master key / no key store, so the
+        # bare-pytest + cli-auth profiles are unaffected.
+        record.update(_identity(user_api_key_dict))
+        _emit(record)
 
 
 routing_recorder = RoutingRecorder()

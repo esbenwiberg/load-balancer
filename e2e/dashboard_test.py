@@ -133,5 +133,97 @@ class TestFetchFleet(unittest.TestCase):
         self.assertFalse(by_wb["wb-b"]["healthy"])
 
 
+# --- identity in routing records (goal 15) ----------------------------------
+# The e2e suite (test_e2e.py) proves the minted-key -> dashboard path end to end
+# against the live gateway; these cover the record-shaping OFFLINE — that the
+# per-request view carries the identity fields and the per-key rollup aggregates
+# correctly, including the null-identity (master key / no key store) collapse.
+
+
+def _delivered(**kw):
+    """A minimal `delivered` record like obs_callback emits (goal 3 + 15)."""
+    rec = {
+        "event": "delivered",
+        "requested_model": "qwen3-coder",
+        "served_model": "qwen3-coder",
+        "fallback": False,
+        "response_cost": 0.01,
+        "tokens": {"total": 16},
+    }
+    rec.update(kw)
+    return rec
+
+
+class TestRequestsViewIdentity(unittest.TestCase):
+    def test_request_row_carries_identity(self):
+        recs = [_delivered(key_alias="repo-a", user_id="test-user", team_id="team-x")]
+        row = dashboard._requests_view(recs)[0]
+        self.assertEqual(row["key_alias"], "repo-a")
+        self.assertEqual(row["user_id"], "test-user")
+        self.assertEqual(row["team_id"], "team-x")
+
+    def test_null_identity_passes_through(self):
+        # Master key / no key store: obs_callback stamps nulls; the view keeps them.
+        row = dashboard._requests_view([_delivered()])[0]
+        self.assertIsNone(row["key_alias"])
+        self.assertIsNone(row["user_id"])
+        self.assertIsNone(row["team_id"])
+
+
+class TestKeyRollup(unittest.TestCase):
+    def test_rollup_aggregates_per_key(self):
+        recs = [
+            _delivered(
+                key_alias="repo-a",
+                user_id="u1",
+                team_id="t1",
+                tokens={"total": 10},
+                response_cost=0.02,
+            ),
+            _delivered(
+                key_alias="repo-a",
+                user_id="u1",
+                team_id="t1",
+                tokens={"total": 6},
+                response_cost=0.01,
+                fallback=True,
+            ),
+            _delivered(
+                key_alias="repo-b",
+                user_id="u2",
+                team_id="t1",
+                tokens={"total": 8},
+                response_cost=0.03,
+            ),
+        ]
+        rows = dashboard._key_rollup(recs)
+        by_alias = {r["key_alias"]: r for r in rows}
+        a = by_alias["repo-a"]
+        self.assertEqual(a["requests"], 2)
+        self.assertEqual(a["fallbacks"], 1)
+        self.assertEqual(a["tokens"], 16)
+        self.assertAlmostEqual(a["cost"], 0.03)
+        self.assertEqual(a["user_id"], "u1")
+        self.assertEqual(a["team_id"], "t1")
+        b = by_alias["repo-b"]
+        self.assertEqual(b["requests"], 1)
+        self.assertEqual(b["fallbacks"], 0)
+        # Busiest-first ordering: repo-a (2 requests) precedes repo-b (1).
+        self.assertEqual(rows[0]["key_alias"], "repo-a")
+
+    def test_null_identity_collapses_into_one_row(self):
+        # Master-key traffic (no alias) all folds into a single null-alias row,
+        # never scattered or dropped — so the rollup stays honest without a key
+        # store in play.
+        rows = dashboard._key_rollup([_delivered(), _delivered()])
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["key_alias"])
+        self.assertEqual(rows[0]["requests"], 2)
+
+    def test_ignores_non_delivered_events(self):
+        rows = dashboard._key_rollup([{"event": "llm_call", "key_alias": "x"}])
+        self.assertEqual(rows, [])
+
+
 if __name__ == "__main__":
     unittest.main()
