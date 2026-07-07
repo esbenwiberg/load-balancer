@@ -32,7 +32,9 @@ an internal compose network only):
                     "mode": "agent|leak|runaway|malformed|hangup|echo",
                     "count": 2}      # apply to next N requests, then auto-clear
   GET  /__control                    # dump current directives
-  POST /__reset                      # clear all directives + routing records
+  GET  /__requests                   # dump inbound /v1/* requests (headers+body,
+                                     #   secrets redacted) — goal-17 spike
+  POST /__reset                      # clear directives + records + captures
   GET  /health                       # 200 (liveness)
 
 Observability sink (goal 3 — the gateway's obs_callback POSTs routing records
@@ -281,6 +283,77 @@ class Observations:
 
 OBSERVATIONS = Observations()
 
+
+class RequestCapture:
+    """Thread-safe capture of the inbound requests mockd receives on `/v1/*`, for
+    the goal-17 session-metadata spike.
+
+    It lets the dev-stack DUMP exactly what identity/session metadata a real
+    coding agent's request carries by the time it reaches the BACKEND (i.e. after
+    the gateway hop translated + forwarded it). Point `claude`/`codex` at the dev
+    gateway, then `GET /__requests` on mockd to read the forwarded headers+body.
+
+    Secrets never land in a dump: any header whose name looks credential-bearing
+    (authorization / *api-key* / *token* / *secret*) has its VALUE redacted —
+    presence + auth scheme are recorded, the credential is not — so a dump is
+    safe to print in CI logs or paste into a doc. Read via GET /__requests;
+    cleared by /__reset alongside the other sinks so captures never leak across
+    serially-run tests."""
+
+    _CAP = 1000  # bound memory across a long-lived dev stack; oldest are dropped.
+    _SECRET_HEADERS = ("authorization", "proxy-authorization")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._reqs = []
+
+    @classmethod
+    def _is_secret(cls, name: str) -> bool:
+        lk = name.lower()
+        return (
+            lk in cls._SECRET_HEADERS
+            or "api-key" in lk
+            or "token" in lk
+            or "secret" in lk
+        )
+
+    @classmethod
+    def _redact_headers(cls, headers) -> dict:
+        out = {}
+        for k, v in headers.items():
+            if cls._is_secret(k):
+                # Keep the scheme (e.g. "Bearer") so the shape is visible, but
+                # drop the credential itself.
+                scheme = v.split(" ", 1)[0] if v and " " in v else ""
+                out[k] = (scheme + " <redacted>").strip() if scheme else "<redacted>"
+            else:
+                out[k] = v
+        return out
+
+    def capture(self, method: str, path: str, headers, body) -> None:
+        with self._lock:
+            self._reqs.append(
+                {
+                    "method": method,
+                    "path": path,
+                    "headers": self._redact_headers(headers),
+                    "body": body if isinstance(body, dict) else {},
+                }
+            )
+            if len(self._reqs) > self._CAP:
+                self._reqs = self._reqs[-self._CAP :]
+
+    def all(self) -> list:
+        with self._lock:
+            return json.loads(json.dumps(self._reqs))
+
+    def reset(self) -> None:
+        with self._lock:
+            self._reqs = []
+
+
+REQUESTS = RequestCapture()
+
 # --- Inline directive parsing ----------------------------------------------
 
 _INLINE_RE = re.compile(r"\[\[mockd:([^\]]+)\]\]")
@@ -493,6 +566,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/__observe"):
             # Routing records the gateway's obs_callback has POSTed so far.
             return self._json(200, {"records": OBSERVATIONS.all()})
+        if self.path.startswith("/__requests"):
+            # goal-17 spike: the inbound /v1/* requests captured so far
+            # (headers + body, secrets redacted) — what reached the backend.
+            return self._json(200, {"requests": REQUESTS.all()})
         return self._json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -507,6 +584,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/__reset"):
             CONTROL.reset()
             OBSERVATIONS.reset()  # records must not leak across tests either
+            REQUESTS.reset()  # captured inbound requests must not leak either
             return self._json(200, {"ok": True})
         # Count real inference toward this instance's live load (goal 13), so the
         # heartbeat producer reports a truthful in_flight. The `with` decrements
@@ -551,6 +629,7 @@ class Handler(BaseHTTPRequestHandler):
     # --- chat completions ---------------------------------------------------
     def _handle_chat(self):
         body = self._read_body()
+        REQUESTS.capture(self.command, self.path, self.headers, body)
         model = body.get("model", "")
         messages = body.get("messages", [])
         tools = body.get("tools")
@@ -670,6 +749,7 @@ class Handler(BaseHTTPRequestHandler):
     # --- responses api ------------------------------------------------------
     def _handle_responses(self):
         body = self._read_body()
+        REQUESTS.capture(self.command, self.path, self.headers, body)
         model = body.get("model", "")
         input_items = body.get("input", [])
         if isinstance(input_items, str):  # Responses allows a bare string
@@ -822,7 +902,7 @@ def main():
     # Start pushing heartbeats to the control-plane if configured (dev stack).
     _start_heartbeat()
     print(
-        "mockd listening on http://%s:%d (chat + responses + /__control + /__observe)%s"
+        "mockd listening on http://%s:%d (chat + responses + /__control + /__observe + /__requests)%s"
         % (host, port, ident)
     )
     try:
