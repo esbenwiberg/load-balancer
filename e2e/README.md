@@ -553,6 +553,121 @@ are). No Foundry, no hosted model, no data egress.
 
 ---
 
+## Profile: manual — the live end-to-end demo (real model + fallback + audit) (goal 19)
+
+The single stack that tells the **whole story** at once, driven by hand and
+watched: a real client (Claude Code / Codex / curl) → the gateway (SUT) → a
+**REAL** small coding model on your **host Ollama** as the primary workbench,
+falling back to a **mock Foundry** tier, with the **audit dashboard** rendering
+every hop live. It combines what `local` proves (real tool-calling, offline,
+keyless) with what `dev` proves (tiered fallback + the routing dashboard) into
+one demoable path.
+
+Two files define it — both **committed, both carry no secrets** (master key from
+env, Ollama is auth-less, mockd ignores auth):
+[`docker-compose.manual.yaml`](docker-compose.manual.yaml) and
+[`litellm-config.manual.yaml`](litellm-config.manual.yaml).
+
+> **HARD CONSTRAINT — NEVER in CI, NEVER in `run.sh`.** It needs a host Ollama
+> and is meant to be watched, not asserted on. Nothing wires it into the merge
+> gate: `e2e/run.sh` and CI use the **mock** profile only. `scripts/check.sh`'s
+> fast tier *does* run `docker compose config` on this file (pure schema
+> validation — **not** `up`, starts no containers), exactly like the `local`
+> profile. That's the only automation it ever touches.
+
+Topology (two containers + your host Ollama):
+
+```
+host    Ollama (NATIVE, you run it)   qwen3:8b on the GPU — the primary workbench
+:4000   litellm gateway               clients + conformance.py hit this (SUT)
+:9103   foundry  (mockd)              the mock fallback tier (claude-*/gpt)
+:9300   dashboard                      open it — watch the primary→fallback hop live
+```
+
+### Prereq: a host Ollama (native)
+
+The gateway talks to Ollama on the **host** over `host.docker.internal:11434`, so
+Ollama must listen on an interface the container VM can reach:
+
+```bash
+brew install ollama                    # once (or the Ollama.app / Linux install)
+OLLAMA_HOST=0.0.0.0 ollama serve       # daemon on an iface the VM sees
+ollama pull qwen3:8b                    # the model the gateway will request
+```
+
+Running the model natively (Metal on a Mac, or an NVIDIA host) is why this is the
+*fast* real-model path — see "Fast path: native Ollama on the host" under the
+`local` profile for the why.
+
+### Bring-up
+
+```bash
+cd e2e
+docker compose -f docker-compose.manual.yaml up -d
+# then open the audit dashboard and drive traffic through :4000:
+open http://localhost:9300
+../.venv-e2e/bin/python ../conformance/conformance.py \
+  --base-url http://localhost:4000/v1 --api anthropic \
+  --model qwen3-coder --api-key "${LITELLM_MASTER_KEY:-sk-manual-master-test-key}" --runs 1
+```
+
+Every prompt lands on the dashboard as a routing record — normally served by
+`qwen3-coder` on your host Ollama (`backend_tier=local`).
+
+### The echo-mode step — make the fallback tier unmistakable
+
+Put the mock Foundry into **echo mode** so anything it serves comes back as a
+literal `"mockd echo."` — a dead-giveaway that the *fallback* answered rather
+than the real model:
+
+```bash
+curl -sX POST http://localhost:9103/__control \
+  -d '{"model": "*", "mode": "echo"}'
+```
+
+`:9103` is the host-published port of the `foundry` mockd, so you drive its
+`/__control` without touching the gateway.
+
+### The kill-Ollama fallback demo
+
+Now stop the primary and watch the gateway fail over to the mock Foundry:
+
+```bash
+# 1. kill the host Ollama (Ctrl-C the `ollama serve`, or:)
+pkill -f 'ollama serve'
+
+# 2. send a request — qwen3-coder is down, so the gateway falls through the
+#    chain (claude-sonnet → claude-opus → gpt), all on the mock Foundry:
+curl -s http://localhost:4000/v1/chat/completions \
+  -H "Authorization: Bearer ${LITELLM_MASTER_KEY:-sk-manual-master-test-key}" \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "qwen3-coder", "messages": [{"role": "user", "content": "ping"}]}'
+# -> content is "mockd echo." — the fallback tier served it.
+```
+
+On the dashboard (`http://localhost:9300`) you'll see two records for that
+prompt: a failed `qwen3-coder` attempt (`backend_tier=local`) then a delivered
+`claude-sonnet` (`backend_tier=foundry`) — the primary→fallback hop, live. Bring
+Ollama back (`OLLAMA_HOST=0.0.0.0 ollama serve`) and, after the cooldown expires,
+traffic returns to the real model.
+
+### Teardown
+
+```bash
+docker compose -f docker-compose.manual.yaml down -v
+```
+
+(and stop/restart your host `ollama serve` as you like — it's not part of the
+compose stack).
+
+### Org data-governance guardrail
+
+The model runs on your machine (offline, keyless) and the fallback tier is a
+mock — so no data egress. Keep prompts synthetic anyway. No Foundry, no hosted
+model. In doubt → **DISCO**.
+
+---
+
 ## Profile: cli-auth (real models, opt-in)
 
 Drive **real** Claude Code / Codex through the balancer, with a small model
