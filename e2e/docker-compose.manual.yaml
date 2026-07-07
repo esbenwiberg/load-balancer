@@ -1,0 +1,127 @@
+# =============================================================================
+# MANUAL try-out profile (goal 19) — the project's best LIVE DEMO, by hand.
+#
+# What it shows off: a real client (Claude Code / Codex) -> the gateway (SUT,
+# unchanged) -> a REAL small coding model on your HOST Ollama as the primary
+# workbench, with a MOCK Foundry tier behind it for fallback, and the audit
+# dashboard rendering every hop live. It exists to be DRIVEN by hand and watched,
+# not asserted on — that is why it is separate from the mock gate (run.sh).
+#
+# Topology:
+#   host        Ollama (NATIVE, not a container) — you run it; serves qwen3:8b on
+#               the Metal GPU (fast). The gateway reaches it over
+#               host.docker.internal:11434. Auth-less (Ollama needs no key).
+#   :4000       litellm gateway   — clients + conformance.py hit this (SUT)
+#   :9103       foundry           — mockd, MOCKD_INSTANCE=mock-foundry; the
+#                                   always-up mock fallback tier (claude-*/gpt).
+#                                   Host-published so you can drive /__control
+#                                   (e.g. put it in echo mode for the demo).
+#   :9300       dashboard         — the "where did my prompt go?" audit viewer.
+#                                   Open http://localhost:9300 and watch the
+#                                   primary->fallback hop land live.
+#
+# PREREQ — a HOST Ollama (see e2e/README "Profile: manual"):
+#   brew install ollama            # or the Ollama.app / Linux install
+#   OLLAMA_HOST=0.0.0.0 ollama serve   # listen on an iface the container VM sees
+#   ollama pull qwen3:8b               # the model the gateway will request
+#
+# Bring-up / teardown (BY HAND — never in CI, never wired into run.sh):
+#   docker compose -f docker-compose.manual.yaml up -d
+#   docker compose -f docker-compose.manual.yaml down -v
+#
+# vs the other profiles: NO Postgres + NO control-plane (this profile mints no
+# virtual keys and drives no fleet view — the master key authenticates directly,
+# keeping the container count to two). The gateway stays containerized on the
+# vetted pinned image on purpose (prod parity; never a host `pip install litellm`
+# — docs/03 risk 8). `docker compose config` (fast-tier lint) validates this
+# file's SCHEMA but starts no containers — validation is not a run.
+# =============================================================================
+
+x-mockd: &mockd
+  # Stdlib-only daemon: any modern python image works, no pip install.
+  image: python:3.12-slim
+  working_dir: /app
+  volumes:
+    - ./mockd.py:/app/mockd.py:ro
+  command: ["python", "mockd.py"]
+
+services:
+  foundry:
+    <<: *mockd
+    container_name: manual-foundry
+    environment:
+      MOCKD_PORT: "9100"
+      MOCKD_HOST: "0.0.0.0"
+      MOCKD_INSTANCE: "mock-foundry"
+      MOCKD_DEBUG: "${MOCKD_DEBUG:-}"
+    ports:
+      - "9103:9100"        # host-published so you can drive /__control (echo mode)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9100/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
+  dashboard:
+    # The read-only audit viewer + routing-record sink. Leave the stack up and
+    # open http://localhost:9300 to watch each prompt's route (and the
+    # primary->fallback hop) land live as you drive traffic through :4000.
+    image: python:3.12-slim
+    container_name: manual-dashboard
+    working_dir: /app
+    volumes:
+      - ./dashboard.py:/app/dashboard.py:ro
+    command: ["python", "dashboard.py"]
+    environment:
+      DASH_PORT: "9300"
+      DASH_HOST: "0.0.0.0"
+    ports:
+      - "9300:9300"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9300/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
+  litellm:
+    # Same pinned, vetted image as deploy/ + e2e/ + dev/ + local/ (docs/03 risk 8
+    # — never 1.82.7/1.82.8). The check.sh pin guard enforces this exact tag.
+    image: ghcr.io/berriai/litellm:v1.83.14-stable
+    container_name: litellm-manual
+    depends_on:
+      foundry:
+        condition: service_healthy
+      dashboard:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./litellm-config.manual.yaml:/app/config.yaml:ro
+      # Observability callback — sits next to the config so LiteLLM can import
+      # `obs_callback.routing_recorder` (it adds the config dir to sys.path).
+      - ./obs_callback.py:/app/obs_callback.py:ro
+    # host.docker.internal resolves to the host from inside the container VM; the
+    # host Ollama must listen on an interface the VM can reach
+    # (OLLAMA_HOST=0.0.0.0 when you start the daemon — see the prereq above).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Test-only master key — NOT a secret. Overridable via your env.
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-manual-master-test-key}"
+      # Selects the model; your HOST Ollama must have it pulled (see prereq).
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen3:8b}"
+      # Talk to the HOST Ollama (native, GPU) — the config reads this via
+      # `api_base: os.environ/OLLAMA_API_BASE`.
+      OLLAMA_API_BASE: "${OLLAMA_API_BASE:-http://host.docker.internal:11434/v1}"
+      # Fan routing records to the dashboard sink so http://localhost:9300 shows
+      # every prompt's route live (same callback the dev/e2e/deploy configs use).
+      OBS_WEBHOOK_URL: "http://dashboard:9300/records"
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s

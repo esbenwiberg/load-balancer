@@ -112,17 +112,6 @@ model "wins" on paper while feeling dead).
 llm_call records for streamed responses carry ttft_ms measured from LiteLLM's own timestamps (completion_start_time or a verified equivalent — verified against the pinned 1.83.x, not guessed; if the pinned version exposes no usable timestamp, complete by documenting that finding in docs/09 instead), the dashboard surfaces it, and an e2e test asserts a streamed request's record has ttft_ms present and <= latency_ms; non-streamed records may omit it; the docs/09 streaming caveat is updated; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR
 ```
 
-### 19. Promote the manual try-out stack to a committed profile — risk: low
-**Why:** `e2e/docker-compose.manual.yaml` + `e2e/litellm-config.manual.yaml`
-are the project's best live demo (Claude Code → gateway → real host-Ollama vs
-mock Foundry, fallback + audit dashboard) and sit untracked — one `git clean`
-from gone, walkthrough living in one head. The config states and needs no
-secrets (Ollama is auth-less; master key from env) — verify that before commit.
-**Completion condition:**
-```
-the two e2e/*.manual.* files are committed with an e2e/README "Profile: manual" walkthrough (host-Ollama prereq, bring-up, the echo-mode step, the kill-Ollama fallback demo, teardown) after a secrets scan of both files shows no credentials; hard constraint: NEVER wired into CI or run.sh — at most `docker compose config` validation in the fast tier like the local profile; e2e/run.sh (mock) exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked, stop after 20 turns and leave a draft PR
-```
-
 ---
 
 ## § Needs-a-human (do NOT run unattended)
@@ -229,3 +218,4 @@ decision is made.
   (answers in prose); `qwen2.5-coder:3b/:7b` leak tool calls (no `<tool_call>`
   wrapper). Slow CPU-only (reasoning mode) but never a CI/merge gate. — PR #26 (2026-07)
 - ✅ 14. Azure IaC skeleton — code only, offline-validated — Bicep (decision recorded over Terraform: `bicep build` validates fully offline; Azure-native; stateless) under `deploy/azure/`: `main.bicep` + modules for the gateway Container App (managed identity, Key Vault–referenced secrets, parameterised ingress), PostgreSQL Flexible Server (private persistent store), Key Vault (secrets + MI RBAC), and VNet (delegated subnets + NSG). Secrets are required `@secure()` params with no defaults; `main.example.bicepparam` carries commit-safe placeholders. `scripts/check.sh` fast tier gained an offline `bicep build`/`build-params` step (fails on ANY diagnostic, no cloud calls/creds), CI installs bicep via `az bicep install`, and the litellm image-pin guard now also covers `.bicep`. Parity doc [docs/11](docs/11-azure-iac.md) maps every dev-stack component to its Azure counterpart (with the deliberate gaps named). — PR #24 (2026-07)
+- ✅ 19. Promote the manual try-out stack to a committed profile — PR #30 (2026-07)

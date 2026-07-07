@@ -1,0 +1,112 @@
+# =============================================================================
+# MANUAL try-out profile gateway config (goal 19) — the SAME gateway (SUT), wired
+# for the project's best LIVE DEMO: a real client -> the gateway -> a REAL model
+# on your HOST Ollama as the primary workbench, falling back to a MOCK Foundry
+# tier, with the audit dashboard rendering every hop.
+#
+# WHY THIS PROFILE EXISTS: it is the one stack that shows the WHOLE story end to
+# end in a way you can watch — real tool-calling on a real model (like `local`),
+# plus fallback across tiers and the routing-record dashboard (like `dev`). It is
+# meant to be driven BY HAND (Claude Code / Codex / curl) and observed, not
+# asserted on — so it is deliberately kept OUT of the mock gate (run.sh) and CI.
+#
+# NOT A SECRET: master_key comes from the environment; Ollama needs no auth and
+# mockd ignores auth (api_key: dummy is a placeholder to keep the SDK happy). This
+# file carries NO keys, so it is COMMITTED (goal 19) alongside its compose file.
+#
+# HARD CONSTRAINT: NEVER run in CI and NEVER wired into e2e/run.sh — it needs a
+# host Ollama and is driven by hand. The fast-tier `docker compose config` lint
+# validates this file's schema (via its compose file) but starts no containers.
+# =============================================================================
+
+model_list:
+  # ---- Primary workbench: a REAL model on your HOST Ollama ------------------
+  # The stable workbench alias every profile uses; only the BACKEND swaps. Here it
+  # fronts qwen3:8b on the HOST Ollama's OpenAI-compatible surface, reached via
+  # OLLAMA_API_BASE (default host.docker.internal:11434/v1 — set in the compose
+  # file). Point your client / conformance.py at the gateway with
+  # `--model qwen3-coder` exactly as against every other profile.
+  - model_name: qwen3-coder
+    litellm_params:
+      # Backend model read from OLLAMA_MODEL (compose sets it; default qwen3:8b),
+      # so one env var switches what the gateway requests AND what you `ollama pull`.
+      model: os.environ/OLLAMA_MODEL
+      custom_llm_provider: openai   # Ollama's OpenAI-compatible surface...
+      api_base: os.environ/OLLAMA_API_BASE   # ...on the host (see compose default)
+      api_key: dummy                # Ollama ignores auth; placeholder for the SDK.
+      # Bridge /v1/responses (Codex path) down to chat, same as every other config.
+      use_chat_completions_api: true
+    model_info:
+      backend_tier: local
+      # agent_capable DELIBERATELY UNSET — for a REAL model it must be EARNED by
+      # conformance.py, not declared (LiteLLM defaults the flag off when omitted).
+
+  # ---- Mock Foundry fallback tier (one mockd container) --------------------
+  # The always-up tier the primary falls through to. Served by the `foundry` mockd
+  # container over its OpenAI-compatible surface. Put it in echo mode via
+  # /__control to make a fallback hop unmistakable in the demo (see e2e/README
+  # "Profile: manual"). Same deliberate simplification as the dev/e2e configs:
+  # every backend is reached via the `openai/` provider against mockd (the
+  # azure_ai/ Anthropic wire format is validated only against real Foundry).
+  - model_name: claude-sonnet
+    litellm_params:
+      model: openai/claude-sonnet
+      api_base: http://foundry:9100/v1
+      api_key: dummy
+      use_chat_completions_api: true
+    model_info:
+      backend_tier: foundry
+      instance: mock-foundry
+      agent_capable: true
+
+  - model_name: claude-opus
+    litellm_params:
+      model: openai/claude-opus
+      api_base: http://foundry:9100/v1
+      api_key: dummy
+      use_chat_completions_api: true
+    model_info:
+      backend_tier: foundry
+      instance: mock-foundry
+      agent_capable: true
+
+  - model_name: gpt
+    litellm_params:
+      model: openai/gpt
+      api_base: http://foundry:9100/v1
+      api_key: dummy
+      use_chat_completions_api: true
+    model_info:
+      backend_tier: foundry
+      instance: mock-foundry
+      agent_capable: true
+
+router_settings:
+  # The primary workbench falls through to the Foundry tier, Anthropic family
+  # first (tool-call format consistency), GPT last — same shape as prod/dev/e2e.
+  # This is what the kill-Ollama demo exercises: stop the host Ollama, send a
+  # request, and watch qwen3-coder fail over to the mock Foundry.
+  fallbacks:
+    - qwen3-coder: ["claude-sonnet", "claude-opus", "gpt"]
+    - claude-sonnet: ["claude-opus"]
+  num_retries: 1
+  # A real model on CPU/GPU can take a while per turn — generous like the local
+  # profile (the mock config uses 30s; prod uses 600s) so a real run isn't cut off.
+  timeout: 600
+  # Prod-like cooldown so a killed Ollama gets parked and the fallback sticks for
+  # the demo, then recovers when you bring Ollama back.
+  allowed_fails: 2
+  cooldown_time: 30
+
+litellm_settings:
+  # Ollama's OpenAI surface rejects some OpenAI-only params; drop them rather than
+  # surface a 400 (same setting the mock/local/prod configs use).
+  drop_params: true
+  # Routing-record observability — one record per backend attempt + per delivered
+  # response, fanned to the dashboard sink (compose OBS_WEBHOOK_URL) so
+  # http://localhost:9300 shows the primary->fallback hop live. Same callback the
+  # dev/e2e/deploy configs use — single source of truth in obs_callback.py.
+  callbacks: obs_callback.routing_recorder
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
