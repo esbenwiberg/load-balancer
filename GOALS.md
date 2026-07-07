@@ -119,7 +119,7 @@ decision is made.
    its condition literally holds on `main` — if in doubt, re-check it, don't
    trust the checkmark.
 
-- ✅ 18. TTFT for streamed responses — PR #__PR__ (2026-07)
+- ✅ 18. TTFT for streamed responses — PR #34 (2026-07)
 - ✅ Phase-0 groundwork (blockers A & B, conformance harness, deploy scaffold) — PR #1
 - ✅ E2E test harness (mock + cli-auth profiles) — PR #2
 - ✅ Goal-driven workflow (GOALS.md backlog + unattended contract) — PR #3
