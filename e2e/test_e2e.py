@@ -1333,15 +1333,11 @@ def test_dashboard_shows_minted_key_identity():
     assert r.status_code == 200, r.text
 
     data = _poll_dash(
-        lambda d: any(
-            rq.get("key_alias") == key_alias for rq in d.get("requests", [])
-        )
+        lambda d: any(rq.get("key_alias") == key_alias for rq in d.get("requests", []))
     )
 
     # (a) the per-request row carries the caller's synthetic identity.
-    reqs = [
-        rq for rq in data.get("requests", []) if rq.get("key_alias") == key_alias
-    ]
+    reqs = [rq for rq in data.get("requests", []) if rq.get("key_alias") == key_alias]
     assert reqs, (
         "dashboard has no request row carrying the minted key's alias %r: %r"
         % (key_alias, data.get("requests"))
@@ -1356,9 +1352,9 @@ def test_dashboard_shows_minted_key_identity():
 
     # (b) the per-key rollup aggregates that identity's traffic.
     keys = [k for k in data.get("keys", []) if k.get("key_alias") == key_alias]
-    assert keys, (
-        "dashboard per-key rollup is missing the minted key %r: %r"
-        % (key_alias, data.get("keys"))
+    assert keys, "dashboard per-key rollup is missing the minted key %r: %r" % (
+        key_alias,
+        data.get("keys"),
     )
     k = keys[0]
     assert k.get("user_id") == user_id and k.get("team_id") == team_id, (

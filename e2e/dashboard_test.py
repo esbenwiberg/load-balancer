@@ -142,17 +142,21 @@ class TestFetchFleet(unittest.TestCase):
 
 def _delivered(**kw):
     """A minimal `delivered` record like obs_callback emits (goal 3 + 15)."""
-    rec = {"event": "delivered", "requested_model": "qwen3-coder",
-           "served_model": "qwen3-coder", "fallback": False,
-           "response_cost": 0.01, "tokens": {"total": 16}}
+    rec = {
+        "event": "delivered",
+        "requested_model": "qwen3-coder",
+        "served_model": "qwen3-coder",
+        "fallback": False,
+        "response_cost": 0.01,
+        "tokens": {"total": 16},
+    }
     rec.update(kw)
     return rec
 
 
 class TestRequestsViewIdentity(unittest.TestCase):
     def test_request_row_carries_identity(self):
-        recs = [_delivered(key_alias="repo-a", user_id="test-user",
-                           team_id="team-x")]
+        recs = [_delivered(key_alias="repo-a", user_id="test-user", team_id="team-x")]
         row = dashboard._requests_view(recs)[0]
         self.assertEqual(row["key_alias"], "repo-a")
         self.assertEqual(row["user_id"], "test-user")
@@ -169,12 +173,28 @@ class TestRequestsViewIdentity(unittest.TestCase):
 class TestKeyRollup(unittest.TestCase):
     def test_rollup_aggregates_per_key(self):
         recs = [
-            _delivered(key_alias="repo-a", user_id="u1", team_id="t1",
-                       tokens={"total": 10}, response_cost=0.02),
-            _delivered(key_alias="repo-a", user_id="u1", team_id="t1",
-                       tokens={"total": 6}, response_cost=0.01, fallback=True),
-            _delivered(key_alias="repo-b", user_id="u2", team_id="t1",
-                       tokens={"total": 8}, response_cost=0.03),
+            _delivered(
+                key_alias="repo-a",
+                user_id="u1",
+                team_id="t1",
+                tokens={"total": 10},
+                response_cost=0.02,
+            ),
+            _delivered(
+                key_alias="repo-a",
+                user_id="u1",
+                team_id="t1",
+                tokens={"total": 6},
+                response_cost=0.01,
+                fallback=True,
+            ),
+            _delivered(
+                key_alias="repo-b",
+                user_id="u2",
+                team_id="t1",
+                tokens={"total": 8},
+                response_cost=0.03,
+            ),
         ]
         rows = dashboard._key_rollup(recs)
         by_alias = {r["key_alias"]: r for r in rows}
