@@ -1046,6 +1046,19 @@ def test_fallback_is_observable_in_routing_record():
         "failure record must capture per-attempt latency: %r" % f
     )
 
+    # (c) trace correlation (goal 16): the delivered record and the failed
+    # attempt must carry the SAME correlation_id — the shared, request-scoped id
+    # that lets the dashboard nest the attempt under its request even on the
+    # fallback path (where the winner's success event may never fire).
+    assert d.get("correlation_id"), (
+        "delivered record must carry a correlation_id to join on: %r" % d
+    )
+    assert f.get("correlation_id") == d.get("correlation_id"), (
+        "the failed attempt must share the delivered record's correlation_id — that "
+        "shared id IS the join: delivered=%r failed=%r"
+        % (d.get("correlation_id"), f.get("correlation_id"))
+    )
+
 
 def test_direct_request_routing_record_no_fallback():
     """The baseline the fallback case is distinguished against: a request its own
@@ -1247,6 +1260,96 @@ def test_dashboard_data_endpoint_shows_fallback_route():
     )
     assert f.get("tier") == "local", (
         "dashboard attempt row should carry the backend tier: %r" % f
+    )
+
+
+# --- trace correlation: join a request to its attempt trail (goal 16) --------
+#
+# Before goal 16 the dashboard showed the per-request rows and the attempt trail
+# SIDE BY SIDE — a `delivered` record carried no id, so "which 503 made THIS
+# request fall back?" was left to eyeballing timestamps. obs_callback now stamps a
+# request-scoped correlation_id (LiteLLM's litellm_trace_id, shared across the
+# whole fallback group) in async_pre_call_hook, so it reaches every llm_call
+# attempt AND is recoverable in the delivered record. The dashboard nests each
+# request's attempts under it by that id. See docs/09-observability.md.
+
+
+def test_dashboard_request_row_joined_to_failure_attempt_by_correlation_id():
+    """Goal 16: a forced fallback's request row must be JOINED to its own 503
+    failure attempt by a shared correlation_id — the attempt nested UNDER the
+    request, not merely present somewhere in the flat trail. This is the whole
+    point of the goal: "why did THIS request fall back?" answered by the join.
+
+    Force qwen3-coder -> claude-sonnet, then assert the dashboard's request row:
+      * carries a non-null correlation_id;
+      * nests an `attempts` trail that INCLUDES the qwen3-coder 503 failure
+        attempt, and that attempt's correlation_id equals the request's — proving
+        the join key really ties the two records together.
+    """
+    _inject({"model": "qwen3-coder", "status": 503})  # persistent -> fallback
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": "qwen3-coder",
+            "messages": [{"role": "user", "content": "ping trace join"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+    assert "served_model=claude-sonnet" in _served_model(r.json()), r.text
+
+    def _joined(data):
+        for rq in data.get("requests", []):
+            if rq.get("requested_model") != "qwen3-coder":
+                continue
+            cid = rq.get("correlation_id")
+            if not cid:
+                continue
+            if any(
+                a.get("status") == "failure"
+                and a.get("requested_group") == "qwen3-coder"
+                and a.get("correlation_id") == cid
+                for a in (rq.get("attempts") or [])
+            ):
+                return True
+        return False
+
+    data = _poll_dash(_joined)
+
+    reqs = [
+        rq
+        for rq in data.get("requests", [])
+        if rq.get("requested_model") == "qwen3-coder"
+    ]
+    assert reqs, "dashboard has no request row for the qwen3-coder prompt: %r" % data
+    rq = reqs[0]
+    cid = rq.get("correlation_id")
+    assert cid, (
+        "the fallback request row must carry a correlation_id to join on: %r" % rq
+    )
+    attempts = rq.get("attempts") or []
+    assert attempts, (
+        "the request row must NEST its attempt trail, not leave it alongside: %r" % rq
+    )
+    # The 503 that triggered the fallback is nested under THIS request, joined by id.
+    failed = [
+        a
+        for a in attempts
+        if a.get("status") == "failure" and a.get("requested_group") == "qwen3-coder"
+    ]
+    assert failed, (
+        "the request's nested attempts must include its 503 failure (the 'why'): %r"
+        % attempts
+    )
+    f = failed[0]
+    assert str(f.get("error_code")) == "503", (
+        "the nested failure attempt must carry the 503 that triggered the fallback: %r"
+        % f
+    )
+    assert f.get("correlation_id") == cid, (
+        "the nested attempt's correlation_id must equal the request's — that shared "
+        "id IS the join: attempt=%r request_cid=%r" % (f, cid)
     )
 
 
