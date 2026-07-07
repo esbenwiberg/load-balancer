@@ -68,17 +68,6 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 
 ## § Autonomy-friendly (safe to run unattended)
 
-### 16. Join the attempt trail to its request — trace correlation — risk: medium
-**Why:** the verified LiteLLM quirk ([docs/09](docs/09-observability.md)):
-`delivered` records carry no `trace_id`, so the dashboard shows attempts
-*alongside* requests instead of nested under them. Debugging "why did THIS
-request fall back" needs the join. Prereq: none (independent of 15, but lands
-on the same dashboard — coordinate if run concurrently).
-**Completion condition:**
-```
-delivered records carry a correlation id (litellm_call_id/trace_id or a documented equivalent recoverable in async_post_call_success_hook), the dashboard's request rows nest/link their llm_call attempt records by that id, and an e2e test proves a forced fallback's request row is joined to its 503 failure attempt; if LiteLLM 1.83.x genuinely cannot surface a shared id on the fallback-winner path, the goal instead completes by documenting the verified limitation in docs/09 plus the best achievable partial join (direct requests joined by id, fallbacks best-effort) — decide and document per CLAUDE.md, do not fork the gateway; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked, stop after 40 turns and leave a draft PR
-```
-
 ### 18. TTFT for streamed responses — risk: medium
 **Why:** the [docs/09](docs/09-observability.md) caveat: `latency_ms` is
 time-to-completion. For agent UX, time-to-first-token is the felt latency, and
@@ -207,3 +196,4 @@ decision is made.
 - ✅ 14. Azure IaC skeleton — code only, offline-validated — Bicep (decision recorded over Terraform: `bicep build` validates fully offline; Azure-native; stateless) under `deploy/azure/`: `main.bicep` + modules for the gateway Container App (managed identity, Key Vault–referenced secrets, parameterised ingress), PostgreSQL Flexible Server (private persistent store), Key Vault (secrets + MI RBAC), and VNet (delegated subnets + NSG). Secrets are required `@secure()` params with no defaults; `main.example.bicepparam` carries commit-safe placeholders. `scripts/check.sh` fast tier gained an offline `bicep build`/`build-params` step (fails on ANY diagnostic, no cloud calls/creds), CI installs bicep via `az bicep install`, and the litellm image-pin guard now also covers `.bicep`. Parity doc [docs/11](docs/11-azure-iac.md) maps every dev-stack component to its Azure counterpart (with the deliberate gaps named). — PR #24 (2026-07)
 - ✅ 19. Promote the manual try-out stack to a committed profile — PR #30 (2026-07)
 - ✅ 17. Repo-granularity attribution + session-metadata spike — PR #32 (2026-07)
+- ✅ 16. Join the attempt trail to its request — trace correlation — PR #33 (2026-07)

@@ -29,6 +29,30 @@ It emits two record shapes, keyed by `event`:
                 are null under the master key / no key store, so the bare-pytest
                 and cli-auth profiles are unaffected.
 
+TRACE CORRELATION — joining a request to its attempt trail (goal 16):
+
+  Every record carries a `correlation_id` so the dashboard can NEST each
+  `delivered` request under its `llm_call` attempts instead of showing them side
+  by side. The id is LiteLLM's request-scoped `litellm_trace_id`, which the router
+  SHARES across a whole fallback group — its `_update_kwargs_before_fallbacks`
+  sets it ONCE, before the fallback loop, via setdefault — so the failed primary
+  attempt AND the winner carry the SAME trace_id.
+
+  The gap this closes: that shared trace_id already reaches the `llm_call` records
+  (it's their `standard_logging_object.trace_id`), but on the proxy fallback path
+  the WINNER'S success event is not reliably fired (the verified quirk, below) and
+  the delivered response's `_hidden_params` does NOT expose the trace_id — so the
+  `delivered` record, built in async_post_call_success_hook, had no id to join on.
+
+  Fix (NO gateway fork — this lives entirely in our own callback): async_pre_call_hook
+  STAMPS `data["litellm_trace_id"]` at ingress. Because the router uses setdefault,
+  our id becomes THE shared trace_id for every attempt; and because the proxy threads
+  the SAME `data` dict through pre-call -> the LLM call -> async_post_call_success_hook,
+  the delivered record reads it straight back off `data`. Result: a guaranteed shared
+  `correlation_id` linking a request to ALL its attempts (including a fallback's failed
+  primary), on both the direct and fallback paths. A client-supplied litellm_trace_id
+  (or an x-litellm-trace-id header) is preserved, never overwritten. See docs/09.
+
 Sinks (independent, both optional):
 
   * stdout  — ALWAYS. One JSON object per line, prefixed `ROUTING_RECORD `.
@@ -53,6 +77,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 
 from litellm.integrations.custom_logger import CustomLogger
 
@@ -68,6 +93,12 @@ _WEBHOOK_URLS = [
 ]
 _WEBHOOK_TIMEOUT = float(os.environ.get("OBS_WEBHOOK_TIMEOUT", "2.0"))
 _STDOUT_PREFIX = "ROUTING_RECORD "
+
+# LiteLLM's request-scoped id. The router shares it across a whole fallback group
+# (setdefault before the fallback loop), so stamping it at ingress gives every
+# attempt AND the delivered summary the same value to join on. See the module
+# docstring + docs/09.
+_CORRELATION_KEY = "litellm_trace_id"
 
 
 def _first(d, *keys):
@@ -157,10 +188,35 @@ def _llm_call_record(kwargs, fallback_status: str) -> dict:
         "error_class": err.get("error_class"),
         "litellm_call_id": slo.get("litellm_call_id"),
         "trace_id": slo.get("trace_id"),
+        # The JOIN KEY (goal 16): the request-scoped trace_id, shared by every
+        # attempt in a fallback group. The dashboard nests these under the
+        # matching `delivered` request by this id.
+        "correlation_id": slo.get("trace_id"),
     }
 
 
 class RoutingRecorder(CustomLogger):
+    # --- ingress: stamp the correlation id (goal 16) -----------------------
+    async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+        """Stamp a request-scoped correlation id onto `data` BEFORE routing.
+
+        Sets `data["litellm_trace_id"]` (unless the client already supplied one,
+        which we keep). The router shares this id across the whole fallback group
+        via setdefault, so every `llm_call` attempt carries it as its trace_id;
+        and the proxy threads this SAME `data` dict into async_post_call_success_hook,
+        so the `delivered` record can read it straight back — giving a guaranteed
+        shared join key across a request and ALL its attempts (docs/09, goal 16).
+
+        Best-effort and never fatal: any hiccup degrades to leaving `data`
+        untouched (LiteLLM then generates its own per-attempt trace_id, i.e. the
+        pre-goal-16 behaviour) rather than breaking the request path."""
+        try:
+            if isinstance(data, dict) and not data.get(_CORRELATION_KEY):
+                data[_CORRELATION_KEY] = "obs-" + uuid.uuid4().hex
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return data
+
     # --- per-attempt trail (success + failure) -----------------------------
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
         _emit(_llm_call_record(kwargs, "success"))
@@ -199,6 +255,16 @@ class RoutingRecorder(CustomLogger):
             # A fallback served the request iff the backend that answered is
             # not the alias the client requested.
             "fallback": bool(requested and served and requested != served),
+            # The JOIN KEY (goal 16): the request-scoped trace_id we stamped on
+            # `data` in async_pre_call_hook, shared by every attempt (incl. a
+            # fallback's failed primary). The dashboard nests this request's
+            # `llm_call` attempts under it by this id.
+            "correlation_id": data.get(_CORRELATION_KEY),
+            # The WINNER's own call id (differs per attempt). When the winner's
+            # success event DOES fire, it links this request to that exact
+            # success attempt; on the fallback-winner path it may fire for no
+            # attempt, which is why correlation_id (above) is the reliable join.
+            "litellm_call_id": hp.get("litellm_call_id"),
         }
         # WHO asked (goal 15): stamp the caller's synthetic identity onto the
         # delivered record. Null under the master key / no key store, so the

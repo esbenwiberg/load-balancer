@@ -225,5 +225,125 @@ class TestKeyRollup(unittest.TestCase):
         self.assertEqual(rows, [])
 
 
+# --- trace correlation: join a request to its attempt trail (goal 16) --------
+# The e2e suite proves the gateway actually stamps a shared correlation_id end to
+# end; these cover the dashboard FOLD offline — that _requests_view nests each
+# request's llm_call attempts under it by that id (the failed primary of a
+# fallback included), and degrades cleanly when the id is absent.
+
+
+class TestTraceCorrelation(unittest.TestCase):
+    def test_fallback_request_joins_its_503_attempt(self):
+        # A forced fallback: qwen3-coder 503s, claude-sonnet answers. On the proxy
+        # fallback path the winner's success llm_call may not fire — so the only
+        # attempt sharing the delivered record's correlation_id is the FAILED
+        # primary. The join must still surface it under the request.
+        cid = "obs-deadbeef"
+        records = [
+            {
+                "event": "llm_call",
+                "status": "failure",
+                "requested_group": "qwen3-coder",
+                "backend": "qwen",
+                "tier": "local",
+                "error_code": 503,
+                "latency_ms": 12.3,
+                "correlation_id": cid,
+            },
+            {
+                "event": "delivered",
+                "requested_model": "qwen3-coder",
+                "served_model": "claude-sonnet",
+                "fallback": True,
+                "tokens": {"total": 7},
+                "correlation_id": cid,
+            },
+        ]
+        reqs = dashboard._requests_view(records)
+        self.assertEqual(len(reqs), 1)
+        row = reqs[0]
+        self.assertEqual(row["correlation_id"], cid)
+        self.assertEqual(len(row["attempts"]), 1)
+        att = row["attempts"][0]
+        self.assertEqual(att["status"], "failure")
+        self.assertEqual(att["error_code"], 503)
+        self.assertEqual(att["requested_group"], "qwen3-coder")
+        self.assertEqual(att["correlation_id"], cid)
+
+    def test_direct_request_joins_its_success_attempt(self):
+        cid = "obs-cafe"
+        records = [
+            {
+                "event": "llm_call",
+                "status": "success",
+                "requested_group": "claude-sonnet",
+                "backend": "sonnet",
+                "correlation_id": cid,
+            },
+            {
+                "event": "delivered",
+                "requested_model": "claude-sonnet",
+                "served_model": "claude-sonnet",
+                "fallback": False,
+                "correlation_id": cid,
+            },
+        ]
+        row = dashboard._requests_view(records)[0]
+        self.assertEqual(row["correlation_id"], cid)
+        self.assertEqual(len(row["attempts"]), 1)
+        self.assertEqual(row["attempts"][0]["status"], "success")
+
+    def test_two_requests_do_not_cross_join(self):
+        records = [
+            {
+                "event": "llm_call",
+                "status": "success",
+                "backend": "a",
+                "correlation_id": "id-A",
+            },
+            {
+                "event": "llm_call",
+                "status": "success",
+                "backend": "b",
+                "correlation_id": "id-B",
+            },
+            {
+                "event": "delivered",
+                "requested_model": "a",
+                "served_model": "a",
+                "fallback": False,
+                "correlation_id": "id-A",
+            },
+            {
+                "event": "delivered",
+                "requested_model": "b",
+                "served_model": "b",
+                "fallback": False,
+                "correlation_id": "id-B",
+            },
+        ]
+        reqs = {r["correlation_id"]: r for r in dashboard._requests_view(records)}
+        self.assertEqual([a["backend"] for a in reqs["id-A"]["attempts"]], ["a"])
+        self.assertEqual([a["backend"] for a in reqs["id-B"]["attempts"]], ["b"])
+
+    def test_request_without_correlation_id_degrades_to_empty_trail(self):
+        # A pre-goal-16 record (no correlation_id) still yields a row, just with no
+        # nested attempts — never a crash, never a wrong join. The uncorrelated
+        # attempt is not lost either: it still shows in the flat trail.
+        records = [
+            {"event": "llm_call", "status": "failure", "backend": "x"},
+            {
+                "event": "delivered",
+                "requested_model": "x",
+                "served_model": "y",
+                "fallback": True,
+            },
+        ]
+        row = dashboard._requests_view(records)[0]
+        self.assertIsNone(row["correlation_id"])
+        self.assertEqual(row["attempts"], [])
+        self.assertEqual(len(dashboard._attempts_view(records)), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

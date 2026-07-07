@@ -129,22 +129,47 @@ class Records:
 RECORDS = Records()
 
 
+def _attempts_by_correlation(records: list) -> dict:
+    """Index every `llm_call` attempt by its `correlation_id` (goal 16), in
+    stream (chronological) order. This is the join table: a `delivered` request's
+    correlation_id keys straight into its own attempt trail — the failed primary
+    AND the winner of a fallback, which share the id (see obs_callback / docs/09).
+    Attempts with no correlation_id are skipped here (they still show in the flat
+    trail)."""
+    idx: dict = {}
+    for r in records:
+        if r.get("event") != "llm_call":
+            continue
+        cid = r.get("correlation_id")
+        if cid is None:
+            continue
+        idx.setdefault(cid, []).append(dict(r))
+    return idx
+
+
 def _requests_view(records: list) -> list:
     """Fold the raw record stream into a per-REQUEST view — the primary
     "where did my prompt go?" table.
 
     A `delivered` record IS one client request's outcome: it names the alias the
     client asked for vs the backend that actually served it, the fallback flag,
-    and the delivered tokens/cost. We surface those newest-first and attach any
-    `llm_call` FAILURE attempts that share a nearby position in the stream as the
-    "why" — but we do NOT try to hard-correlate by id (delivered records carry no
-    trace_id; see docs/09), so the attempt trail is offered separately and the
-    per-request row stands on the delivered record alone."""
+    and the delivered tokens/cost. Newest-first.
+
+    TRACE CORRELATION (goal 16): each row now carries its `correlation_id` and its
+    NESTED `attempts` — the `llm_call` records that share that id, joined by it
+    rather than by stream proximity. For a fallback that is the failed primary
+    (the 503 "why") plus the winner; for a direct request it is the single
+    successful attempt. This makes "why did THIS request fall back" answerable by
+    nesting the attempt trail UNDER the request, not just alongside it. Requests
+    with no correlation_id (older records, or a stack without the pre-call stamp)
+    degrade to an empty `attempts` list and still stand on the delivered record."""
+    by_cid = _attempts_by_correlation(records)
     out = []
     for r in records:
         if r.get("event") != "delivered":
             continue
         tokens = r.get("tokens") or {}
+        cid = r.get("correlation_id")
         out.append(
             {
                 "requested_model": r.get("requested_model"),
@@ -163,6 +188,10 @@ def _requests_view(records: list) -> list:
                 "key_alias": r.get("key_alias"),
                 "user_id": r.get("user_id"),
                 "team_id": r.get("team_id"),
+                # TRACE CORRELATION (goal 16): the join key + this request's own
+                # attempt trail, nested under it by that id.
+                "correlation_id": cid,
+                "attempts": by_cid.get(cid, []) if cid is not None else [],
             }
         )
     out.reverse()  # newest first
@@ -339,6 +368,14 @@ _PAGE = """<!doctype html>
   .muted { color:var(--muted); }
   .empty { color:var(--muted); padding:18px 12px; }
   code { color:var(--fg); }
+  /* trace correlation (goal 16): the attempt trail nested UNDER its request */
+  tr.trail td { border-bottom:1px solid var(--line); padding:4px 12px 8px;
+    white-space:normal; color:var(--muted); font-size:12px; }
+  tr.trail .cid { color:var(--muted); }
+  .attempt { display:inline-block; padding:1px 6px; margin:2px 2px;
+    border:1px solid var(--line); border-radius:6px; }
+  .attempt.failed { border-color:var(--warn); }
+  .attempt.ok { border-color:var(--ok); }
 </style>
 </head>
 <body>
@@ -380,7 +417,8 @@ _PAGE = """<!doctype html>
     </table>
   </div>
 
-  <h2>Requests &mdash; requested alias &rarr; backend that served it</h2>
+  <h2>Requests &mdash; requested alias &rarr; backend that served it
+    <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">&middot; each row nests its own attempt trail (goal 16)</span></h2>
   <div class="tablewrap">
     <table>
       <thead><tr>
@@ -410,6 +448,28 @@ function idCell(v){
   // Synthetic identity, or a muted dash when null (master key / no key store).
   return v==null ? '<span class="muted">&mdash;</span>' : '<code>'+esc(v)+'</code>';
 }
+function attemptChip(a){
+  // One backend attempt in a request's nested trail. A failure shows the error
+  // code that triggered the fallback (the "why"); a success shows its tier.
+  const failed = a.status==='failure';
+  const tier = a.tier ? ' <span class="badge tier">'+esc(a.tier)+'</span>' : '';
+  const lat = a.latency_ms==null ? '' : ' <span class="muted">'+esc(a.latency_ms)+'ms</span>';
+  const mark = failed
+    ? ' <span class="badge fail">'+esc(a.error_code||'fail')+'</span>'
+    : ' <span class="badge direct">ok</span>';
+  return '<span class="attempt '+(failed?'failed':'ok')+'"><code>'
+    + esc(a.backend||a.requested_group)+'</code>'+tier+mark+lat+'</span>';
+}
+function reqTrail(r){
+  // The attempt trail joined to THIS request by correlation_id (goal 16),
+  // rendered as a sub-row nested under the request. Empty when a request has no
+  // correlated attempts (older records / a stack without the pre-call stamp).
+  const atts = r.attempts||[];
+  if(!atts.length) return '';
+  const chips = atts.map(attemptChip).join('<span class="arrow"> &rarr; </span>');
+  const cid = r.correlation_id ? ' <span class="cid">('+esc(r.correlation_id)+')</span>' : '';
+  return '<tr class="trail"><td></td><td colspan="8">why'+cid+': '+chips+'</td></tr>';
+}
 function reqRow(r){
   const badge = r.fallback
     ? '<span class="badge fall">fallback</span>'
@@ -426,7 +486,8 @@ function reqRow(r){
     + '<td>'+esc(r.provider)+'</td>'
     + '<td class="num">'+tok+'</td>'
     + '<td class="num">'+cost+'</td>'
-    + '</tr>';
+    + '</tr>'
+    + reqTrail(r);  // goal 16: nest this request's attempt trail beneath it
 }
 function keyRow(k){
   const alias = k.key_alias==null

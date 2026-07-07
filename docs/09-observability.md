@@ -19,8 +19,8 @@ Keyed by `event`:
 
 | `event`     | fired per…       | carries |
 |-------------|------------------|---------|
-| `llm_call`  | backend **attempt** (success *or* failure) | `requested_group`, `backend`, `backend_model_id`, `api_base`, `tier`, `latency_ms`, `tokens`, and on failure `error_code`/`error_class`, plus `litellm_call_id`/`trace_id` |
-| `delivered` | client **request** (the final response) | `requested_model`, `served_model`, `served_model_id`, `api_base`, `provider`, `response_cost`, `tokens`, `fallback`, and the caller's identity `key_alias`/`user_id`/`team_id` (goal 15) |
+| `llm_call`  | backend **attempt** (success *or* failure) | `requested_group`, `backend`, `backend_model_id`, `api_base`, `tier`, `latency_ms`, `tokens`, and on failure `error_code`/`error_class`, plus `litellm_call_id`/`trace_id`, and the join key `correlation_id` (goal 16) |
+| `delivered` | client **request** (the final response) | `requested_model`, `served_model`, `served_model_id`, `api_base`, `provider`, `response_cost`, `tokens`, `fallback`, the caller's identity `key_alias`/`user_id`/`team_id` (goal 15), and the join key `correlation_id` + winner `litellm_call_id` (goal 16) |
 
 **Why two?** A fallback has two halves — *why the primary was abandoned* and
 *who ultimately answered*:
@@ -42,6 +42,47 @@ Keyed by `event`:
 > authoritative "who served it" and the `llm_call` records as the attempt trail.
 > When the winner's success event *does* fire, it shares the failed primary's
 > `trace_id`, so you can also correlate the pair that way.
+
+### Trace correlation — joining a request to its attempt trail (goal 16)
+
+Both record shapes carry a **`correlation_id`** so the dashboard can nest each
+`delivered` request *under* its `llm_call` attempts instead of showing them side
+by side. Debugging "why did **this** request fall back?" is then a lookup, not
+timestamp-eyeballing.
+
+The id is LiteLLM's request-scoped **`litellm_trace_id`**, which the router
+**shares across a whole fallback group**: `Router._update_kwargs_before_fallbacks`
+sets it **once, before the fallback loop**, via `setdefault` — so the failed
+primary attempt *and* the winner carry the **same** `trace_id`. That already
+reaches the `llm_call` records (it's their `standard_logging_object.trace_id`).
+
+The gap this closes is on the **`delivered`** side. It is built in
+`async_post_call_success_hook`, and there the shared id is *not* reachable: the
+winner's response `_hidden_params` exposes only the winner's *own* `litellm_call_id`
+(which differs per attempt), **not** the shared `trace_id`; and on the fallback
+path the winner's success `llm_call` — the one record that *would* bridge the
+winner's call id to the shared trace_id — is not reliably fired (the quirk above).
+
+**The fix (no gateway fork — it lives entirely in our own callback):**
+`obs_callback`'s `async_pre_call_hook` **stamps `data["litellm_trace_id"]`** at
+ingress (keeping any client-supplied one). Because the router uses `setdefault`,
+our id becomes *the* shared trace_id for every attempt; and because the proxy
+threads the **same `data` dict** through `pre_call_hook → the LLM call →
+async_post_call_success_hook`, the `delivered` record reads it straight back off
+`data`. Result: a **guaranteed shared `correlation_id`** linking a request to
+**all** its attempts — the failed primary of a fallback included — on both the
+direct and fallback paths, without depending on the unreliable winner success
+event. This was verified against `litellm==1.83.14`: on a forced fallback the
+failed primary and the winner both log `trace_id == our stamped id`, and the same
+id is present on `data` in the success hook.
+
+The winner's own `litellm_call_id` is *also* recorded on `delivered` (a bonus
+exact link to the winning attempt *when* its success event fires); `correlation_id`
+is the reliable join. The dashboard's `_requests_view` indexes `llm_call` records
+by `correlation_id` and nests each request's trail under it (`e2e/dashboard.py`);
+`e2e/test_e2e.py::test_dashboard_request_row_joined_to_failure_attempt_by_correlation_id`
+proves a forced fallback's request row is joined to its 503 failure attempt, and
+the record-level share is checked in `test_fallback_is_observable_in_routing_record`.
 
 ### The two sinks
 
@@ -107,8 +148,10 @@ is a stdlib-only daemon (same shape as mockd) that is *both* a routing-record
 The page shows three tables: a **Per key** rollup (goal 15 — see below),
 **Requests** (requested alias → served backend, a `direct`/`fallback` badge, the
 caller's `key`/`user`, provider, tokens, cost — folded from the `delivered`
-records) and the **Attempt trail** (every `llm_call`: backend, tier, status,
-latency, and on failure the error that triggered a fallback — the "why").
+records, with each row now **nesting its own attempt trail** joined by
+`correlation_id`, goal 16) and the **Attempt trail** (every `llm_call`: backend,
+tier, status, latency, and on failure the error that triggered a fallback — the
+"why"; kept as the flat, cross-request view).
 
 ### Identity — *who* asked? (goal 15)
 
@@ -295,10 +338,6 @@ end-to-end is a separate, vetted step.
 - **Not durable.** All sinks are ephemeral (stdout ring / mockd + dashboard
   in-memory). Durable, queryable, per-user/team spend is [goal 11b](../GOALS.md)
   (Postgres spend logs).
-- **Not per-request hard-correlated.** The dashboard's per-request rows come from
-  `delivered` records, which carry no `trace_id` (see the quirk box above), so
-  the attempt trail is shown *alongside* requests, not joined to them by id.
-  Fleet-level correlation is a later refinement.
 - **Streaming latency caveat.** `latency_ms` on an `llm_call` is LiteLLM's
   `response_time`; for streamed responses that reflects time-to-completion of the
   logged call, not time-to-first-token. TTFT is a later refinement.
