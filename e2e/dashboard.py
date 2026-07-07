@@ -430,14 +430,15 @@ _PAGE = """<!doctype html>
     </table>
   </div>
 
-  <h2>Attempt trail &mdash; every backend tried, and why a fallback fired</h2>
+  <h2>Attempt trail &mdash; every backend tried, and why a fallback fired
+    <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">&middot; ttft = time-to-first-token, streamed only (goal 18)</span></h2>
   <div class="tablewrap">
     <table>
       <thead><tr>
         <th>group</th><th>backend</th><th>tier</th><th>status</th>
-        <th class="num">latency</th><th class="num">tokens</th><th>error</th>
+        <th class="num">ttft</th><th class="num">latency</th><th class="num">tokens</th><th>error</th>
       </tr></thead>
-      <tbody id="attempts"><tr><td class="empty" colspan="7">no attempts yet</td></tr></tbody>
+      <tbody id="attempts"><tr><td class="empty" colspan="8">no attempts yet</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -453,7 +454,9 @@ function attemptChip(a){
   // code that triggered the fallback (the "why"); a success shows its tier.
   const failed = a.status==='failure';
   const tier = a.tier ? ' <span class="badge tier">'+esc(a.tier)+'</span>' : '';
-  const lat = a.latency_ms==null ? '' : ' <span class="muted">'+esc(a.latency_ms)+'ms</span>';
+  // ttft (streamed only, goal 18) shown alongside completion latency: "12ms ttft / 40ms".
+  const lat = a.latency_ms==null ? ''
+    : ' <span class="muted">'+(a.ttft_ms==null?'':esc(a.ttft_ms)+'ms ttft / ')+esc(a.latency_ms)+'ms</span>';
   const mark = failed
     ? ' <span class="badge fail">'+esc(a.error_code||'fail')+'</span>'
     : ' <span class="badge direct">ok</span>';
@@ -510,6 +513,8 @@ function attRow(a){
   const t = a.tier ? '<span class="badge tier">'+esc(a.tier)+'</span>' : '&mdash;';
   const failed = a.status==='failure';
   const st = failed ? '<span class="badge fail">failure</span>' : esc(a.status);
+  // ttft is present only on streamed attempts (goal 18); a dash for non-streamed.
+  const ttft = a.ttft_ms==null ? '&mdash;' : (esc(a.ttft_ms)+' ms');
   const lat = a.latency_ms==null ? '&mdash;' : (esc(a.latency_ms)+' ms');
   const tok = (a.tokens&&a.tokens.total!=null) ? esc(a.tokens.total) : '&mdash;';
   const err = a.error_code ? ('<code>'+esc(a.error_code)+' '+esc(a.error_class||'')+'</code>') : '&mdash;';
@@ -518,6 +523,7 @@ function attRow(a){
     + '<td><code>'+esc(a.backend)+'</code></td>'
     + '<td>'+t+'</td>'
     + '<td>'+st+'</td>'
+    + '<td class="num">'+ttft+'</td>'
     + '<td class="num">'+lat+'</td>'
     + '<td class="num">'+tok+'</td>'
     + '<td>'+err+'</td>'
@@ -595,7 +601,7 @@ async function refresh(){
       : '<tr><td class="empty" colspan="9">no requests yet</td></tr>';
     document.getElementById('attempts').innerHTML = atts.length
       ? atts.map(attRow).join('')
-      : '<tr><td class="empty" colspan="7">no attempts yet</td></tr>';
+      : '<tr><td class="empty" colspan="8">no attempts yet</td></tr>';
     document.getElementById('status').textContent =
       reqs.length+' requests \\u00b7 '+atts.length+' attempts \\u00b7 '+(data.count||0)+' records';
   } catch(e) {

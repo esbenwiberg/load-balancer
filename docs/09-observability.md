@@ -19,7 +19,7 @@ Keyed by `event`:
 
 | `event`     | fired per…       | carries |
 |-------------|------------------|---------|
-| `llm_call`  | backend **attempt** (success *or* failure) | `requested_group`, `backend`, `backend_model_id`, `api_base`, `tier`, `latency_ms`, `tokens`, and on failure `error_code`/`error_class`, plus `litellm_call_id`/`trace_id`, and the join key `correlation_id` (goal 16) |
+| `llm_call`  | backend **attempt** (success *or* failure) | `requested_group`, `backend`, `backend_model_id`, `api_base`, `tier`, `latency_ms` (time-to-completion), `ttft_ms` (time-to-first-token, **streamed attempts only** — goal 18), `tokens`, and on failure `error_code`/`error_class`, plus `litellm_call_id`/`trace_id`, and the join key `correlation_id` (goal 16) |
 | `delivered` | client **request** (the final response) | `requested_model`, `served_model`, `served_model_id`, `api_base`, `provider`, `response_cost`, `tokens`, `fallback`, the caller's identity `key_alias`/`user_id`/`team_id` (goal 15), and the join key `correlation_id` + winner `litellm_call_id` (goal 16) |
 
 **Why two?** A fallback has two halves — *why the primary was abandoned* and
@@ -333,11 +333,57 @@ record, and expose per-session spend at `/spend/tags`. This spike deliberately
 makes **no client-side change** — it captures facts and the mechanism; wiring it
 end-to-end is a separate, vetted step.
 
+## TTFT for streamed responses — the felt latency (goal 18)
+
+`latency_ms` is **time-to-completion**. For an agent, the *felt* latency is
+**time-to-first-token (TTFT)** — how long the client waits before output starts
+streaming. Without it, workbench-vs-Foundry comparisons mislead: a local model
+with a slow first token can "win" on completion latency while feeling dead. So
+every **streamed** `llm_call` record now also carries **`ttft_ms`**.
+
+**Where it comes from — LiteLLM's own timestamp, verified against the pinned
+`v1.83.14-stable` (not guessed).** LiteLLM's `StandardLoggingPayload` (the
+`standard_logging_object` our callback already reads) carries
+`startTime`, `completionStartTime`, `endTime`, and a `stream` flag
+(`litellm/types/utils.py`). It stamps `completionStartTime` at the moment the
+first token arrives — `Logging._update_completion_start_time`, called from the
+streaming wrapper — and marks the payload `stream: true` once the streamed
+response is complete. So **`ttft_ms = (completionStartTime − startTime) · 1000`**
+on a streamed attempt. For a non-streamed call `completionStartTime` *defaults to*
+`endTime`, so TTFT would just equal latency and carries no signal — therefore
+`obs_callback._ttft_ms` returns it **only** when the payload is `stream: true`,
+and **non-streamed records omit `ttft_ms` entirely**.
+
+**A subtlety this also fixed — what `latency_ms` used to mean for streams.** On
+`v1.83.14`, LiteLLM's `response_time` (the old source of `latency_ms`) is **not**
+time-to-completion for a streamed call:
+`StandardLoggingPayloadSetup.get_response_time` returns
+`completionStartTime − startTime` (i.e. TTFT itself) when `stream=True`, and only
+`endTime − startTime` otherwise. Sourcing `latency_ms` from `response_time` would
+have made it equal TTFT for streams — so `latency_ms` now comes straight from the
+raw `endTime − startTime` timestamps (`obs_callback._latency_ms`), keeping it
+**time-to-completion for streamed and non-streamed attempts alike**. By
+construction `startTime ≤ completionStartTime ≤ endTime`, so **`ttft_ms ≤
+latency_ms`** always holds. (Non-streamed `latency_ms` is byte-identical to
+before: `endTime − startTime == response_time` when not streaming.)
+
+**Surfaced** on the dashboard's **Attempt trail** (a `ttft` column, and inline in
+each request's nested trail chip as `12ms ttft / 40ms`) and on the `/api/records`
+attempts. The e2e assertion is
+`e2e/test_e2e.py::test_streamed_llm_call_carries_ttft`: it drives a **streamed**
+`claude-sonnet` request (direct, so the winner's success event — where TTFT
+lives — fires reliably; a fallback winner's success `llm_call` is not guaranteed,
+per the quirk above) and asserts the record's `ttft_ms` is present, non-negative,
+and `<= latency_ms`. `test_direct_request_routing_record_no_fallback` guards the
+complement: a non-streamed attempt **omits** `ttft_ms`.
+
 ## What this is *not* (yet)
 
 - **Not durable.** All sinks are ephemeral (stdout ring / mockd + dashboard
   in-memory). Durable, queryable, per-user/team spend is [goal 11b](../GOALS.md)
   (Postgres spend logs).
-- **Streaming latency caveat.** `latency_ms` on an `llm_call` is LiteLLM's
-  `response_time`; for streamed responses that reflects time-to-completion of the
-  logged call, not time-to-first-token. TTFT is a later refinement.
+- **TTFT is per successful streamed attempt.** It rides the success `llm_call`
+  record, so it is present for direct streamed routes and for a streamed
+  fallback *winner* only when that winner's success event fires (docs/09 quirk);
+  the `delivered` summary does not carry it. Aggregated per-model TTFT
+  (p50/p95) over these records is a later refinement.

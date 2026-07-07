@@ -1113,6 +1113,78 @@ def test_direct_request_routing_record_no_fallback():
     assert (c.get("tokens") or {}).get("total"), (
         "attempt record must capture token usage: %r" % c
     )
+    # Goal 18: a NON-streamed attempt OMITS ttft_ms (for it first-token ==
+    # completion, so a ttft would carry no signal). Its complement — a streamed
+    # attempt carrying ttft_ms <= latency_ms — is test_streamed_llm_call_carries_ttft.
+    assert "ttft_ms" not in c, (
+        "non-streamed llm_call must omit ttft_ms (time-to-first-token is "
+        "streaming-only, goal 18): %r" % c
+    )
+
+
+# --- TTFT for streamed responses (goal 18) -----------------------------------
+#
+# latency_ms is time-to-COMPLETION; for an agent the FELT latency is
+# time-to-first-token. A slow-TTFT local model can "win" on completion latency
+# while feeling dead, so workbench-vs-Foundry comparisons need TTFT too. The
+# obs_callback reads it from LiteLLM's own completionStartTime timestamp
+# (verified against the pinned v1.83.14-stable) and stamps ttft_ms onto STREAMED
+# llm_call records only. See docs/09-observability.md.
+
+
+def test_streamed_llm_call_carries_ttft():
+    """A STREAMED response's llm_call record must carry a ttft_ms (time-to-first-
+    token), and it must be <= latency_ms (time-to-completion). Non-streamed
+    records omit it (guarded in test_direct_request_routing_record_no_fallback).
+
+    Direct route (claude-sonnet serves itself) so the winner's SUCCESS event
+    fires normally — on a fallback the winner's success llm_call is not reliably
+    logged (docs/09 quirk), and TTFT lives on that success record."""
+    with httpx.stream(
+        "POST",
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": "claude-sonnet",
+            "stream": True,
+            "messages": [{"role": "user", "content": "ping ttft"}],
+        },
+        timeout=TIMEOUT,
+    ) as resp:
+        assert resp.status_code == 200, resp.read()
+        # Drain fully: LiteLLM only fires the streamed success-logging event once
+        # the whole stream is consumed (that's when completionStartTime is set).
+        for _line in resp.iter_lines():
+            pass
+
+    def _streamed_ttft_seen(recs):
+        return any(
+            x.get("event") == "llm_call"
+            and x.get("status") == "success"
+            and x.get("ttft_ms") is not None
+            for x in recs
+        )
+
+    recs = _poll_observe(_streamed_ttft_seen)
+    streamed = [
+        x
+        for x in recs
+        if x.get("event") == "llm_call"
+        and x.get("status") == "success"
+        and x.get("ttft_ms") is not None
+    ]
+    assert streamed, "no streamed llm_call record carried ttft_ms (goal 18): %r" % recs
+    c = streamed[-1]
+    ttft, lat = c.get("ttft_ms"), c.get("latency_ms")
+    assert isinstance(ttft, (int, float)), "ttft_ms must be numeric: %r" % c
+    assert isinstance(lat, (int, float)), (
+        "a record with ttft_ms must also carry latency_ms: %r" % c
+    )
+    assert ttft >= 0, "ttft_ms must be non-negative: %r" % c
+    assert ttft <= lat, (
+        "time-to-first-token must be <= time-to-completion: ttft=%r latency=%r (%r)"
+        % (ttft, lat, c)
+    )
 
 
 # --- routing dashboard v1: "where did my prompt go?" (goal 12) ---------------
