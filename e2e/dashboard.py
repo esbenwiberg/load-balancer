@@ -58,8 +58,13 @@ Stdlib only — no pip install, runs bare or in a slim container. Python 3.9+.
 HTTP surface:
   POST /records        {<routing record>}   # obs_callback webhook target; append
   GET  /api/records                          # {"records":[...], "requests":[...],
+                                             #  "attempts":[...], "keys":[...],
                                              #  "count":N} — the DATA ENDPOINT the
-                                             #  UI fetches and the e2e test asserts
+                                             #  UI fetches and the e2e test asserts.
+                                             #  `requests` rows carry the caller's
+                                             #  {key_alias,user_id,team_id} and
+                                             #  `keys` is the per-key rollup
+                                             #  (requests, fallbacks, tokens, cost)
   GET  /api/fleet                            # {"available":bool, "models":[...],
                                              #  "instances":[...]} — the goal-13
                                              #  fleet data endpoint: a server-side
@@ -152,10 +157,66 @@ def _requests_view(records: list) -> list:
                 "tokens_total": tokens.get("total"),
                 "tokens_prompt": tokens.get("prompt"),
                 "tokens_completion": tokens.get("completion"),
+                # WHO asked (goal 15): the caller's synthetic identity, sourced
+                # from obs_callback's read of UserAPIKeyAuth. Null under the
+                # master key / no key store.
+                "key_alias": r.get("key_alias"),
+                "user_id": r.get("user_id"),
+                "team_id": r.get("team_id"),
             }
         )
     out.reverse()  # newest first
     return out
+
+
+# The label a per-key rollup uses when a delivered record carries no key_alias
+# (master key / no key store — see obs_callback._identity). Kept out of the
+# alias namespace so a real synthetic alias can never collide with it.
+_NO_KEY = "(master key / no key)"
+
+
+def _key_rollup(records: list) -> list:
+    """Fold the delivered stream into a per-KEY rollup — "who asked, and what did
+    it cost?" (goal 15). One row per distinct key_alias (records with no alias —
+    master key / no key store — collapse into a single `(master key / no key)`
+    row), carrying that key's request count, how many fell back, total tokens,
+    and total cost. This is the identity counterpart to the per-request table:
+    the request table shows individual prompts, this shows the spend/traffic
+    shape per virtual key. Sorted by request volume (busiest first) for a stable,
+    assertable order."""
+    agg = {}
+    order = []
+    for r in records:
+        if r.get("event") != "delivered":
+            continue
+        alias = r.get("key_alias")
+        label = alias if alias else _NO_KEY
+        entry = agg.get(label)
+        if entry is None:
+            entry = {
+                "key_alias": alias,
+                "user_id": r.get("user_id"),
+                "team_id": r.get("team_id"),
+                "requests": 0,
+                "fallbacks": 0,
+                "tokens": 0,
+                "cost": 0.0,
+            }
+            agg[label] = entry
+            order.append(label)
+        entry["requests"] += 1
+        if r.get("fallback"):
+            entry["fallbacks"] += 1
+        total = (r.get("tokens") or {}).get("total")
+        if isinstance(total, (int, float)):
+            entry["tokens"] += total
+        cost = r.get("response_cost")
+        if isinstance(cost, (int, float)):
+            entry["cost"] += cost
+    rows = [agg[k] for k in order]
+    # Busiest key first; ties broken by label for determinism.
+    rows.sort(key=lambda e: (-e["requests"], e["key_alias"] or _NO_KEY))
+    return rows
 
 
 def _attempts_view(records: list) -> list:
@@ -275,6 +336,7 @@ _PAGE = """<!doctype html>
   .fleetstatus { text-transform:none; letter-spacing:0; font-weight:400;
     color:var(--warn); margin-left:8px; }
   .num { text-align:right; font-variant-numeric:tabular-nums; }
+  .muted { color:var(--muted); }
   .empty { color:var(--muted); padding:18px 12px; }
   code { color:var(--fg); }
 </style>
@@ -307,14 +369,26 @@ _PAGE = """<!doctype html>
     </table>
   </div>
 
+  <h2>Per key &mdash; who asked, and what it cost</h2>
+  <div class="tablewrap">
+    <table>
+      <thead><tr>
+        <th>key</th><th>user</th><th>team</th><th class="num">requests</th>
+        <th class="num">fallbacks</th><th class="num">tokens</th><th class="num">cost</th>
+      </tr></thead>
+      <tbody id="keys"><tr><td class="empty" colspan="7">no keyed traffic yet</td></tr></tbody>
+    </table>
+  </div>
+
   <h2>Requests &mdash; requested alias &rarr; backend that served it</h2>
   <div class="tablewrap">
     <table>
       <thead><tr>
         <th>requested</th><th></th><th>served</th><th>route</th>
+        <th>key</th><th>user</th>
         <th>provider</th><th class="num">tokens</th><th class="num">cost</th>
       </tr></thead>
-      <tbody id="requests"><tr><td class="empty" colspan="7">no requests yet</td></tr></tbody>
+      <tbody id="requests"><tr><td class="empty" colspan="9">no requests yet</td></tr></tbody>
     </table>
   </div>
 
@@ -332,6 +406,10 @@ _PAGE = """<!doctype html>
 
 <script>
 function esc(s){ return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function idCell(v){
+  // Synthetic identity, or a muted dash when null (master key / no key store).
+  return v==null ? '<span class="muted">&mdash;</span>' : '<code>'+esc(v)+'</code>';
+}
 function reqRow(r){
   const badge = r.fallback
     ? '<span class="badge fall">fallback</span>'
@@ -343,8 +421,27 @@ function reqRow(r){
     + '<td class="arrow">&rarr;</td>'
     + '<td><code>'+esc(r.served_model)+'</code></td>'
     + '<td>'+badge+'</td>'
+    + '<td>'+idCell(r.key_alias)+'</td>'
+    + '<td>'+idCell(r.user_id)+'</td>'
     + '<td>'+esc(r.provider)+'</td>'
     + '<td class="num">'+tok+'</td>'
+    + '<td class="num">'+cost+'</td>'
+    + '</tr>';
+}
+function keyRow(k){
+  const alias = k.key_alias==null
+    ? '<span class="muted">master key / no key</span>'
+    : '<code>'+esc(k.key_alias)+'</code>';
+  const fb = k.fallbacks
+    ? '<span class="badge fall">'+esc(k.fallbacks)+'</span>' : '0';
+  const cost = (k.cost==null) ? '&mdash;' : ('$'+Number(k.cost).toFixed(6));
+  return '<tr>'
+    + '<td>'+alias+'</td>'
+    + '<td>'+idCell(k.user_id)+'</td>'
+    + '<td>'+idCell(k.team_id)+'</td>'
+    + '<td class="num">'+esc(k.requests)+'</td>'
+    + '<td class="num">'+fb+'</td>'
+    + '<td class="num">'+esc(k.tokens)+'</td>'
     + '<td class="num">'+cost+'</td>'
     + '</tr>';
 }
@@ -428,10 +525,13 @@ async function refresh(){
   try {
     const res = await fetch('api/records', {cache:'no-store'});
     const data = await res.json();
-    const reqs = data.requests||[], atts = data.attempts||[];
+    const reqs = data.requests||[], atts = data.attempts||[], keys = data.keys||[];
+    document.getElementById('keys').innerHTML = keys.length
+      ? keys.map(keyRow).join('')
+      : '<tr><td class="empty" colspan="7">no keyed traffic yet</td></tr>';
     document.getElementById('requests').innerHTML = reqs.length
       ? reqs.map(reqRow).join('')
-      : '<tr><td class="empty" colspan="7">no requests yet</td></tr>';
+      : '<tr><td class="empty" colspan="9">no requests yet</td></tr>';
     document.getElementById('attempts').innerHTML = atts.length
       ? atts.map(attRow).join('')
       : '<tr><td class="empty" colspan="7">no attempts yet</td></tr>';
@@ -492,6 +592,7 @@ class Handler(BaseHTTPRequestHandler):
                     "count": len(recs),
                     "requests": _requests_view(recs),
                     "attempts": _attempts_view(recs),
+                    "keys": _key_rollup(recs),
                     "records": recs,
                 },
             )

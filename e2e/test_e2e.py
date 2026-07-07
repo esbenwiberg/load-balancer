@@ -1264,6 +1264,108 @@ def test_dashboard_page_renders():
     # Goal 13: the same page also renders + fetches the fleet view.
     assert "api/fleet" in body, "dashboard page must fetch the fleet data endpoint"
     assert "Fleet" in body, "dashboard page must render a Fleet section"
+    # Goal 15: the page renders the identity ("who asked") — per-key rollup.
+    assert "Per key" in body, "dashboard page must render a per-key rollup section"
+
+
+# --- identity in routing records: WHO asked? (goal 15) -----------------------
+#
+# Goal 3 answered "where did my prompt go?"; goal 12 made it visible. Neither
+# knew WHOSE prompt it was — obs_callback received `user_api_key_dict` and threw
+# it away. Goal 15 stamps the caller's synthetic identity {key_alias, user_id,
+# team_id} onto the `delivered` record (sourced from UserAPIKeyAuth, null under
+# the master key / no key store) and the dashboard surfaces it: on each request
+# row AND as a per-key rollup (requests, fallbacks, tokens, cost).
+#
+# This test mints a key bound to a SYNTHETIC alias+user+team (goal 11b's
+# machinery), drives a request WITH THAT KEY (not the master key the other tests
+# use), and asserts the identity round-trips all the way to the dashboard's owned
+# /api/records — the same endpoint the read-only page renders.
+#
+# GUARDRAIL: identities are synthetic (repo-a-ish alias, e2e-user id), never a
+# real name or email. No PII, per CLAUDE.md.
+
+
+def test_dashboard_shows_minted_key_identity():
+    """Goal 15: a request made with a MINTED key surfaces that key's
+    alias+user+team in the dashboard's /api/records — both on the per-request row
+    and in the per-key rollup. Proves the identity path end to end: mint ->
+    authenticated request -> obs_callback reads UserAPIKeyAuth -> delivered record
+    -> dashboard. The master-key requests the rest of the suite makes carry a
+    NULL identity (no key store behind the master key), so a non-null alias here
+    is unambiguous attribution to this test's key."""
+    # Mint a key bound to a synthetic alias + user + team. _unique keeps all three
+    # collision-free across repeated / --keep runs; the alias stays repo-a-shaped
+    # (synthetic, per the guardrail) — never a real name/email.
+    team_id = _unique("team")
+    user_id = _unique("user")
+    key_alias = _unique("repo-a")
+    _admin_post(
+        "/team/new", {"team_id": team_id, "team_alias": team_id, "max_budget": 1000}
+    )
+    _admin_post(
+        "/team/member_add",
+        {"team_id": team_id, "member": {"user_id": user_id, "role": "user"}},
+    )
+    gen = _admin_post(
+        "/key/generate",
+        {
+            "models": ["qwen3-coder"],
+            "key_alias": key_alias,
+            "user_id": user_id,
+            "team_id": team_id,
+            "max_budget": 1000,
+        },
+    )
+    key = gen["key"]
+
+    # Drive a request WITH THAT KEY (not the master key) so UserAPIKeyAuth carries
+    # our identity into the success hook.
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers={"Authorization": "Bearer " + key},
+        json={
+            "model": "qwen3-coder",
+            "messages": [{"role": "user", "content": "ping identity"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+
+    data = _poll_dash(
+        lambda d: any(
+            rq.get("key_alias") == key_alias for rq in d.get("requests", [])
+        )
+    )
+
+    # (a) the per-request row carries the caller's synthetic identity.
+    reqs = [
+        rq for rq in data.get("requests", []) if rq.get("key_alias") == key_alias
+    ]
+    assert reqs, (
+        "dashboard has no request row carrying the minted key's alias %r: %r"
+        % (key_alias, data.get("requests"))
+    )
+    rq = reqs[0]
+    assert rq.get("user_id") == user_id, (
+        "request row must carry the key's user_id: %r" % rq
+    )
+    assert rq.get("team_id") == team_id, (
+        "request row must carry the key's team_id: %r" % rq
+    )
+
+    # (b) the per-key rollup aggregates that identity's traffic.
+    keys = [k for k in data.get("keys", []) if k.get("key_alias") == key_alias]
+    assert keys, (
+        "dashboard per-key rollup is missing the minted key %r: %r"
+        % (key_alias, data.get("keys"))
+    )
+    k = keys[0]
+    assert k.get("user_id") == user_id and k.get("team_id") == team_id, (
+        "per-key rollup must carry the key's user+team: %r" % k
+    )
+    assert k.get("requests") >= 1, "per-key rollup must count the request: %r" % k
+    assert k.get("tokens"), "per-key rollup must total the key's tokens: %r" % k
 
 
 # --- fleet dashboard v2: the control-plane registry, made visible (goal 13) --

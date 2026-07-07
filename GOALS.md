@@ -68,18 +68,6 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 
 ## § Autonomy-friendly (safe to run unattended)
 
-### 15. Identity in routing records — *who* asked? — risk: low
-**Why:** `obs_callback.py`'s `async_post_call_success_hook` already receives
-`user_api_key_dict` and throws it away, so the dashboard shows where prompts
-went but never whose they were. Goal 11b proved key→user→team spend attribution
-in Postgres, but the routing-record path (goal 3) and the dashboard (goal 12)
-are identity-blind. Guardrail: identities in tests are **synthetic** — key
-aliases and user ids like `repo-a`/`test-user`, never real names/emails.
-**Completion condition:**
-```
-delivered routing records carry {key_alias, user_id, team_id} sourced from user_api_key_dict (null when the master key / no key store is in play, so bare-pytest and cli-auth profiles keep working); the dashboard's per-request view shows key/user and gains a per-key rollup (requests, fallbacks, tokens, cost); an e2e test proves a request made with a minted key surfaces that key's alias+user+team in the dashboard's /api/records; synthetic identities only, no PII; e2e/run.sh exits 0 with its passing output surfaced in the conversation; squash-merged to main per CLAUDE.md with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR describing the decision needed
-```
-
 ### 16. Join the attempt trail to its request — trace correlation — risk: medium
 **Why:** the verified LiteLLM quirk ([docs/09](docs/09-observability.md)):
 `delivered` records carry no `trace_id`, so the dashboard shows attempts
@@ -228,4 +216,14 @@ decision is made.
   passes; `qwen3:4b` structures calls + passes probes but won't drive the loop
   (answers in prose); `qwen2.5-coder:3b/:7b` leak tool calls (no `<tool_call>`
   wrapper). Slow CPU-only (reasoning mode) but never a CI/merge gate. — PR #26 (2026-07)
+- ✅ 15. Identity in routing records — *who* asked? — `delivered` records now
+  carry the caller's synthetic identity `{key_alias, user_id, team_id}` sourced
+  from LiteLLM's `UserAPIKeyAuth` (`obs_callback._identity`; null under the master
+  key / no key store, so bare-pytest + cli-auth are unaffected). The dashboard's
+  per-request table shows key/user and gains a **Per key** rollup (`/api/records →
+  keys[]`: requests, fallbacks, tokens, cost; master-key traffic collapses into
+  one null-alias row). `test_dashboard_shows_minted_key_identity` mints a
+  synthetic alias+user+team key, drives a request with it, and proves the identity
+  round-trips to `/api/records` (row + rollup); offline shaping covered in
+  `dashboard_test.py`. Synthetic ids only, no PII. Docs: [docs/09](docs/09-observability.md). — PR #<n> (2026-07)
 - ✅ 14. Azure IaC skeleton — code only, offline-validated — Bicep (decision recorded over Terraform: `bicep build` validates fully offline; Azure-native; stateless) under `deploy/azure/`: `main.bicep` + modules for the gateway Container App (managed identity, Key Vault–referenced secrets, parameterised ingress), PostgreSQL Flexible Server (private persistent store), Key Vault (secrets + MI RBAC), and VNet (delegated subnets + NSG). Secrets are required `@secure()` params with no defaults; `main.example.bicepparam` carries commit-safe placeholders. `scripts/check.sh` fast tier gained an offline `bicep build`/`build-params` step (fails on ANY diagnostic, no cloud calls/creds), CI installs bicep via `az bicep install`, and the litellm image-pin guard now also covers `.bicep`. Parity doc [docs/11](docs/11-azure-iac.md) maps every dev-stack component to its Azure counterpart (with the deliberate gaps named). — PR #24 (2026-07)

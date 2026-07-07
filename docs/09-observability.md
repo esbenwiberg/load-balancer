@@ -20,7 +20,7 @@ Keyed by `event`:
 | `event`     | fired per…       | carries |
 |-------------|------------------|---------|
 | `llm_call`  | backend **attempt** (success *or* failure) | `requested_group`, `backend`, `backend_model_id`, `api_base`, `tier`, `latency_ms`, `tokens`, and on failure `error_code`/`error_class`, plus `litellm_call_id`/`trace_id` |
-| `delivered` | client **request** (the final response) | `requested_model`, `served_model`, `served_model_id`, `api_base`, `provider`, `response_cost`, `tokens`, `fallback` |
+| `delivered` | client **request** (the final response) | `requested_model`, `served_model`, `served_model_id`, `api_base`, `provider`, `response_cost`, `tokens`, `fallback`, and the caller's identity `key_alias`/`user_id`/`team_id` (goal 15) |
 
 **Why two?** A fallback has two halves — *why the primary was abandoned* and
 *who ultimately answered*:
@@ -100,14 +100,42 @@ is a stdlib-only daemon (same shape as mockd) that is *both* a routing-record
 | route | purpose |
 |-------|---------|
 | `POST /records` | obs_callback webhook target — append one record |
-| `GET /api/records` | the **data endpoint** the page fetches: `{count, requests[], attempts[], records[]}` |
+| `GET /api/records` | the **data endpoint** the page fetches: `{count, requests[], attempts[], keys[], records[]}` |
 | `GET /` | the read-only HTML page (auto-refreshes off `/api/records` every 2s) |
 | `POST /__reset` | clear the sink (test isolation, like mockd's `/__reset`) |
 
-The page shows two tables: **Requests** (requested alias → served backend, a
-`direct`/`fallback` badge, provider, tokens, cost — folded from the `delivered`
+The page shows three tables: a **Per key** rollup (goal 15 — see below),
+**Requests** (requested alias → served backend, a `direct`/`fallback` badge, the
+caller's `key`/`user`, provider, tokens, cost — folded from the `delivered`
 records) and the **Attempt trail** (every `llm_call`: backend, tier, status,
 latency, and on failure the error that triggered a fallback — the "why").
+
+### Identity — *who* asked? (goal 15)
+
+Goals 3 + 12 answered *where* a prompt went but never *whose* it was:
+`async_post_call_success_hook` received LiteLLM's `UserAPIKeyAuth`
+(`user_api_key_dict`) and discarded it. Goal 15 reads the caller's identity off
+it — `key_alias`, `user_id`, `team_id` (goal 11b's key→user→team binding) — and
+stamps it onto every `delivered` record (`obs_callback._identity`).
+
+- **Null-safe by design.** All three are `null` when the **master key** or **no
+  key store** authenticates the request — the master key carries no
+  alias/user/team, and the bare-pytest + cli-auth profiles use it. So those
+  profiles keep working and simply carry a null identity; no crash, no phantom id.
+- **Surfaced two ways.** The **Requests** table shows each row's `key`/`user`,
+  and a **Per key** rollup (`/api/records → keys[]`) aggregates per distinct
+  `key_alias`: requests, fallbacks, tokens, cost. Null-identity (master-key)
+  traffic collapses into a single `(master key / no key)` row rather than
+  scattering or vanishing.
+- **Synthetic only.** Test identities are aliases like `repo-a` and ids like
+  `e2e-user-…` — never real names or emails (CLAUDE.md guardrail).
+
+The assertion is `e2e/test_e2e.py::test_dashboard_shows_minted_key_identity`: it
+mints a key bound to a synthetic alias+user+team, drives a request **with that
+key**, and asserts the identity round-trips to the dashboard's `/api/records` on
+both the request row and the per-key rollup. Offline shaping (identity
+pass-through, rollup aggregation, null collapse) is covered in
+`e2e/dashboard_test.py` in the fast tier.
 
 ### Build-vs-reuse (a reversible call, decided per CLAUDE.md)
 
