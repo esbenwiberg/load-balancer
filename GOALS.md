@@ -68,15 +68,8 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 
 ## § Autonomy-friendly (safe to run unattended)
 
-### 18. TTFT for streamed responses — risk: medium
-**Why:** the [docs/09](docs/09-observability.md) caveat: `latency_ms` is
-time-to-completion. For agent UX, time-to-first-token is the felt latency, and
-workbench-vs-Foundry comparisons are meaningless without it (a slow-TTFT local
-model "wins" on paper while feeling dead).
-**Completion condition:**
-```
-llm_call records for streamed responses carry ttft_ms measured from LiteLLM's own timestamps (completion_start_time or a verified equivalent — verified against the pinned 1.83.x, not guessed; if the pinned version exposes no usable timestamp, complete by documenting that finding in docs/09 instead), the dashboard surfaces it, and an e2e test asserts a streamed request's record has ttft_ms present and <= latency_ms; non-streamed records may omit it; the docs/09 streaming caveat is updated; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR
-```
+_None queued right now — the last batch (goals 15–18) is done; see § Done. Add
+new autonomy-friendly goals here as the next status audit vets them._
 
 ---
 
@@ -126,6 +119,7 @@ decision is made.
    its condition literally holds on `main` — if in doubt, re-check it, don't
    trust the checkmark.
 
+- ✅ 18. TTFT for streamed responses — PR #__PR__ (2026-07)
 - ✅ Phase-0 groundwork (blockers A & B, conformance harness, deploy scaffold) — PR #1
 - ✅ E2E test harness (mock + cli-auth profiles) — PR #2
 - ✅ Goal-driven workflow (GOALS.md backlog + unattended contract) — PR #3

@@ -7,9 +7,15 @@ observability stack (no Langfuse, no OTEL collector, no Postgres read).
 It emits two record shapes, keyed by `event`:
 
   * llm_call  — one per BACKEND ATTEMPT (success OR failure). Carries the
-                backend that was tried, its tier, per-attempt latency, tokens,
-                and — on failure — the error that TRIGGERED a fallback (the
-                "why", e.g. a 503/429). This is the attempt trail.
+                backend that was tried, its tier, per-attempt latency (time to
+                COMPLETION), tokens, and — on failure — the error that TRIGGERED
+                a fallback (the "why", e.g. a 503/429). This is the attempt trail.
+
+                TTFT (goal 18): a STREAMED attempt also carries `ttft_ms`, the
+                time-to-first-token (the FELT latency for an agent), read from
+                LiteLLM's own completionStartTime timestamp. Non-streamed records
+                OMIT it. By construction ttft_ms <= latency_ms. See _ttft_ms /
+                _latency_ms below and docs/09-observability.md.
 
                 ⚠️ LiteLLM quirk (verified against v1.83.14): on a proxy
                 fallback the WINNING deployment does NOT fire a success event —
@@ -134,6 +140,55 @@ def _tier(kwargs) -> str | None:
     return (md.get("model_info") or {}).get("backend_tier")
 
 
+def _latency_ms(slo) -> float | None:
+    """Time-to-COMPLETION of the attempt, in ms — end minus start.
+
+    Deliberately computed from the raw `startTime`/`endTime` timestamps rather
+    than LiteLLM's `response_time`, because on the pinned v1.83.14-stable
+    `response_time` is NOT time-to-completion for a STREAMED call: LiteLLM's
+    `StandardLoggingPayloadSetup.get_response_time` returns
+    `completionStartTime - startTime` (i.e. TTFT) when `stream=True`, and only
+    `endTime - startTime` otherwise. Sourcing latency straight from the
+    timestamps keeps latency_ms meaning time-to-completion for BOTH streamed and
+    non-streamed attempts, so the ttft_ms below is a true subset of it. Falls
+    back to `response_time` only when the timestamps are absent (e.g. a
+    non-proxy code path), preserving the pre-goal-18 value there."""
+    start = slo.get("startTime")
+    end = slo.get("endTime")
+    if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+        return round((end - start) * 1000, 1)
+    rt = slo.get("response_time")
+    return round(rt * 1000, 1) if isinstance(rt, (int, float)) else None
+
+
+def _ttft_ms(slo) -> float | None:
+    """Time-to-first-token, in ms — the FELT latency of a STREAMED response
+    (goal 18). Measured from LiteLLM's own timestamps: `completionStartTime`
+    minus `startTime`.
+
+    LiteLLM stamps `completionStartTime` at the moment the first token arrives
+    (`Logging._update_completion_start_time`, called from the streaming wrapper),
+    and marks the payload `stream: True` once the streamed response is complete.
+    For a NON-streamed call `completionStartTime` defaults to `endTime`, so TTFT
+    would just equal latency and carry no signal — hence we return None unless
+    the payload is explicitly `stream: True`, and non-streamed records OMIT
+    ttft_ms entirely.
+
+    Verified against the pinned litellm==1.83.14: StandardLoggingPayload carries
+    {startTime, completionStartTime, stream} (litellm/types/utils.py) and the
+    streaming path populates completionStartTime with the first-chunk time. See
+    docs/09. Clamped at >= 0 so any sub-ms clock jitter can't yield a spurious
+    negative; by construction startTime <= completionStartTime <= endTime, so a
+    real value is always <= latency_ms."""
+    if not slo.get("stream"):
+        return None
+    start = slo.get("startTime")
+    first = slo.get("completionStartTime")
+    if isinstance(start, (int, float)) and isinstance(first, (int, float)):
+        return max(round((first - start) * 1000, 1), 0.0)
+    return None
+
+
 def _identity(user_api_key_dict) -> dict:
     """The synthetic identity of the CALLER, read off LiteLLM's UserAPIKeyAuth
     (the `user_api_key_dict` the success hook receives and, until goal 15, threw
@@ -166,8 +221,7 @@ def _llm_call_record(kwargs, fallback_status: str) -> dict:
     """Build an `llm_call` record from a success/failure event's kwargs."""
     slo = kwargs.get("standard_logging_object") or {}
     err = slo.get("error_information") or {}
-    rt = slo.get("response_time")
-    return {
+    record = {
         "event": "llm_call",
         "status": slo.get("status") or fallback_status,
         # The alias the client asked for (the router "model group").
@@ -177,7 +231,9 @@ def _llm_call_record(kwargs, fallback_status: str) -> dict:
         "backend_model_id": (slo.get("model_id") or "")[:12] or None,
         "api_base": slo.get("api_base"),
         "tier": _tier(kwargs),
-        "latency_ms": round(rt * 1000, 1) if isinstance(rt, (int, float)) else None,
+        # Time-to-completion of the attempt (see _latency_ms — sourced from raw
+        # timestamps so it stays completion-time even for streamed calls).
+        "latency_ms": _latency_ms(slo),
         "tokens": {
             "prompt": slo.get("prompt_tokens"),
             "completion": slo.get("completion_tokens"),
@@ -193,6 +249,14 @@ def _llm_call_record(kwargs, fallback_status: str) -> dict:
         # matching `delivered` request by this id.
         "correlation_id": slo.get("trace_id"),
     }
+    # TTFT (goal 18): the felt latency of a STREAMED response — present ONLY on
+    # streamed attempts. Non-streamed records omit the key entirely (for them
+    # first-token == completion, so it would carry no signal). By construction
+    # ttft_ms <= latency_ms. See _ttft_ms + docs/09.
+    ttft = _ttft_ms(slo)
+    if ttft is not None:
+        record["ttft_ms"] = ttft
+    return record
 
 
 class RoutingRecorder(CustomLogger):
