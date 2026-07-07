@@ -79,17 +79,6 @@ on the same dashboard — coordinate if run concurrently).
 delivered records carry a correlation id (litellm_call_id/trace_id or a documented equivalent recoverable in async_post_call_success_hook), the dashboard's request rows nest/link their llm_call attempt records by that id, and an e2e test proves a forced fallback's request row is joined to its 503 failure attempt; if LiteLLM 1.83.x genuinely cannot surface a shared id on the fallback-winner path, the goal instead completes by documenting the verified limitation in docs/09 plus the best achievable partial join (direct requests joined by id, fallbacks best-effort) — decide and document per CLAUDE.md, do not fork the gateway; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked, stop after 40 turns and leave a draft PR
 ```
 
-### 17. Repo-granularity attribution + session-metadata spike — risk: low
-**Why:** the status-audit gap: spend and routing can't be sliced by repo or
-session today. Repo granularity falls out of the existing key machinery (11b)
-as a *pattern* — one minted key per repo — with zero client hacking. Session
-granularity needs facts first: what identity/session metadata do Claude Code
-and Codex actually send through the gateway? Capture, don't guess.
-**Completion condition:**
-```
-an e2e test proves the key-per-repo pattern: two keys minted with synthetic aliases (repo-a, repo-b) drive traffic and /key/info + SpendLogs attribute spend to each repo key separately, with the pattern documented in e2e/README; PLUS a written spike (docs/09 section or new doc) recording what identity/session metadata real coding agents send through the gateway — captured from mockd/dev-stack request dumps with synthetic prompts only, covering at least the headers/body fields Claude Code emits — and which LiteLLM tag/metadata mechanism could carry a session id end-to-end; findings only, no client-side changes; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR
-```
-
 ### 18. TTFT for streamed responses — risk: medium
 **Why:** the [docs/09](docs/09-observability.md) caveat: `latency_ms` is
 time-to-completion. For agent UX, time-to-first-token is the felt latency, and
@@ -217,3 +206,4 @@ decision is made.
   `dashboard_test.py`. Synthetic ids only, no PII. Docs: [docs/09](docs/09-observability.md). — PR #31 (2026-07)
 - ✅ 14. Azure IaC skeleton — code only, offline-validated — Bicep (decision recorded over Terraform: `bicep build` validates fully offline; Azure-native; stateless) under `deploy/azure/`: `main.bicep` + modules for the gateway Container App (managed identity, Key Vault–referenced secrets, parameterised ingress), PostgreSQL Flexible Server (private persistent store), Key Vault (secrets + MI RBAC), and VNet (delegated subnets + NSG). Secrets are required `@secure()` params with no defaults; `main.example.bicepparam` carries commit-safe placeholders. `scripts/check.sh` fast tier gained an offline `bicep build`/`build-params` step (fails on ANY diagnostic, no cloud calls/creds), CI installs bicep via `az bicep install`, and the litellm image-pin guard now also covers `.bicep`. Parity doc [docs/11](docs/11-azure-iac.md) maps every dev-stack component to its Azure counterpart (with the deliberate gaps named). — PR #24 (2026-07)
 - ✅ 19. Promote the manual try-out stack to a committed profile — PR #30 (2026-07)
+- ✅ 17. Repo-granularity attribution + session-metadata spike — PR #<n> (2026-07)

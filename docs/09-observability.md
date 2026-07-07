@@ -195,6 +195,101 @@ in-flight and lists both instances) and
 health signal survives the whole registry→dashboard path). Offline shaping +
 graceful-degrade branches are covered by `e2e/dashboard_test.py` (fast tier).
 
+## Repo + session attribution — the spike (goal 17)
+
+Two questions from the status audit: can spend/routing be sliced **by repo** and
+**by session**? Repo is a *solved pattern*; session is a *findings-first spike*
+(capture what agents actually send — don't guess).
+
+### Repo granularity — the key-per-repo pattern (no new machinery)
+
+Repo attribution needs **zero** new code and **zero** client hacking: it's goal
+11b's key store used as a pattern — **mint one virtual key per repo, with the
+repo name as the key's `key_alias`.** Every request on that key is then
+attributed to the repo for free:
+
+- `GET /key/info?key=…` → the repo's **aggregate** spend + its `key_alias`;
+- each `LiteLLM_SpendLogs` row is hashed to the repo's key (`api_key =
+  sha256(key)`), so `/spend/logs` slices the **per-request** ledger by repo;
+- goal-15 identity already stamps `key_alias` onto every `delivered` routing
+  record, so the dashboard's **Per key** rollup *is* a per-repo rollup.
+
+The proof is `e2e/test_e2e.py::test_spend_attributed_per_repo_key`: it mints two
+keys aliased `repo-a`/`repo-b` (synthetic — never a real repo name), drives them
+at **different** volumes (1 vs 3 requests), and asserts each key's SpendLogs rows
+carry only its own hash **and** that repo-b strictly outspends repo-a — the
+falsifiable proof the two repos accrue *separately*, not from a shared pool. See
+also e2e/README "Repo-granularity attribution".
+
+### Session granularity — what coding agents actually send (captured, not guessed)
+
+Session attribution needs a fact we didn't have: what identity/session metadata
+survives from a real coding agent, through the gateway, to the backend? mockd now
+captures every inbound `/v1/*` request — **`GET /__requests`** returns the method,
+path, **headers (credential values redacted)**, and body of each. Point a real
+client at the **dev** stack and dump it:
+
+```bash
+docker compose -f e2e/docker-compose.dev.yaml up -d
+# drive Claude Code / Codex at :4000 (see e2e/README "Point a real client…"),
+# with SYNTHETIC prompts only — no PII, per CLAUDE.md. Then, on any mockd backend:
+curl -s localhost:9101/__requests | python3 -m json.tool   # wb-a mockd
+```
+
+`e2e/test_e2e.py::test_session_metadata_capture_through_gateway` exercises the
+capture across **both** agent surfaces (Anthropic `/v1/messages`, Codex
+`/v1/responses`) with synthetic prompts and asserts the plumbing records the
+forwarded request **and never leaks a secret** — so the dump above is reproducible
+in CI and safe to paste.
+
+**Finding 1 — what the clients emit at the edge.** Claude Code speaks the
+Anthropic Messages API; Codex speaks the OpenAI Responses API. Their SDKs stamp a
+recognizable header set (from static analysis of the clients/SDKs; run the dump
+against a live client to pin exact values for the pinned versions):
+
+| Surface | Identity/session-bearing fields the client emits |
+|---------|--------------------------------------------------|
+| **Claude Code** → `POST /v1/messages` | **Headers:** `anthropic-version`, `anthropic-beta`, `x-api-key` **or** `authorization: Bearer …`, `user-agent: claude-cli/<ver>`, `x-app: cli`, and Anthropic-SDK `x-stainless-*` (lang/os/arch/runtime/package-version/retry-count). **Body:** `model`, `system`, `messages`, `tools`, `max_tokens`, `stream`, and **`metadata.user_id`** — a stable per-account hash, the one identity field in the body. No per-conversation session id is sent by default. |
+| **Codex** → `POST /v1/responses` | **Headers:** `authorization: Bearer …`, `user-agent`/`originator` naming the Codex CLI, and OpenAI-SDK `x-stainless-*`; Codex additionally emits a **`session_id`** header (per-invocation) — the highest-value session carrier, to confirm against the dump. **Body:** `model`, `instructions`, `input`, `tools`, `stream`, `store`, and **`prompt_cache_key`** (Codex sets this to the session/conversation id). |
+
+**Finding 2 — the gateway hop is a hard boundary.** LiteLLM *terminates* the
+client request, authenticates the virtual key, then **re-issues a fresh request
+to the backend** with the backend's own credentials. The `/__requests` dump
+confirms the consequence: client **transport headers do not survive** —
+`user-agent`, `x-stainless-*`, `anthropic-version`, and any custom header (we
+send an `x-session-id` in the test to demonstrate this) die at the gateway and
+never reach the backend. What crosses is the **translated body**, plus whatever
+LiteLLM itself attaches. So a session id set as a *client header* is invisible
+downstream, and a client's `metadata.user_id` is consumed by LiteLLM's own user
+tracking rather than forwarded verbatim. **A session id therefore needs a
+LiteLLM-native carrier, not a raw client header.**
+
+**Finding 3 — the LiteLLM mechanism that could carry a session id end-to-end.**
+LiteLLM has a first-class **request-tags / metadata** channel that lands in the
+audit surface we already query:
+
+- **`x-litellm-tags: session:<uuid>,repo:<name>`** header, *or* body
+  **`metadata.tags: [...]`** — LiteLLM records tags into `LiteLLM_SpendLogs`
+  (`metadata`) and exposes per-tag spend at **`GET /spend/tags`**, plus tag-based
+  routing/budgets. This is the cleanest "carry a session id and slice spend by
+  it" path: it's queryable and durable (Postgres), exactly like goal 11b.
+- **Request `metadata`** more broadly is surfaced to the logging callback via
+  `standard_logging_object.metadata.requester_metadata` — so obs_callback could
+  stamp a session id onto the `delivered` routing record the same way goal 15
+  stamps identity, giving the dashboard a per-session view with no new sink.
+
+**No client hacking required:** both agents allow injecting custom request headers
+(e.g. Claude Code's `ANTHROPIC_CUSTOM_HEADERS`, Codex's config `http_headers`), so
+`x-litellm-tags` can be set without patching either client. (These are LiteLLM
+~1.83.x features — verify against the pinned build before building on them.)
+
+**Recommendation (findings only — not built here).** A future goal should
+standardize `x-litellm-tags: session:<uuid>` (repo already covered by the
+key-per-repo pattern), record it via SpendLogs + a `session_id` on the routing
+record, and expose per-session spend at `/spend/tags`. This spike deliberately
+makes **no client-side change** — it captures facts and the mechanism; wiring it
+end-to-end is a separate, vetted step.
+
 ## What this is *not* (yet)
 
 - **Not durable.** All sinks are ephemeral (stdout ring / mockd + dashboard

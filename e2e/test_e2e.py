@@ -1779,3 +1779,219 @@ def test_spend_survives_gateway_restart():
     assert _nonzero(key_after), (
         "issued key + its spend must persist across restart: %r" % key_after
     )
+
+
+# --- repo-granularity attribution: the key-per-repo pattern (goal 17) ---------
+#
+# Repo granularity needs NO new machinery and NO client hacking — it falls out of
+# goal 11b's key store as a PATTERN: mint one virtual key per repo, with the repo
+# name as the key's `key_alias`. Every request on that key is then attributed to
+# the repo automatically — /key/info gives the repo's aggregate spend, and each
+# LiteLLM_SpendLogs row is hashed to the repo's key. This test proves the pattern
+# end to end with two synthetic repos (repo-a, repo-b) driven at DIFFERENT
+# volumes, so "attributed separately" is falsifiable: if attribution leaked, the
+# per-key row counts / spends would not track each repo's own traffic.
+#
+# GUARDRAIL: aliases are synthetic repo handles (repo-a/repo-b), never a real
+# repo/customer name — no PII, per CLAUDE.md.
+
+
+def _mint_repo_key(repo_alias):
+    """Key-per-repo pattern: mint ONE virtual key whose `key_alias` IS the repo
+    name. Returns (alias, key). No user/team needed — the repo axis is purely the
+    alias, which is exactly the "zero client hacking" point of the pattern."""
+    alias = _unique(repo_alias)
+    gen = _admin_post(
+        "/key/generate",
+        {"models": ["qwen3-coder"], "key_alias": alias, "max_budget": 1000},
+    )
+    return alias, gen["key"]
+
+
+def _spend_log_rows_for_key(key):
+    """LiteLLM_SpendLogs rows whose `api_key` is the unsalted sha256 of `key` —
+    the per-request ledger sliced to ONE repo key. Try the server-side api_key
+    filter first, fall back to unfiltered + client-side filter, and normalize the
+    list shape either way (same tolerance as _spend_log_rows_for)."""
+    key_hash = hashlib.sha256(key.encode()).hexdigest()
+    for path in ("/spend/logs?api_key=" + key_hash, "/spend/logs"):
+        r = httpx.get(GATEWAY + path, headers=AUTH, timeout=TIMEOUT)
+        if r.status_code != 200:
+            continue
+        data = r.json()
+        rows = (
+            data
+            if isinstance(data, list)
+            else (data.get("data") or data.get("logs") or [])
+        )
+        rows = [x for x in rows if x.get("api_key") == key_hash]
+        if rows:
+            return rows
+    return []
+
+
+def _key_alias_of(info):
+    """Pull `key_alias` out of a /key/info response, tolerating the top-level vs
+    nested-under-`info` shape."""
+    if not isinstance(info, dict):
+        return None
+    for c in (info, info.get("info")):
+        if isinstance(c, dict) and c.get("key_alias") is not None:
+            return c.get("key_alias")
+    return None
+
+
+def test_spend_attributed_per_repo_key():
+    """Goal 17: the key-per-repo pattern attributes spend to each repo SEPARATELY.
+
+    Mint one key per repo (alias == repo name), drive DIFFERENT traffic volumes
+    through each (repo-a: 1 request, repo-b: 3), then assert:
+      * each repo key's LiteLLM_SpendLogs rows are hashed to ONLY its own key —
+        the per-request ledger slices cleanly by repo (no cross-contamination);
+      * /key/info reports each repo's alias + nonzero aggregate spend; and
+      * repo-b (3x the traffic) strictly OUTSPENDS repo-a — the falsifiable proof
+        that spend tracks each repo's own traffic, not a shared/leaked pool.
+    Zero client-side changes: the repo axis is purely the minted key's alias.
+    """
+    alias_a, key_a = _mint_repo_key("repo-a")
+    alias_b, key_b = _mint_repo_key("repo-b")
+    _spend_traffic(key_a, n=1)
+    _spend_traffic(key_b, n=3)
+
+    # (1) per-request ledger: each repo key's rows carry ONLY its own key hash.
+    # Poll until all of each repo's requests have flushed to Postgres (the row
+    # filter itself — api_key == sha256(key) — is the separation guarantee).
+    rows_a = _poll(lambda: _spend_log_rows_for_key(key_a), lambda r: len(r) >= 1)
+    rows_b = _poll(lambda: _spend_log_rows_for_key(key_b), lambda r: len(r) >= 3)
+    assert len(rows_a) >= 1, "repo-a key has no SpendLogs row within %ss: %r" % (
+        SPEND_POLL_TIMEOUT,
+        rows_a,
+    )
+    assert len(rows_b) >= 3, (
+        "repo-b key sent 3 requests but the ledger has %d rows within %ss: %r"
+        % (len(rows_b), SPEND_POLL_TIMEOUT, rows_b)
+    )
+    for row in rows_a + rows_b:
+        assert "qwen3-coder" in str(row.get("model", "")), (
+            "repo spend-log row must name the served model: %r" % row
+        )
+        assert _nonzero(float(row.get("spend") or 0)), (
+            "per-request repo spend must be nonzero (costs configured): %r" % row
+        )
+
+    # (2) aggregate ledger: /key/info reports each repo's alias + nonzero spend.
+    info_a = _poll(
+        lambda: _admin_get("/key/info?key=" + key_a),
+        lambda i: _nonzero(_dig_spend(i)),
+    )
+    spend_a = _dig_spend(info_a)
+    assert _key_alias_of(info_a) == alias_a, (
+        "repo-a /key/info must carry its repo alias so spend is sliceable BY "
+        "repo: %r" % info_a
+    )
+    assert _nonzero(spend_a), "repo-a key ledger must show nonzero spend: %r" % spend_a
+
+    # repo-b outspends repo-a: poll /key/info for b until its spend exceeds a's
+    # fully-settled total (a never grows past its single request), which proves
+    # the two repos accrue independently rather than sharing a pool.
+    info_b = _poll(
+        lambda: _admin_get("/key/info?key=" + key_b),
+        lambda i: (_dig_spend(i) or 0) > spend_a,
+    )
+    spend_b = _dig_spend(info_b)
+    assert _key_alias_of(info_b) == alias_b, (
+        "repo-b /key/info must carry its repo alias: %r" % info_b
+    )
+    assert _nonzero(spend_b) and spend_b > spend_a, (
+        "repo-b (3x traffic) must outspend repo-a — separate per-repo "
+        "attribution: repo-a=%r repo-b=%r" % (spend_a, spend_b)
+    )
+
+
+# --- session-metadata spike: what do coding agents send? (goal 17) -----------
+#
+# Repo granularity (above) is a solved PATTERN. Session granularity needs FACTS
+# first: what identity/session metadata does a request actually carry by the time
+# it reaches the backend? mockd now captures every inbound /v1/* request (headers
+# + body, secrets redacted) at GET /__requests — so the dev-stack can DUMP what a
+# real `claude`/`codex` sends (see docs/09 "Session + repo attribution — the
+# spike"). This test drives BOTH coding-agent surfaces through the gateway with
+# SYNTHETIC prompts and asserts the capture mechanism records the forwarded
+# request safely (redacted) — making the spike's dumps reproducible in CI.
+#
+# It is a CAPTURE/plumbing test, not a client-behavior assertion: exactly which
+# client fields survive the gateway hop is the spike's finding, documented in
+# docs/09 — deliberately NOT hard-asserted here so a LiteLLM version bump that
+# changes forwarding can't turn a findings-doc into a red gate.
+
+
+def _mockd_requests():
+    """The inbound /v1/* requests mockd captured (headers redacted) so far."""
+    r = httpx.get(MOCKD + "/__requests", timeout=TIMEOUT)
+    assert r.status_code == 200, r.text
+    return r.json().get("requests", [])
+
+
+def test_session_metadata_capture_through_gateway():
+    """Goal 17 spike: the request-capture plumbing that feeds the session-metadata
+    findings works, and never leaks a secret.
+
+    Drive Claude Code's surface (Anthropic /v1/messages) AND Codex's surface
+    (/v1/responses) through the gateway with synthetic prompts + a synthetic
+    session marker, then read mockd /__requests and assert:
+      * the gateway forwarded a translated backend request we can capture; and
+      * every captured request's credential header is REDACTED (never a raw
+        token) — so a dump is safe to print in CI or paste into the doc.
+    """
+    session_id = _unique("session")  # synthetic — never a real id, per CLAUDE.md
+
+    # Claude Code's native surface. Includes the Anthropic `metadata.user_id`
+    # field (a documented client-side identity carrier) + a custom session header,
+    # so a dump shows whether either survives the gateway hop (the finding).
+    r = httpx.post(
+        GATEWAY + "/v1/messages",
+        headers={
+            "Authorization": "Bearer " + KEY,
+            "anthropic-version": "2023-06-01",
+            "x-session-id": session_id,
+        },
+        json={
+            "model": "qwen3-coder",
+            "max_tokens": 64,
+            "metadata": {"user_id": session_id},
+            "messages": [{"role": "user", "content": "ping session"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+
+    # Codex's surface (Responses -> Chat bridge).
+    r = httpx.post(
+        GATEWAY + "/v1/responses",
+        headers={"Authorization": "Bearer " + KEY, "x-session-id": session_id},
+        json={
+            "model": "qwen3-coder",
+            "input": [{"role": "user", "content": "ping session"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+
+    reqs = _mockd_requests()
+    assert reqs, "mockd captured no inbound requests — capture plumbing is broken"
+    # Both surfaces translate to /v1/chat/completions toward the backend.
+    assert any("/v1/chat/completions" in q.get("path", "") for q in reqs), (
+        "no forwarded backend chat request captured: %r" % [q.get("path") for q in reqs]
+    )
+    # The safety contract: no captured request may expose a raw credential.
+    for q in reqs:
+        headers = q.get("headers") or {}
+        auth = next(
+            (v for k, v in headers.items() if k.lower() == "authorization"), None
+        )
+        if auth is not None:
+            assert "<redacted>" in auth and KEY not in auth, (
+                "captured Authorization header must be redacted, got %r" % auth
+            )
+        # every capture must carry the shape the dump documents
+        assert isinstance(q.get("body"), dict), "captured request must record a body"

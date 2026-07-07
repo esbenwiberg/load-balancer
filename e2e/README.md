@@ -201,6 +201,35 @@ persistence question answered — **keys and their spend survive a restart.**
 (`prod`/`deploy` today runs stateless with no DB; the same endpoints and audit
 work identically once a Postgres is wired behind it.)
 
+### Repo-granularity attribution — the key-per-repo pattern (goal 17)
+
+Slicing spend **by repo** needs no new machinery and no client changes: it's the
+spend audit above used as a **pattern** — mint **one key per repo, with the repo
+name as the `key_alias`**. Every request on that key is then attributed to the
+repo automatically:
+
+```bash
+MASTER="$LITELLM_MASTER_KEY"; H="Authorization: Bearer $MASTER"
+# one minted key per repo — the repo name is just the key_alias (synthetic; no PII)
+KEY_A=$(curl -sX POST localhost:4000/key/generate -H "$H" \
+  -d '{"models":["qwen3-coder"],"key_alias":"repo-a"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['key'])")
+# drive that repo's traffic with KEY_A, then read its slice:
+curl -s "localhost:4000/key/info?key=$KEY_A" -H "$H"     # -> info.key_alias + info.spend (repo aggregate)
+curl -s "localhost:4000/spend/logs?api_key=$(python3 -c "import hashlib,os;print(hashlib.sha256('$KEY_A'.encode()).hexdigest())")" -H "$H"  # per-request rows for this repo
+```
+
+Because goal-15 already stamps `key_alias` onto each routing record, the
+dashboard's **Per key** rollup doubles as a **per-repo** rollup.
+
+**What the suite proves.** `test_spend_attributed_per_repo_key` mints two keys
+aliased `repo-a`/`repo-b`, drives them at **different** volumes (1 vs 3), and
+asserts each repo key's `SpendLogs` rows carry only its own key hash **and** that
+repo-b strictly outspends repo-a — the falsifiable proof the repos accrue
+*separately*. Session granularity is a separate, findings-first spike (see
+[docs/09 "Repo + session attribution — the spike"](../docs/09-observability.md));
+mockd's **`GET /__requests`** (headers redacted) is the capture endpoint that
+feeds it — point a real client at the dev stack and dump what reaches the backend.
+
 ### Observability — "where did my prompt go?" (goal 3)
 
 Every request leaves a per-request routing trail: **{chosen backend, why,
