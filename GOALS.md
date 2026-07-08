@@ -55,7 +55,9 @@ guards, both dashboard halves, control plane, Ollama profile, Azure IaC) is
 prompts went but not *whose* they were, attempts aren't joined to requests,
 and there's no repo/session slicing or TTFT. Recommended order:
 identity (15) → repo/session attribution (17) → manual profile (19) →
-trace join (16) → TTFT (18). Spark-infra-shaped work stays parked.
+trace join (16) → TTFT (18); the Fugu-inspired pair slots after — overhead
+attribution (20, needs 16) and the shadow complexity spike (21, independent).
+Spark-infra-shaped work stays parked.
 The keystone § Needs-a-human item remains the **routing-granularity decision**
 — it unblocks the actual task-aware router (the control plane is a registry
 nobody consumes until that call is made); pair it with the LiteLLM-vs-archgw
@@ -70,6 +72,34 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 
 _None queued right now — the last batch (goals 15–18) is done; see § Done. Add
 new autonomy-friendly goals here as the next status audit vets them._
+
+### 20. Router-overhead attribution — visible vs consumed tokens — risk: low
+**Why:** the Fugu lesson (Sakana's orchestration model, reverse-engineered by
+Requesty 2026-06): a request returning ~2,200 visible tokens consumed ~22,700
+total — a 10x overhead invisible to the client. Our gateway has the same
+failure mode in miniature: retries and failed fallback attempts consume
+backend tokens the `delivered` record never rolls up. Today attempts and
+requests aren't even joined (goal 16), so per-request true cost is
+unanswerable. Prereq: **goal 16** (the attempt↔request join is the substrate).
+**Completion condition:**
+```
+the dashboard's per-request view carries {tokens_delivered, tokens_consumed} where tokens_consumed sums tokens across ALL attempts joined to the request (failed + retried + winner; attempts with no usage reported count 0 and that convention is documented), plus a fleet/summary rollup of overhead (consumed vs delivered) so a silently-expensive routing config is visible at a glance; an e2e test proves a forced-fallback request reports tokens_consumed > tokens_delivered while a clean direct request reports them equal; docs/09 gains an "overhead attribution" note recording the Fugu 10x rationale; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked (including: goal 16 not yet on main), stop after 30 turns and leave a draft PR
+```
+
+### 21. Complexity-signal spike — shadow-mode request classifier — risk: low
+**Why:** Fugu/TRINITY's core routing lever is a *per-request* complexity gate
+(trivial → one cheap worker, hard → escalate); TRINITY does it with a ~0.6B
+coordinator. Our routing-granularity decision is parked (Needs-a-human), but
+the *telemetry* isn't blocked: tag every routing record with a cheap heuristic
+complexity score in shadow mode — zero influence on routing — so when the
+human decision lands, the router is designed against real request
+distributions instead of guesses. Deliberate anti-Fugu constraints: the
+heuristic is deterministic + documented (auditable, unlike Fugu's proprietary
+routing), and it must never buffer or delay the request path.
+**Completion condition:**
+```
+routing records gain a shadow complexity tag computed in the existing callback from request features only (documented heuristic over e.g. prompt/message token count, presence and size of tools[], message-turn count — no extra model calls, no added latency path, no influence on routing whatsoever); the dashboard surfaces the tag per request plus a distribution rollup; an e2e test proves a trivial one-line prompt and a tool-heavy multi-turn agentic request land in different buckets; a docs section (docs/09 or docs/10) records the Fugu/TRINITY inspiration, the heuristic's exact features, and how the signal would feed the future task-aware router once the routing-granularity decision is made; no routing behavior changes anywhere; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR
+```
 
 ---
 
@@ -89,6 +119,17 @@ decision is made.
   the whole router. Decide with a human, *then* the implementation becomes an
   autonomy-friendly goal.
 - **LiteLLM-only vs `archgw` evaluation** — architecture fork; research + a call.
+- **Verify-then-escalate as a routing primitive** — quality-based fallback
+  (Fugu/TRINITY's Verifier role): try local first, run a cheap verification
+  pass, escalate to Foundry only on failure — vs our current
+  availability-based fallback. Design fork with real teeth: what verifies
+  (heuristic? judge model? conformance-style probe?), loop/token budget,
+  latency floor (Fugu Ultra's is 8–160s — the cautionary tale), and it
+  interacts directly with the routing-granularity decision above. Decide
+  together with that call; afterwards the implementation is likely an
+  autonomy-friendly goal. Hard constraints regardless of outcome: routing
+  stays deterministic + auditable, and never buffer the stream behind
+  orchestration.
 - **First Azure deploy + exposure model** (after goal 14) — subscription/resource
   choices, private endpoint vs public + IP allowlist, TLS, dashboard auth, who
   gets keys and how they rotate. A hosted OpenAI-compatible proxy with Foundry
