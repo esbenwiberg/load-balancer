@@ -18,6 +18,12 @@ to Qwen and turn 4 to Opus:
 ("taste *every* request and route it") is probably wrong for coding agents.
 **Open:** can we even reliably detect "session start" from a stateless proxy? (Heuristics:
 new/empty transcript, first message, a client-provided session header?)
+**→ DECIDED (2026-07-08): hybrid — see the decision block after risk 2.** On session
+detection, goal 17's spike ([docs/09](09-observability.md)) turned the open question into
+facts: Codex already emits a per-invocation `session_id` (+ `prompt_cache_key`); Claude
+Code sends no conversation id by default but supports header injection
+(`ANTHROPIC_CUSTOM_HEADERS`) and LiteLLM carries `x-litellm-tags` end-to-end; transcript
+shape (empty vs prior-turns) is the no-cooperation fallback heuristic.
 
 ### 2. Can you actually "taste" a coding-agent request well?
 A coding-agent turn is not a clean single-intent query. It's a huge blob: system prompt,
@@ -28,6 +34,38 @@ we mis-provisioned.
 **Open:** is session-start tasting good enough, or do we need to allow *one* escalation
 hop (e.g. bump to Foundry when a turn exceeds some complexity, accepting the cache/format
 cost once)?
+
+> **DECISION (2026-07-08) — routing granularity: HYBRID.** Made at the keyboard after
+> the Fugu research session (GOALS.md 2026-07-08; Sakana's Fugu does per-request routing
+> by *owning the conversation surface* — an orchestration model that rewrites prompts
+> per worker and normalizes every response, paying ~10x token overhead, 8–160s latency,
+> and total routing opacity. A pass-through gateway in front of *client-side* stateful
+> agent loops has none of those affordances, so naive per-request routing stays wrong
+> here — risks 1–2 stand). The decided shape:
+>
+> 1. **Sessions route sticky, at session granularity.** A request that belongs to a
+>    stateful conversation (session id when the client provides one, transcript-shape
+>    heuristic when it doesn't) pins to the backend the session started on. No
+>    mid-session backend swaps — tool-call format continuity and prompt-cache reuse win.
+> 2. **Stateless one-shots route per-request, freely.** Traffic with no conversational
+>    state (empty/single-turn transcript, no tool history — e.g. Claude Code's
+>    background/haiku-class calls) has no format-continuity problem; route it to the
+>    cheapest capable backend every time. Goal 21's shadow classifier separates these
+>    shapes already.
+> 3. **One escalation hop per session, upward only.** A session may escalate
+>    local → Foundry once (accepting the one-time cache/format cost); it never
+>    de-escalates — big-tier models tolerate a foreign-format transcript far better
+>    than small local ones, so downward moves are where risk-1 breakage actually bites.
+>    The escalation *trigger* (complexity threshold vs verify-then-escalate vs manual)
+>    is deliberately NOT decided here — it is the remaining open sub-question, parked
+>    in GOALS.md § Needs-a-human, to be designed against goal 21's accumulating
+>    traffic-mix telemetry.
+>
+> Hard constraints carried over from the Fugu research: routing stays deterministic +
+> auditable (per-request records must prove which backend saw every prompt — the
+> data-governance moat), and never buffer the stream behind a routing decision.
+> Implementation is unblocked but engine-shaped: the hybrid's requirements are the
+> input to the LiteLLM-vs-`archgw` evaluation (checklist below).
 
 ### 3. Spark interactive latency for big models
 A 30B-class model on a Spark is **single-digit tok/s for one user.** A coding agent
@@ -219,7 +257,10 @@ depend on a flaky component.
       **→ risk 4: YES on paper via `use_chat_completions_api` (1.83.x-stable); smoke-test pending.**
 - [x] Verify Anthropic-on-Foundry API surface + LiteLLM provider support.
       **→ risk 5: `azure_ai/<deployment>` + `/anthropic` base URL; wired into the scaffold.**
-- [ ] Decide routing granularity: session-only (safe) vs allow-one-escalation (riskier).
+- [x] Decide routing granularity: session-only (safe) vs allow-one-escalation (riskier).
+      **→ DECIDED 2026-07-08: HYBRID — sticky sessions + free per-request stateless +
+      one upward-only escalation hop; see the decision block after risk 2. Escalation
+      trigger still open (GOALS.md § Needs-a-human).**
 - [ ] Decide what "belongs" on a Spark vs always-Foundry (latency-driven, not just size).
 - [ ] Evaluate LiteLLM-only vs Arch(`archgw`) for the routing layer.
 - [ ] Data-governance sign-off with DISCO on Foundry usage + transparent routing.

@@ -54,14 +54,13 @@ guards, both dashboard halves, control plane, Ollama profile, Azure IaC) is
 **attribution + observability refinement** — its first batch (identity 15,
 repo/session 17, manual profile 19, trace join 16, TTFT 18) is **done** —
 see § Done, as is the Fugu-inspired pair — overhead attribution (20) and the
-shadow complexity signal (21). The autonomy-friendly queue is EMPTY: the next
-vetted goals come out of a status audit, or out of the keystone
-routing-granularity decision below (which goal 21's accumulating traffic-mix
-telemetry now feeds). Spark-infra-shaped work stays parked.
-The keystone § Needs-a-human item remains the **routing-granularity decision**
-— it unblocks the actual task-aware router (the control plane is a registry
-nobody consumes until that call is made); pair it with the LiteLLM-vs-archgw
-fork, at the keyboard.
+shadow complexity signal (21). **The keystone routing-granularity decision is
+MADE (2026-07-08): HYBRID** — sticky sessions, free per-request stateless
+routing, one upward-only escalation hop ([docs/03](docs/03-open-questions-and-risks.md)
+decision block). That unblocks the router arc: shadow session classification
+(22) → hybrid-router spec (23), whose requirements table feeds the
+LiteLLM-vs-archgw fork (still at the keyboard, § Needs-a-human, along with
+the escalation-trigger choice). Spark-infra-shaped work stays parked.
 
 Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 [`docs/06`](docs/06-recommendation.md) (decision), [`docs/03`](docs/03-open-questions-and-risks.md) (risks).
@@ -70,9 +69,33 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 
 ## § Autonomy-friendly (safe to run unattended)
 
-_None queued right now — the attribution arc (15–18) and the Fugu-inspired
-pair (20–21) are done; see § Done. Add new autonomy-friendly goals here as the
-next status audit vets them._
+### 22. Shadow session classification — session-turn vs stateless one-shot — risk: low
+**Why:** the routing-granularity decision (2026-07-08, [docs/03](docs/03-open-questions-and-risks.md)
+risks 1–2) is **HYBRID**: sticky sessions, free per-request stateless routing,
+one upward-only escalation. Its foundational assumption — "we can tell a
+session turn from a stateless one-shot at the proxy" — should be proven as
+SHADOW telemetry before any routing policy consumes it, exactly like goal 21
+(same anti-Fugu constraints: deterministic, feature-vector-on-record, logging
+hooks only, zero routing influence). Build on goal 17's captured facts:
+Codex emits `session_id`/`prompt_cache_key`; Claude Code needs the
+`x-litellm-tags: session:<id>` carrier (injectable via ANTHROPIC_CUSTOM_HEADERS,
+no client patching); transcript shape (prior assistant/tool turns present) is
+the no-cooperation fallback.
+**Completion condition:**
+```
+routing records gain a shadow request_class tag (session-turn | one-shot) plus a stickiness_key (the session tag/id when the request carries one via a LiteLLM-native carrier verified on the pinned 1.83.x, else a documented transcript-shape heuristic, else null) computed in the existing logging hooks from request features only — no routing influence, no request-path latency; the dashboard surfaces both per request plus a class distribution; e2e proves (a) a bare single-turn request classifies one-shot, (b) a multi-turn transcript with tool history classifies session-turn, (c) two requests sent with the same session tag surface the same stickiness_key while a different tag yields a different key; docs/09 or docs/12 documents the exact features and carrier; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR
+```
+
+### 23. Hybrid-router design spec — docs only, engine-agnostic — risk: low
+**Why:** the granularity decision is made; the *mechanics* need a spec before
+any engine work: exact policy semantics and the requirements list that feeds
+the LiteLLM-vs-archgw fork (§ Needs-a-human). Docs only — proposing, not
+deciding: the spec's open calls (escalation trigger, engine) stay flagged for
+the keyboard.
+**Completion condition:**
+```
+a new docs/12-hybrid-router-spec.md specifies: request classification (consuming goals 21+22's shadow signals), stickiness semantics (key derivation, where state lives — gateway vs control-plane — with the control-plane contract named per docs/10), the upward-only single-escalation rule (state transition, what happens to the transcript, cache-loss accounting via goal 20's overhead instrument), stateless per-request policy (cheapest capable backend, agent_capable gate), failure semantics (how availability-fallback interacts with stickiness), and a requirements table mapped against BOTH candidate engines (LiteLLM 1.83.x primitives vs archgw) feeding that fork's evaluation; every still-open decision is explicitly flagged Needs-a-human (escalation trigger, engine choice); no code, no config, no routing behavior changes; e2e/run.sh exits 0 surfaced (docs-only sanity); squash-merged with the merge confirmation surfaced; if blocked, stop after 25 turns and leave a draft PR
+```
 
 ---
 
@@ -87,22 +110,23 @@ decision is made.
   boxes, pinned models, memory headroom, vLLM tool-call parser. Infra.
 - **Data-governance sign-off with DISCO** ([docs/03 risk 10](docs/03-open-questions-and-risks.md))
   — is Foundry OK for the intended work; residency/retention. External.
-- **Routing granularity decision** ([docs/03 risks 1–2](docs/03-open-questions-and-risks.md))
-  — session-only vs allow-one-escalation. Irreversible-ish design call; drives
-  the whole router. Decide with a human, *then* the implementation becomes an
-  autonomy-friendly goal.
-- **LiteLLM-only vs `archgw` evaluation** — architecture fork; research + a call.
-- **Verify-then-escalate as a routing primitive** — quality-based fallback
-  (Fugu/TRINITY's Verifier role): try local first, run a cheap verification
-  pass, escalate to Foundry only on failure — vs our current
-  availability-based fallback. Design fork with real teeth: what verifies
-  (heuristic? judge model? conformance-style probe?), loop/token budget,
-  latency floor (Fugu Ultra's is 8–160s — the cautionary tale), and it
-  interacts directly with the routing-granularity decision above. Decide
-  together with that call; afterwards the implementation is likely an
-  autonomy-friendly goal. Hard constraints regardless of outcome: routing
-  stays deterministic + auditable, and never buffer the stream behind
-  orchestration.
+- ~~**Routing granularity decision**~~ — **✅ DECIDED 2026-07-08: HYBRID**
+  (sticky sessions + free per-request stateless + one upward-only escalation
+  hop) — recorded in [docs/03 risks 1–2](docs/03-open-questions-and-risks.md)
+  (decision block after risk 2). Unblocked goals 22–23 above. The remaining
+  sub-decision is the **escalation trigger** (next bullet).
+- **Escalation trigger for the hybrid router** — WHEN does a session take its
+  one upward hop? The options with real teeth: a complexity threshold (goal
+  21's signal crossing a line), **verify-then-escalate** (Fugu/TRINITY's
+  Verifier role: cheap verification pass on local output, escalate on
+  failure — mind Fugu Ultra's 8–160s latency floor, the cautionary tale), or
+  manual/client-signaled. Decide against goal 21's accumulated traffic-mix
+  telemetry once it has real distributions, ideally alongside the engine fork
+  below. Hard constraints regardless: deterministic + auditable, never buffer
+  the stream behind a verdict.
+- **LiteLLM-only vs `archgw` evaluation** — architecture fork; research + a
+  call. Goal 23's spec produces the requirements table this evaluation runs
+  against — do 23 first.
 - **First Azure deploy + exposure model** (after goal 14) — subscription/resource
   choices, private endpoint vs public + IP allowlist, TLS, dashboard auth, who
   gets keys and how they rotate. A hosted OpenAI-compatible proxy with Foundry
