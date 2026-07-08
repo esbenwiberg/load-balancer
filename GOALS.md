@@ -53,10 +53,9 @@ guards, both dashboard halves, control plane, Ollama profile, Azure IaC) is
 **done** — see § Done. The 2026-07-07 status audit opened a new arc:
 **attribution + observability refinement** — its first batch (identity 15,
 repo/session 17, manual profile 19, trace join 16, TTFT 18) is **done** —
-see § Done. Next up is the Fugu-inspired pair (from the 2026-07-08 Fugu
-research session): overhead attribution (20 — its goal-16 prereq landed in
-PR #33, so it's unblocked) and the shadow complexity spike (21, independent);
-either order works, both are autonomy-friendly.
+see § Done, as is Fugu-inspired overhead attribution (20). Next up: the
+shadow complexity spike (21, autonomy-friendly, from the 2026-07-08 Fugu
+research session).
 Spark-infra-shaped work stays parked.
 The keystone § Needs-a-human item remains the **routing-granularity decision**
 — it unblocks the actual task-aware router (the control plane is a registry
@@ -69,20 +68,6 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 ---
 
 ## § Autonomy-friendly (safe to run unattended)
-
-### 20. Router-overhead attribution — visible vs consumed tokens — risk: low
-**Why:** the Fugu lesson (Sakana's orchestration model, reverse-engineered by
-Requesty 2026-06): a request returning ~2,200 visible tokens consumed ~22,700
-total — a 10x overhead invisible to the client. Our gateway has the same
-failure mode in miniature: retries and failed fallback attempts consume
-backend tokens the `delivered` record never rolls up. Prereq: **goal 16**
-(the attempt↔request join is the substrate) — **satisfied**, merged as
-PR #33; build on whatever join shape it verified (full or documented-partial
-per its condition).
-**Completion condition:**
-```
-the dashboard's per-request view carries {tokens_delivered, tokens_consumed} where tokens_consumed sums tokens across ALL attempts joined to the request (failed + retried + winner; attempts with no usage reported count 0 and that convention is documented), plus a fleet/summary rollup of overhead (consumed vs delivered) so a silently-expensive routing config is visible at a glance; an e2e test proves a forced-fallback request reports tokens_consumed > tokens_delivered while a clean direct request reports them equal; docs/09 gains an "overhead attribution" note recording the Fugu 10x rationale; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked (including: goal 16 not yet on main), stop after 30 turns and leave a draft PR
-```
 
 ### 21. Complexity-signal spike — shadow-mode request classifier — risk: low
 **Why:** Fugu/TRINITY's core routing lever is a *per-request* complexity gate
@@ -158,6 +143,26 @@ decision is made.
    its condition literally holds on `main` — if in doubt, re-check it, don't
    trust the checkmark.
 
+- ✅ 20. Router-overhead attribution — delivered vs consumed tokens (the Fugu
+  10x lesson) — per-request `{tokens_delivered, tokens_consumed}` on the
+  dashboard view (consumed = Σ over the goal-16 joined attempt trail; no-usage
+  attempts count 0; the winner counted exactly once — from its success attempt
+  when logged, inferred from the delivered record when not, per the verified
+  quirk) + an `/api/records` `overhead` rollup {delivered, consumed,
+  overhead_tokens, ratio, unattributed_attempt_tokens (streamed/aborted
+  traffic, surfaced separately so it can't skew the ratio)} rendered on the
+  page. **Condition amended during the run (decide-and-document):** the
+  original test premise "forced fallback ⇒ consumed > delivered" was probed
+  live and found impossible on the pinned litellm v1.83.14 — FAILED attempts
+  report zero usage (verified for 503, retry-then-fallback, and mid-stream
+  hangup; the failed hop burns latency, not gateway-visible tokens). So:
+  summation proven offline with synthetic token-carrying failures
+  (`dashboard_test.py::TestOverheadAttribution`, consumed > delivered), and the
+  e2e test (`test_dashboard_overhead_attribution_direct_and_fallback`) pins the
+  real behaviour — direct AND 503-fallback show consumed == delivered, with
+  the zero-usage premise asserted via the nested trail so a litellm upgrade
+  that starts billing failures fails loudly. Gateway-visible consumed is
+  documented as a LOWER BOUND. Docs: docs/09 "Overhead attribution". — PR #37 (2026-07)
 - ✅ 18. TTFT for streamed responses — PR #34 (2026-07)
 - ✅ Phase-0 groundwork (blockers A & B, conformance harness, deploy scaffold) — PR #1
 - ✅ E2E test harness (mock + cli-auth profiles) — PR #2

@@ -59,12 +59,17 @@ HTTP surface:
   POST /records        {<routing record>}   # obs_callback webhook target; append
   GET  /api/records                          # {"records":[...], "requests":[...],
                                              #  "attempts":[...], "keys":[...],
-                                             #  "count":N} — the DATA ENDPOINT the
-                                             #  UI fetches and the e2e test asserts.
+                                             #  "overhead":{...}, "count":N} — the
+                                             #  DATA ENDPOINT the UI fetches and
+                                             #  the e2e test asserts.
                                              #  `requests` rows carry the caller's
-                                             #  {key_alias,user_id,team_id} and
-                                             #  `keys` is the per-key rollup
-                                             #  (requests, fallbacks, tokens, cost)
+                                             #  {key_alias,user_id,team_id} plus
+                                             #  {tokens_delivered,tokens_consumed}
+                                             #  (goal 20), `keys` is the per-key
+                                             #  rollup (requests, fallbacks,
+                                             #  tokens, cost), and `overhead` is
+                                             #  the goal-20 delivered-vs-consumed
+                                             #  summary
   GET  /api/fleet                            # {"available":bool, "models":[...],
                                              #  "instances":[...]} — the goal-13
                                              #  fleet data endpoint: a server-side
@@ -147,6 +152,35 @@ def _attempts_by_correlation(records: list) -> dict:
     return idx
 
 
+def _consumed_tokens(attempts: list, delivered_total) -> int:
+    """Total tokens a request ACTUALLY burned across every backend attempt
+    (goal 20 — overhead attribution, the Fugu lesson: visible tokens are not
+    consumed tokens once retries and fallbacks pile up).
+
+    Sums `tokens.total` over the request's joined attempt trail — the failed
+    primary, every retry, and the winner. Convention (documented in docs/09):
+    an attempt reporting no usage counts 0; on the pinned litellm v1.83.14 that
+    is every FAILED attempt (verified: failure events carry 0/0/0), so the
+    gateway-visible consumed total is a LOWER BOUND on true backend burn.
+
+    Winner inference: when the trail contains NO success attempt (the verified
+    fallback-winner quirk — its success event may not fire, e.g. streamed
+    winners), the delivered tokens stand in for the winner so it is never
+    DROPPED; when a success attempt IS present its tokens are already in the
+    sum, so delivered tokens are NOT added again — never double-counted."""
+    consumed = 0
+    has_success = False
+    for a in attempts:
+        t = (a.get("tokens") or {}).get("total")
+        if isinstance(t, (int, float)):
+            consumed += t
+        if a.get("status") == "success":
+            has_success = True
+    if not has_success and isinstance(delivered_total, (int, float)):
+        consumed += delivered_total
+    return consumed
+
+
 def _requests_view(records: list) -> list:
     """Fold the raw record stream into a per-REQUEST view — the primary
     "where did my prompt go?" table.
@@ -162,7 +196,16 @@ def _requests_view(records: list) -> list:
     successful attempt. This makes "why did THIS request fall back" answerable by
     nesting the attempt trail UNDER the request, not just alongside it. Requests
     with no correlation_id (older records, or a stack without the pre-call stamp)
-    degrade to an empty `attempts` list and still stand on the delivered record."""
+    degrade to an empty `attempts` list and still stand on the delivered record.
+
+    OVERHEAD ATTRIBUTION (goal 20 — the Fugu lesson): each row also carries
+    `tokens_delivered` (what the client got) vs `tokens_consumed` (what ALL the
+    request's backend attempts burned, summed over the joined trail — failed +
+    retried + winner; attempts reporting no usage count 0). The winner is never
+    dropped or double-counted: when the trail contains a success attempt its
+    tokens are already in the sum; when it does not (the verified quirk — the
+    fallback winner's success event may not fire), the delivered tokens stand in
+    for the winner. See _consumed_tokens + docs/09."""
     by_cid = _attempts_by_correlation(records)
     out = []
     for r in records:
@@ -170,6 +213,8 @@ def _requests_view(records: list) -> list:
             continue
         tokens = r.get("tokens") or {}
         cid = r.get("correlation_id")
+        attempts = by_cid.get(cid, []) if cid is not None else []
+        delivered_tokens = tokens.get("total")
         out.append(
             {
                 "requested_model": r.get("requested_model"),
@@ -182,6 +227,12 @@ def _requests_view(records: list) -> list:
                 "tokens_total": tokens.get("total"),
                 "tokens_prompt": tokens.get("prompt"),
                 "tokens_completion": tokens.get("completion"),
+                # OVERHEAD ATTRIBUTION (goal 20): what the client GOT vs what
+                # the request's whole attempt trail BURNED. tokens_delivered
+                # aliases tokens_total (kept for existing consumers); consumed
+                # is the joined-trail sum (see _consumed_tokens).
+                "tokens_delivered": delivered_tokens,
+                "tokens_consumed": _consumed_tokens(attempts, delivered_tokens),
                 # WHO asked (goal 15): the caller's synthetic identity, sourced
                 # from obs_callback's read of UserAPIKeyAuth. Null under the
                 # master key / no key store.
@@ -191,7 +242,7 @@ def _requests_view(records: list) -> list:
                 # TRACE CORRELATION (goal 16): the join key + this request's own
                 # attempt trail, nested under it by that id.
                 "correlation_id": cid,
-                "attempts": by_cid.get(cid, []) if cid is not None else [],
+                "attempts": attempts,
             }
         )
     out.reverse()  # newest first
@@ -246,6 +297,55 @@ def _key_rollup(records: list) -> list:
     # Busiest key first; ties broken by label for determinism.
     rows.sort(key=lambda e: (-e["requests"], e["key_alias"] or _NO_KEY))
     return rows
+
+
+def _overhead_rollup(records: list, requests: list) -> dict:
+    """The at-a-glance overhead summary (goal 20): across every attributable
+    request, how many tokens the clients were HANDED vs how many the backends
+    BURNED — so a silently-expensive routing config (retry storms, flappy
+    primaries forcing constant fallbacks) shows up as a ratio, not a vibe.
+    This is the anti-Fugu instrument: Sakana's Fugu Ultra was reverse-engineered
+    delivering ~2.2k visible tokens for ~22.7k consumed (10x, invisible to the
+    client); this rollup exists so OUR gateway can never hide that shape.
+
+    `unattributed_attempt_tokens` counts llm_call tokens whose correlation_id
+    matches NO delivered record — on the pinned litellm that is chiefly STREAMED
+    traffic (no delivered record fires for streamed responses; docs/09 caveat)
+    plus requests that errored out entirely. Surfaced separately rather than
+    folded into the ratio, so the per-request math stays exact and the gap
+    stays VISIBLE instead of silently skewing the ratio."""
+    delivered = 0
+    consumed = 0
+    for rq in requests:
+        d = rq.get("tokens_delivered")
+        if isinstance(d, (int, float)):
+            delivered += d
+        c = rq.get("tokens_consumed")
+        if isinstance(c, (int, float)):
+            consumed += c
+    delivered_cids = {
+        r.get("correlation_id")
+        for r in records
+        if r.get("event") == "delivered" and r.get("correlation_id") is not None
+    }
+    unattributed = 0
+    for r in records:
+        if r.get("event") != "llm_call":
+            continue
+        if r.get("correlation_id") in delivered_cids:
+            continue
+        t = (r.get("tokens") or {}).get("total")
+        if isinstance(t, (int, float)):
+            unattributed += t
+    return {
+        "requests": len(requests),
+        "tokens_delivered": delivered,
+        "tokens_consumed": consumed,
+        "overhead_tokens": consumed - delivered,
+        # consumed per delivered token; None when nothing delivered (no signal).
+        "overhead_ratio": round(consumed / delivered, 3) if delivered else None,
+        "unattributed_attempt_tokens": unattributed,
+    }
 
 
 def _attempts_view(records: list) -> list:
@@ -418,15 +518,16 @@ _PAGE = """<!doctype html>
   </div>
 
   <h2>Requests &mdash; requested alias &rarr; backend that served it
-    <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">&middot; each row nests its own attempt trail (goal 16)</span></h2>
+    <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">&middot; each row nests its own attempt trail (goal 16)</span>
+    <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400" id="overhead"></span></h2>
   <div class="tablewrap">
     <table>
       <thead><tr>
         <th>requested</th><th></th><th>served</th><th>route</th>
         <th>key</th><th>user</th>
-        <th>provider</th><th class="num">tokens</th><th class="num">cost</th>
+        <th>provider</th><th class="num">delivered</th><th class="num">consumed</th><th class="num">cost</th>
       </tr></thead>
-      <tbody id="requests"><tr><td class="empty" colspan="9">no requests yet</td></tr></tbody>
+      <tbody id="requests"><tr><td class="empty" colspan="10">no requests yet</td></tr></tbody>
     </table>
   </div>
 
@@ -471,13 +572,18 @@ function reqTrail(r){
   if(!atts.length) return '';
   const chips = atts.map(attemptChip).join('<span class="arrow"> &rarr; </span>');
   const cid = r.correlation_id ? ' <span class="cid">('+esc(r.correlation_id)+')</span>' : '';
-  return '<tr class="trail"><td></td><td colspan="8">why'+cid+': '+chips+'</td></tr>';
+  return '<tr class="trail"><td></td><td colspan="9">why'+cid+': '+chips+'</td></tr>';
 }
 function reqRow(r){
   const badge = r.fallback
     ? '<span class="badge fall">fallback</span>'
     : '<span class="badge direct">direct</span>';
-  const tok = r.tokens_total==null ? '&mdash;' : esc(r.tokens_total);
+  const del = r.tokens_delivered==null ? '&mdash;' : esc(r.tokens_delivered);
+  // consumed > delivered means backend burn the client never saw (goal 20) —
+  // flag it, don't bury it in a same-looking number.
+  const over = r.tokens_consumed!=null && r.tokens_consumed > (r.tokens_delivered||0);
+  const con = r.tokens_consumed==null ? '&mdash;'
+    : (over ? '<span class="badge fall">'+esc(r.tokens_consumed)+'</span>' : esc(r.tokens_consumed));
   const cost = r.response_cost==null ? '&mdash;' : ('$'+Number(r.response_cost).toFixed(6));
   return '<tr>'
     + '<td><code>'+esc(r.requested_model)+'</code></td>'
@@ -487,7 +593,8 @@ function reqRow(r){
     + '<td>'+idCell(r.key_alias)+'</td>'
     + '<td>'+idCell(r.user_id)+'</td>'
     + '<td>'+esc(r.provider)+'</td>'
-    + '<td class="num">'+tok+'</td>'
+    + '<td class="num">'+del+'</td>'
+    + '<td class="num">'+con+'</td>'
     + '<td class="num">'+cost+'</td>'
     + '</tr>'
     + reqTrail(r);  // goal 16: nest this request's attempt trail beneath it
@@ -598,10 +705,17 @@ async function refresh(){
       : '<tr><td class="empty" colspan="7">no keyed traffic yet</td></tr>';
     document.getElementById('requests').innerHTML = reqs.length
       ? reqs.map(reqRow).join('')
-      : '<tr><td class="empty" colspan="9">no requests yet</td></tr>';
+      : '<tr><td class="empty" colspan="10">no requests yet</td></tr>';
     document.getElementById('attempts').innerHTML = atts.length
       ? atts.map(attRow).join('')
       : '<tr><td class="empty" colspan="8">no attempts yet</td></tr>';
+    // goal 20: the delivered-vs-consumed rollup, at a glance (the Fugu lesson).
+    const ov = data.overhead;
+    document.getElementById('overhead').innerHTML = !ov ? ''
+      : '&middot; &Sigma; delivered '+esc(ov.tokens_delivered)
+        +' / consumed '+esc(ov.tokens_consumed)
+        +(ov.overhead_ratio!=null ? ' (ratio '+esc(ov.overhead_ratio)+')' : '')
+        +(ov.unattributed_attempt_tokens ? ' &middot; +'+esc(ov.unattributed_attempt_tokens)+' unattributed (streamed/aborted)' : '');
     document.getElementById('status').textContent =
       reqs.length+' requests \\u00b7 '+atts.length+' attempts \\u00b7 '+(data.count||0)+' records';
   } catch(e) {
@@ -653,13 +767,17 @@ class Handler(BaseHTTPRequestHandler):
         # The DATA ENDPOINT the UI fetches and the e2e assertion covers.
         if self.path.startswith("/api/records"):
             recs = RECORDS.all()
+            requests = _requests_view(recs)
             return self._json(
                 200,
                 {
                     "count": len(recs),
-                    "requests": _requests_view(recs),
+                    "requests": requests,
                     "attempts": _attempts_view(recs),
                     "keys": _key_rollup(recs),
+                    # goal 20: delivered-vs-consumed at a glance (the Fugu 10x
+                    # lesson) — see _overhead_rollup.
+                    "overhead": _overhead_rollup(recs, requests),
                     "records": recs,
                 },
             )
