@@ -53,10 +53,11 @@ guards, both dashboard halves, control plane, Ollama profile, Azure IaC) is
 **done** — see § Done. The 2026-07-07 status audit opened a new arc:
 **attribution + observability refinement** — its first batch (identity 15,
 repo/session 17, manual profile 19, trace join 16, TTFT 18) is **done** —
-see § Done, as is Fugu-inspired overhead attribution (20). Next up: the
-shadow complexity spike (21, autonomy-friendly, from the 2026-07-08 Fugu
-research session).
-Spark-infra-shaped work stays parked.
+see § Done, as is the Fugu-inspired pair — overhead attribution (20) and the
+shadow complexity signal (21). The autonomy-friendly queue is EMPTY: the next
+vetted goals come out of a status audit, or out of the keystone
+routing-granularity decision below (which goal 21's accumulating traffic-mix
+telemetry now feeds). Spark-infra-shaped work stays parked.
 The keystone § Needs-a-human item remains the **routing-granularity decision**
 — it unblocks the actual task-aware router (the control plane is a registry
 nobody consumes until that call is made); pair it with the LiteLLM-vs-archgw
@@ -69,20 +70,9 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 
 ## § Autonomy-friendly (safe to run unattended)
 
-### 21. Complexity-signal spike — shadow-mode request classifier — risk: low
-**Why:** Fugu/TRINITY's core routing lever is a *per-request* complexity gate
-(trivial → one cheap worker, hard → escalate); TRINITY does it with a ~0.6B
-coordinator. Our routing-granularity decision is parked (Needs-a-human), but
-the *telemetry* isn't blocked: tag every routing record with a cheap heuristic
-complexity score in shadow mode — zero influence on routing — so when the
-human decision lands, the router is designed against real request
-distributions instead of guesses. Deliberate anti-Fugu constraints: the
-heuristic is deterministic + documented (auditable, unlike Fugu's proprietary
-routing), and it must never buffer or delay the request path.
-**Completion condition:**
-```
-routing records gain a shadow complexity tag computed in the existing callback from request features only (documented heuristic over e.g. prompt/message token count, presence and size of tools[], message-turn count — no extra model calls, no added latency path, no influence on routing whatsoever); the dashboard surfaces the tag per request plus a distribution rollup; an e2e test proves a trivial one-line prompt and a tool-heavy multi-turn agentic request land in different buckets; a docs section (docs/09 or docs/10) records the Fugu/TRINITY inspiration, the heuristic's exact features, and how the signal would feed the future task-aware router once the routing-granularity decision is made; no routing behavior changes anywhere; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR
-```
+_None queued right now — the attribution arc (15–18) and the Fugu-inspired
+pair (20–21) are done; see § Done. Add new autonomy-friendly goals here as the
+next status audit vets them._
 
 ---
 
@@ -143,6 +133,22 @@ decision is made.
    its condition literally holds on `main` — if in doubt, re-check it, don't
    trust the checkmark.
 
+- ✅ 21. Complexity-signal spike — shadow-mode request classifier — every
+  routing record (delivered + best-effort llm_call, so streamed traffic is
+  covered via the attempt trail) carries a `complexity` tag from a
+  deterministic, fully-auditable decision tree over request features only
+  (`obs_callback._complexity`: buckets trivial/toolful/heavy/agentic; the
+  whole feature vector {bucket, approx_prompt_tokens, turns, tools} rides the
+  record), computed in the logging hooks AFTER routing — zero influence, zero
+  request-path latency. Dashboard: bucket badge per request (features on
+  hover) + `complexity_buckets` distribution in /api/records (untagged ⇒
+  `unclassified`, honest denominator). Tests: 13-case offline suite
+  (`obs_callback_test.py`, new fast-tier step in check.sh — litellm stubbed) +
+  dashboard shaping tests + e2e
+  (`test_routing_records_carry_shadow_complexity`: trivial one-liner vs
+  tool-heavy multi-turn land in different buckets, both served by the backend
+  they asked for). Docs: docs/09 "Shadow complexity" (incl. how the
+  distribution feeds the routing-granularity decision). — PR #38 (2026-07)
 - ✅ 20. Router-overhead attribution — delivered vs consumed tokens (the Fugu
   10x lesson) — per-request `{tokens_delivered, tokens_consumed}` on the
   dashboard view (consumed = Σ over the goal-16 joined attempt trail; no-usage

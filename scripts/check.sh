@@ -273,6 +273,22 @@ else
   skip "python3" "not installed"
 fi
 
+# --- obs-callback complexity classifier unit tests (goal 21 — offline) -------
+# The shadow complexity decision tree (obs_callback._complexity) is a pure
+# function over request features; a stub satisfies the litellm import, so the
+# whole tree (buckets, precedence, degradations) pins in the fast tier. The e2e
+# stack proves the live stamping onto routing records.
+step "obs-callback complexity unit tests (e2e/obs_callback_test.py)"
+if have python3; then
+  if (cd e2e && python3 obs_callback_test.py); then
+    ok "obs_callback_test.py"
+  else
+    fail "e2e/obs_callback_test.py"
+  fi
+else
+  skip "python3" "not installed"
+fi
+
 # --- gitleaks: secret scan of the working tree ------------------------------
 step "gitleaks secret scan"
 if have gitleaks; then

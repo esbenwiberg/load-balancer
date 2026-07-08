@@ -1534,6 +1534,138 @@ def test_dashboard_overhead_attribution_direct_and_fallback():
     assert ov.get("overhead_ratio") is not None and ov["overhead_ratio"] >= 1.0, ov
 
 
+# --- shadow complexity: request-shape telemetry (goal 21) -------------------
+# Fugu/TRINITY's core routing lever is a per-request complexity gate; ours is
+# parked behind the routing-granularity decision (Needs-a-human). What is NOT
+# blocked is the telemetry: obs_callback stamps a deterministic, fully-auditable
+# `complexity` tag (bucket + the whole feature vector) on routing records, in
+# the logging hooks only — ZERO routing influence — so the future router gets
+# designed against real traffic distributions. See docs/09 "Shadow complexity".
+
+
+def test_routing_records_carry_shadow_complexity():
+    """Goal 21: a trivial one-liner and a tool-heavy multi-turn agentic request
+    land in DIFFERENT buckets on the dashboard, the feature vector rides along
+    (auditable), the distribution rollup counts both — and the tag changed no
+    routing (both requests are served by the backend they asked for)."""
+    # -- the trivial ask: one short tool-less user turn ----------------------
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": "claude-sonnet",
+            "messages": [{"role": "user", "content": "say hi"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+
+    # -- the agentic ask: tools offered + an agent loop in motion ------------
+    # (synthetic transcript; mockd's scripted agent mode answers it fine)
+    agentic_messages = [
+        {"role": "user", "content": "read the config file and fix the port"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path": "app.cfg"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "port=8080"},
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "edit_file",
+                "description": "Edit a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+        },
+    ]
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={"model": "qwen3-coder", "messages": agentic_messages, "tools": tools},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+
+    def _both_tagged(data):
+        buckets = set()
+        for rq in data.get("requests", []):
+            cx = rq.get("complexity") or {}
+            if rq.get("requested_model") == "claude-sonnet":
+                if cx.get("bucket"):
+                    buckets.add(("trivial-req", cx["bucket"]))
+            if rq.get("requested_model") == "qwen3-coder":
+                if cx.get("bucket"):
+                    buckets.add(("agentic-req", cx["bucket"]))
+        return len(buckets) >= 2
+
+    data = _poll_dash(_both_tagged)
+
+    trivial_rows = [
+        rq
+        for rq in data["requests"]
+        if rq.get("requested_model") == "claude-sonnet" and rq.get("complexity")
+    ]
+    agentic_rows = [
+        rq
+        for rq in data["requests"]
+        if rq.get("requested_model") == "qwen3-coder" and rq.get("complexity")
+    ]
+    assert trivial_rows and agentic_rows, data["requests"]
+    t_cx, a_cx = trivial_rows[0]["complexity"], agentic_rows[0]["complexity"]
+
+    # Different buckets — the whole point: the shadow signal separates the
+    # one-liner from the tool-driving loop.
+    assert t_cx["bucket"] == "trivial", t_cx
+    assert a_cx["bucket"] == "agentic", a_cx
+
+    # Auditable: the full feature vector rides the record (anti-Fugu constraint).
+    for cx in (t_cx, a_cx):
+        assert set(cx) == {"bucket", "approx_prompt_tokens", "turns", "tools"}, cx
+    assert a_cx["tools"] == 2 and a_cx["turns"] == 3, a_cx
+    assert t_cx["tools"] == 0 and t_cx["turns"] == 1, t_cx
+
+    # The distribution rollup counts both ends of the mix.
+    buckets = data.get("complexity_buckets") or {}
+    assert buckets.get("trivial", 0) >= 1, buckets
+    assert buckets.get("agentic", 0) >= 1, buckets
+
+    # SHADOW means shadow: no faults injected, so both requests must have been
+    # served by exactly the backend they asked for — the tag moved nothing.
+    assert not trivial_rows[0].get("fallback"), trivial_rows[0]
+    assert not agentic_rows[0].get("fallback"), agentic_rows[0]
+
+
 def test_dashboard_page_renders():
     """The read-only page itself serves (GET /) and is wired to its data endpoint.
     Not a headless-browser test — we assert the HTML is served and references the

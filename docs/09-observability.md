@@ -435,6 +435,64 @@ prompt; LiteLLM's failure event carries `tokens 0/0/0` (confirmed for plain
   still says 0). When real Foundry/Spark backends land, expect the true ratio
   to be ≥ what this shows — never ≤.
 
+## Shadow complexity — request-shape telemetry for the future router (goal 21)
+
+**Why this exists — the other Fugu lesson.** Fugu/TRINITY's (Sakana AI, ICLR
+2026) core routing lever is a **per-request complexity gate**: trivial queries
+go to one cheap worker, hard ones escalate — TRINITY does it with a ~0.6B
+coordinator. Our task-aware router is parked behind the **routing-granularity
+decision** (Needs-a-human, GOALS.md) — but the *telemetry* was never blocked.
+Every routing record now carries a **`complexity`** tag, so by the time that
+decision is made, the router gets designed against **real request
+distributions** instead of guesses.
+
+**Two deliberate anti-Fugu constraints** (Fugu's routing is proprietary and
+opaque — the reverse of what a governed gateway needs):
+
+- **Deterministic + transparent.** A documented decision tree over request
+  features only — no model call, no scoring net — and the **full feature
+  vector rides on the record** (`{bucket, approx_prompt_tokens, turns,
+  tools}`), so every classification is auditable after the fact
+  (`obs_callback_test.py::TestDegradations::test_deterministic` pins
+  determinism as a test).
+- **Shadow only.** Computed inside the *logging* hooks, after routing is
+  decided. It influences nothing: no routing, no latency on the request path.
+  The e2e test asserts both requests were served by exactly the backend they
+  asked for.
+
+**The decision tree** (`obs_callback._complexity`, precedence order):
+
+| bucket | rule |
+|---|---|
+| `agentic` | tools offered AND a loop in motion (tool/function-role message, assistant `tool_calls`, or >2 turns with tools) |
+| `toolful` | tools offered, single-shot |
+| `heavy` | no tools, but approx_prompt_tokens > 2000 or > 4 turns |
+| `trivial` | everything else |
+
+`approx_prompt_tokens` is chars/4 over message content **plus the serialized
+tool schemas** (tools are injected into the real prompt, so they count). A
+crude proxy on purpose — stable, dependency-free, good enough to bucket by;
+exact token counts already ride the records (goals 3/20). Unreadable messages ⇒
+the tag is **omitted**, never guessed.
+
+**Where it lands.** Both record shapes: `delivered` (classified from the
+original request `data`) and best-effort on `llm_call` attempts (from the
+logging kwargs) — attempt-level stamping matters because **streamed requests
+fire no `delivered` record** on the pinned LiteLLM (the standing caveat), so
+the attempt trail is their only carrier. The dashboard shows a bucket badge
+per request (feature vector on hover) and `/api/records` carries a
+**`complexity_buckets`** distribution — untagged records count as
+`unclassified` so the denominator stays honest.
+
+**How it feeds the router later.** Once the routing-granularity decision is
+made, the accumulated distribution answers the sizing questions a
+complexity-gated router needs: what share of real traffic is `trivial` (a
+local-model candidate), how much is `agentic` (needs an `agent_capable=true`
+backend — the conformance gate), and whether `heavy` traffic is common enough
+to justify a context-length routing rule. The bucket thresholds are the
+tunable starting point; the recorded feature vectors are the data to tune them
+against.
+
 ## What this is *not* (yet)
 
 - **Not durable.** All sinks are ephemeral (stdout ring / mockd + dashboard

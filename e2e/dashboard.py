@@ -239,6 +239,11 @@ def _requests_view(records: list) -> list:
                 "key_alias": r.get("key_alias"),
                 "user_id": r.get("user_id"),
                 "team_id": r.get("team_id"),
+                # SHADOW complexity (goal 21): the deterministic classification
+                # obs_callback stamped from request features — pure telemetry
+                # for the future router, zero routing influence. None on records
+                # from a stack without the tag.
+                "complexity": r.get("complexity"),
                 # TRACE CORRELATION (goal 16): the join key + this request's own
                 # attempt trail, nested under it by that id.
                 "correlation_id": cid,
@@ -346,6 +351,25 @@ def _overhead_rollup(records: list, requests: list) -> dict:
         "overhead_ratio": round(consumed / delivered, 3) if delivered else None,
         "unattributed_attempt_tokens": unattributed,
     }
+
+
+def _complexity_buckets(records: list) -> dict:
+    """The complexity DISTRIBUTION (goal 21): how the traffic mix splits across
+    the shadow buckets — the request-shape telemetry the parked
+    routing-granularity decision will be designed against. Counts `delivered`
+    records by their complexity bucket; records without the tag (older stacks,
+    unreadable messages) count under "unclassified" so the denominator stays
+    honest — a mostly-unclassified distribution says "don't trust me yet"
+    instead of quietly showing only the classifiable slice."""
+    buckets: dict = {}
+    for r in records:
+        if r.get("event") != "delivered":
+            continue
+        cx = r.get("complexity") or {}
+        bucket = cx.get("bucket") if isinstance(cx, dict) else None
+        label = bucket if bucket else "unclassified"
+        buckets[label] = buckets.get(label, 0) + 1
+    return buckets
 
 
 def _attempts_view(records: list) -> list:
@@ -519,15 +543,16 @@ _PAGE = """<!doctype html>
 
   <h2>Requests &mdash; requested alias &rarr; backend that served it
     <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">&middot; each row nests its own attempt trail (goal 16)</span>
-    <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400" id="overhead"></span></h2>
+    <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400" id="overhead"></span>
+    <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400" id="cxdist"></span></h2>
   <div class="tablewrap">
     <table>
       <thead><tr>
-        <th>requested</th><th></th><th>served</th><th>route</th>
+        <th>requested</th><th></th><th>served</th><th>route</th><th>complexity</th>
         <th>key</th><th>user</th>
         <th>provider</th><th class="num">delivered</th><th class="num">consumed</th><th class="num">cost</th>
       </tr></thead>
-      <tbody id="requests"><tr><td class="empty" colspan="10">no requests yet</td></tr></tbody>
+      <tbody id="requests"><tr><td class="empty" colspan="11">no requests yet</td></tr></tbody>
     </table>
   </div>
 
@@ -572,7 +597,16 @@ function reqTrail(r){
   if(!atts.length) return '';
   const chips = atts.map(attemptChip).join('<span class="arrow"> &rarr; </span>');
   const cid = r.correlation_id ? ' <span class="cid">('+esc(r.correlation_id)+')</span>' : '';
-  return '<tr class="trail"><td></td><td colspan="9">why'+cid+': '+chips+'</td></tr>';
+  return '<tr class="trail"><td></td><td colspan="10">why'+cid+': '+chips+'</td></tr>';
+}
+// Shadow complexity (goal 21): the bucket as a badge, the full feature vector
+// as a hover title — every classification auditable in place, never a mystery.
+const CX_CLASS = {trivial:'no', toolful:'tier', heavy:'fail', agentic:'fall'};
+function cxCell(cx){
+  if(!cx || !cx.bucket) return '<span class="muted">&mdash;</span>';
+  const cls = CX_CLASS[cx.bucket] || 'no';
+  const why = '~'+cx.approx_prompt_tokens+' tok / '+cx.turns+' turns / '+cx.tools+' tools';
+  return '<span class="badge '+cls+'" title="'+esc(why)+'">'+esc(cx.bucket)+'</span>';
 }
 function reqRow(r){
   const badge = r.fallback
@@ -590,6 +624,7 @@ function reqRow(r){
     + '<td class="arrow">&rarr;</td>'
     + '<td><code>'+esc(r.served_model)+'</code></td>'
     + '<td>'+badge+'</td>'
+    + '<td>'+cxCell(r.complexity)+'</td>'
     + '<td>'+idCell(r.key_alias)+'</td>'
     + '<td>'+idCell(r.user_id)+'</td>'
     + '<td>'+esc(r.provider)+'</td>'
@@ -705,7 +740,7 @@ async function refresh(){
       : '<tr><td class="empty" colspan="7">no keyed traffic yet</td></tr>';
     document.getElementById('requests').innerHTML = reqs.length
       ? reqs.map(reqRow).join('')
-      : '<tr><td class="empty" colspan="10">no requests yet</td></tr>';
+      : '<tr><td class="empty" colspan="11">no requests yet</td></tr>';
     document.getElementById('attempts').innerHTML = atts.length
       ? atts.map(attRow).join('')
       : '<tr><td class="empty" colspan="8">no attempts yet</td></tr>';
@@ -716,6 +751,10 @@ async function refresh(){
         +' / consumed '+esc(ov.tokens_consumed)
         +(ov.overhead_ratio!=null ? ' (ratio '+esc(ov.overhead_ratio)+')' : '')
         +(ov.unattributed_attempt_tokens ? ' &middot; +'+esc(ov.unattributed_attempt_tokens)+' unattributed (streamed/aborted)' : '');
+    // goal 21: the shadow-complexity traffic mix, at a glance.
+    const cx = data.complexity_buckets || {};
+    const mix = Object.keys(cx).sort().map(k=>esc(k)+' '+esc(cx[k])).join(' / ');
+    document.getElementById('cxdist').innerHTML = mix ? '&middot; mix: '+mix : '';
     document.getElementById('status').textContent =
       reqs.length+' requests \\u00b7 '+atts.length+' attempts \\u00b7 '+(data.count||0)+' records';
   } catch(e) {
@@ -778,6 +817,9 @@ class Handler(BaseHTTPRequestHandler):
                     # goal 20: delivered-vs-consumed at a glance (the Fugu 10x
                     # lesson) — see _overhead_rollup.
                     "overhead": _overhead_rollup(recs, requests),
+                    # goal 21: the shadow-complexity traffic mix — see
+                    # _complexity_buckets.
+                    "complexity_buckets": _complexity_buckets(recs),
                     "records": recs,
                 },
             )
