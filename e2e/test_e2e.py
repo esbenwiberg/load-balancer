@@ -1425,6 +1425,115 @@ def test_dashboard_request_row_joined_to_failure_attempt_by_correlation_id():
     )
 
 
+# --- overhead attribution: delivered vs consumed tokens (goal 20) -----------
+# The Fugu lesson (docs/09 "Overhead attribution"): visible tokens are not
+# consumed tokens once retries and fallbacks pile up — Fugu Ultra was
+# reverse-engineered delivering ~2.2k visible tokens while consuming ~22.7k
+# (10x, invisible to the client). The dashboard's per-request view now carries
+# {tokens_delivered, tokens_consumed} and /api/records carries an `overhead`
+# rollup, so that shape can never hide in OUR gateway.
+#
+# VERIFIED against the pinned litellm v1.83.14 (probed live, then pinned here):
+# FAILED attempts report zero usage (0/0/0) — a 503'd backend never processed
+# the prompt, and litellm attributes no tokens to the failure event. So on this
+# stack a forced 503-fallback honestly shows consumed == delivered (ratio 1.0);
+# the gateway-visible consumed total is a LOWER BOUND on true backend burn.
+# The summation itself (a token-carrying failed attempt => consumed > delivered)
+# is proven offline in dashboard_test.py with synthetic records — the instrument
+# is ready for real backends that DO bill partial usage on failures.
+
+
+def test_dashboard_overhead_attribution_direct_and_fallback():
+    """Goal 20: the per-request view carries {tokens_delivered, tokens_consumed}
+    and /api/records carries the `overhead` rollup.
+
+      * a clean direct request reports tokens_consumed == tokens_delivered > 0;
+      * a forced-fallback request ALSO reports consumed == delivered — the
+        verified v1.83.14 behaviour (its 503 failure attempt carries zero usage;
+        asserted via the nested trail so a litellm upgrade that starts billing
+        failures will surface here as a delta, not silently);
+      * the rollup sums are consistent: consumed >= delivered, ratio present.
+    """
+    # -- direct request: no faults ------------------------------------------
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": "claude-sonnet",
+            "messages": [{"role": "user", "content": "ping overhead direct"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+
+    # -- forced fallback: qwen3-coder 503s -> claude-sonnet serves ----------
+    _inject({"model": "qwen3-coder", "status": 503})  # persistent -> fallback
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": "qwen3-coder",
+            "messages": [{"role": "user", "content": "ping overhead fallback"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+    assert "served_model=claude-sonnet" in _served_model(r.json()), r.text
+
+    def _both(data):
+        reqs = data.get("requests", [])
+        return any(rq.get("requested_model") == "claude-sonnet" for rq in reqs) and any(
+            rq.get("requested_model") == "qwen3-coder" and rq.get("fallback")
+            for rq in reqs
+        )
+
+    data = _poll_dash(_both)
+
+    # Direct: what the client got is exactly what the backend burned.
+    direct = [
+        rq
+        for rq in data["requests"]
+        if rq.get("requested_model") == "claude-sonnet" and not rq.get("fallback")
+    ][0]
+    assert isinstance(direct.get("tokens_delivered"), (int, float)), direct
+    assert direct["tokens_delivered"] > 0, direct
+    assert direct.get("tokens_consumed") == direct["tokens_delivered"], (
+        "a clean direct request must show consumed == delivered: %r" % direct
+    )
+
+    # Fallback: delivered > 0, and consumed == delivered BECAUSE the failed 503
+    # attempt reports zero usage on the pinned litellm (verified — see the
+    # comment block above). Pin that premise via the nested trail so a future
+    # litellm that bills failed attempts breaks THIS assertion loudly instead of
+    # silently changing the metric's meaning.
+    fb = [
+        rq
+        for rq in data["requests"]
+        if rq.get("requested_model") == "qwen3-coder" and rq.get("fallback")
+    ][0]
+    assert fb.get("tokens_delivered") and fb["tokens_delivered"] > 0, fb
+    failed = [a for a in (fb.get("attempts") or []) if a.get("status") == "failure"]
+    assert failed, "the fallback row must nest its failed attempt (goal 16): %r" % fb
+    failed_tokens = sum((a.get("tokens") or {}).get("total") or 0 for a in failed)
+    assert failed_tokens == 0, (
+        "premise change: failed attempts now report usage (%r) — revisit the "
+        "consumed==delivered assertion AND docs/09 'Overhead attribution'" % failed
+    )
+    assert fb.get("tokens_consumed") == fb["tokens_delivered"], (
+        "with zero-usage failures, fallback consumed must equal delivered "
+        "(winner counted exactly once, via success attempt or inference): %r" % fb
+    )
+
+    # The at-a-glance rollup: present, and arithmetically consistent.
+    ov = data.get("overhead") or {}
+    assert ov.get("requests", 0) >= 2, ov
+    assert ov.get("tokens_consumed", 0) >= ov.get("tokens_delivered", 0), ov
+    assert ov.get("overhead_tokens") == ov.get("tokens_consumed", 0) - ov.get(
+        "tokens_delivered", 0
+    ), ov
+    assert ov.get("overhead_ratio") is not None and ov["overhead_ratio"] >= 1.0, ov
+
+
 def test_dashboard_page_renders():
     """The read-only page itself serves (GET /) and is wired to its data endpoint.
     Not a headless-browser test — we assert the HTML is served and references the

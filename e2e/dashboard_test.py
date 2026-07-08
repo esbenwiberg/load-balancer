@@ -345,5 +345,168 @@ class TestTraceCorrelation(unittest.TestCase):
         self.assertEqual(len(dashboard._attempts_view(records)), 1)
 
 
+# --- overhead attribution: delivered vs consumed tokens (goal 20) ------------
+# The Fugu lesson (docs/09): visible tokens are not consumed tokens once retries
+# and fallbacks pile up. The e2e suite proves the live path end to end — where,
+# on the pinned litellm v1.83.14, FAILED attempts report zero usage (verified),
+# so a real 503-fallback shows consumed == delivered. These offline tests are
+# therefore the place that PROVES the summation itself, with synthetic failed
+# attempts that DO carry tokens — the instrument is ready for real backends that
+# bill partial usage, even though the mock stack can't produce it.
+
+
+class TestOverheadAttribution(unittest.TestCase):
+    def test_direct_request_consumed_equals_delivered(self):
+        cid = "obs-direct"
+        records = [
+            {
+                "event": "llm_call",
+                "status": "success",
+                "backend": "qwen",
+                "tokens": {"total": 16},
+                "correlation_id": cid,
+            },
+            _delivered(tokens={"total": 16}, correlation_id=cid),
+        ]
+        row = dashboard._requests_view(records)[0]
+        self.assertEqual(row["tokens_delivered"], 16)
+        self.assertEqual(row["tokens_consumed"], 16)
+
+    def test_fallback_with_token_carrying_failure_shows_overhead(self):
+        # THE goal-20 proof: a failed attempt that burned tokens makes
+        # consumed > delivered — backend burn the client never saw.
+        cid = "obs-over"
+        records = [
+            {
+                "event": "llm_call",
+                "status": "failure",
+                "backend": "qwen",
+                "error_code": 500,
+                "tokens": {"total": 7},
+                "correlation_id": cid,
+            },
+            {
+                "event": "llm_call",
+                "status": "success",
+                "backend": "sonnet",
+                "tokens": {"total": 16},
+                "correlation_id": cid,
+            },
+            _delivered(
+                served_model="claude-sonnet",
+                fallback=True,
+                tokens={"total": 16},
+                correlation_id=cid,
+            ),
+        ]
+        row = dashboard._requests_view(records)[0]
+        self.assertEqual(row["tokens_delivered"], 16)
+        self.assertEqual(row["tokens_consumed"], 23)  # 7 wasted + 16 delivered
+        self.assertGreater(row["tokens_consumed"], row["tokens_delivered"])
+
+    def test_winner_without_success_attempt_is_inferred_not_dropped(self):
+        # The verified fallback-winner quirk: no success llm_call fires. The
+        # delivered tokens must stand in for the winner — consumed is 16 (0 from
+        # the failed attempt + the inferred winner), never 0.
+        cid = "obs-quirk"
+        records = [
+            {
+                "event": "llm_call",
+                "status": "failure",
+                "backend": "qwen",
+                "error_code": 503,
+                "tokens": {"total": 0},
+                "correlation_id": cid,
+            },
+            _delivered(
+                served_model="claude-sonnet",
+                fallback=True,
+                tokens={"total": 16},
+                correlation_id=cid,
+            ),
+        ]
+        row = dashboard._requests_view(records)[0]
+        self.assertEqual(row["tokens_consumed"], 16)
+
+    def test_success_attempt_present_means_no_double_count(self):
+        # When the winner's success event DID fire (verified: it does on the
+        # non-streamed fallback path), its tokens are in the attempt sum and the
+        # delivered tokens must NOT be added on top.
+        cid = "obs-nodouble"
+        records = [
+            {
+                "event": "llm_call",
+                "status": "success",
+                "backend": "sonnet",
+                "tokens": {"total": 16},
+                "correlation_id": cid,
+            },
+            _delivered(tokens={"total": 16}, correlation_id=cid),
+        ]
+        row = dashboard._requests_view(records)[0]
+        self.assertEqual(row["tokens_consumed"], 16)  # not 32
+
+    def test_attempt_without_usage_counts_zero(self):
+        # The documented convention: no usage reported => 0, never a crash.
+        cid = "obs-nousage"
+        records = [
+            {"event": "llm_call", "status": "failure", "correlation_id": cid},
+            _delivered(tokens={"total": 5}, correlation_id=cid),
+        ]
+        row = dashboard._requests_view(records)[0]
+        self.assertEqual(row["tokens_consumed"], 5)
+
+    def test_overhead_rollup_sums_and_ratio(self):
+        cid1, cid2 = "obs-r1", "obs-r2"
+        records = [
+            # request 1: clean direct, 10 delivered / 10 consumed
+            {
+                "event": "llm_call",
+                "status": "success",
+                "tokens": {"total": 10},
+                "correlation_id": cid1,
+            },
+            _delivered(tokens={"total": 10}, correlation_id=cid1),
+            # request 2: token-burning failure + winner, 16 delivered / 23 consumed
+            {
+                "event": "llm_call",
+                "status": "failure",
+                "tokens": {"total": 7},
+                "correlation_id": cid2,
+            },
+            {
+                "event": "llm_call",
+                "status": "success",
+                "tokens": {"total": 16},
+                "correlation_id": cid2,
+            },
+            _delivered(fallback=True, tokens={"total": 16}, correlation_id=cid2),
+            # a streamed request's winner: attempt with NO delivered record —
+            # must land in unattributed, not skew the per-request ratio.
+            {
+                "event": "llm_call",
+                "status": "success",
+                "tokens": {"total": 19},
+                "correlation_id": "obs-streamed",
+            },
+        ]
+        requests = dashboard._requests_view(records)
+        ov = dashboard._overhead_rollup(records, requests)
+        self.assertEqual(ov["requests"], 2)
+        self.assertEqual(ov["tokens_delivered"], 26)
+        self.assertEqual(ov["tokens_consumed"], 33)
+        self.assertEqual(ov["overhead_tokens"], 7)
+        self.assertAlmostEqual(ov["overhead_ratio"], round(33 / 26, 3))
+        self.assertEqual(ov["unattributed_attempt_tokens"], 19)
+
+    def test_overhead_rollup_empty_is_calm(self):
+        # No traffic: zeros and a null ratio — never a ZeroDivisionError.
+        ov = dashboard._overhead_rollup([], [])
+        self.assertEqual(ov["requests"], 0)
+        self.assertEqual(ov["tokens_delivered"], 0)
+        self.assertEqual(ov["tokens_consumed"], 0)
+        self.assertIsNone(ov["overhead_ratio"])
+
+
 if __name__ == "__main__":
     unittest.main()

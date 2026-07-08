@@ -377,6 +377,64 @@ per the quirk above) and asserts the record's `ttft_ms` is present, non-negative
 and `<= latency_ms`. `test_direct_request_routing_record_no_fallback` guards the
 complement: a non-streamed attempt **omits** `ttft_ms`.
 
+## Overhead attribution — delivered vs consumed tokens (goal 20)
+
+**Why this exists — the Fugu lesson.** Sakana AI's Fugu (an orchestration model
+fronting a pool of frontier LLMs behind one OpenAI-compatible endpoint — the
+maximalist cousin of this gateway) was reverse-engineered in 2026-06 delivering
+**~2,223 visible tokens while consuming ~22,710** — a **10× overhead invisible
+to the client**, buried in orchestration prompts and multi-model calls. A
+routing gateway has the same failure mode in miniature: retries and failed
+fallback attempts burn backend tokens the `delivered` record never showed. This
+instrument exists so that shape **cannot hide here**: what clients got and what
+backends burned sit side by side, per request and in aggregate.
+
+**The per-request fields.** Each row of the dashboard's per-request view now
+carries **`tokens_delivered`** (the `delivered` record's total — what the
+client got) and **`tokens_consumed`** (the sum of `tokens.total` over the
+request's goal-16 **joined attempt trail** — failed primary, every retry, and
+the winner). Two conventions, both deliberate:
+
+- **No usage reported ⇒ counts 0.** Attempts that report no usage contribute
+  nothing — the sum never guesses.
+- **The winner is counted exactly once.** When the trail contains a success
+  attempt, its tokens are already in the sum. When it does **not** (the
+  verified quirk: a fallback winner's success event may not fire — streamed
+  winners in particular), the delivered tokens stand in for the winner. Never
+  dropped, never double-counted (`dashboard._consumed_tokens`).
+
+**The at-a-glance rollup.** `/api/records` carries an **`overhead`** object —
+`{requests, tokens_delivered, tokens_consumed, overhead_tokens,
+overhead_ratio, unattributed_attempt_tokens}` — rendered on the Requests
+header. A retry-storm or flappy-primary config shows up as a **ratio**, not a
+vibe. `unattributed_attempt_tokens` counts `llm_call` tokens whose
+`correlation_id` matches **no** `delivered` record — chiefly **streamed
+traffic** (no `delivered` record fires for streamed responses on the pinned
+LiteLLM — the standing caveat above) plus requests that errored out entirely.
+It is surfaced **separately** rather than folded into the ratio, so the
+per-request math stays exact and the gap stays visible instead of silently
+skewing the number.
+
+**The verified finding (probed live against `v1.83.14-stable`, not guessed):
+failed attempts report zero usage.** A 503'd backend never processed the
+prompt; LiteLLM's failure event carries `tokens 0/0/0` (confirmed for plain
+503, retry-then-fallback, and mid-stream hangup). Two consequences:
+
+- On the mock stack a forced 503-fallback **honestly** shows
+  `consumed == delivered` (ratio 1.0) — the failed hop wasted *latency*, not
+  gateway-visible tokens. The e2e assertion
+  (`test_dashboard_overhead_attribution_direct_and_fallback`) pins this
+  premise via the nested trail, so a LiteLLM upgrade that starts billing
+  failed attempts breaks the test loudly instead of silently changing the
+  metric's meaning. The **summation logic itself** — a token-carrying failed
+  attempt ⇒ `consumed > delivered` — is proven offline in
+  `dashboard_test.py::TestOverheadAttribution` with synthetic records.
+- **Gateway-visible consumed is a LOWER BOUND on true backend burn.** A real
+  provider may bill for work a failure event doesn't report (a mid-stream
+  death consumed real GPU time and streamed real tokens; the failure record
+  still says 0). When real Foundry/Spark backends land, expect the true ratio
+  to be ≥ what this shows — never ≤.
+
 ## What this is *not* (yet)
 
 - **Not durable.** All sinks are ephemeral (stdout ring / mockd + dashboard
