@@ -59,6 +59,12 @@ TRACE CORRELATION — joining a request to its attempt trail (goal 16):
   primary), on both the direct and fallback paths. A client-supplied litellm_trace_id
   (or an x-litellm-trace-id header) is preserved, never overwritten. See docs/09.
 
+SHADOW COMPLEXITY (goal 21): both record shapes also carry a `complexity` tag —
+a deterministic decision-tree classification (trivial/toolful/heavy/agentic)
+over request features only, with the full feature vector on the record so it is
+auditable. Computed in the logging hooks AFTER routing: pure telemetry for the
+future task-aware router, zero influence on anything. See _complexity + docs/09.
+
 Sinks (independent, both optional):
 
   * stdout  — ALWAYS. One JSON object per line, prefixed `ROUTING_RECORD `.
@@ -217,6 +223,83 @@ def _identity(user_api_key_dict) -> dict:
     }
 
 
+def _complexity(messages, tools):
+    """SHADOW complexity signal (goal 21) — a deterministic, fully-auditable
+    classification of how "hard" a request looks, stamped on routing records so
+    the future task-aware router gets designed against REAL request
+    distributions instead of guesses (GOALS.md: the parked routing-granularity
+    decision).
+
+    Inspired by Fugu/TRINITY (Sakana AI): their core routing lever is a
+    per-request complexity gate in front of a heterogeneous model pool. Two
+    deliberate ANTI-Fugu constraints (their routing is proprietary and opaque):
+      * DETERMINISTIC + TRANSPARENT — a documented decision tree over request
+        features only (no model call, no scoring net), and the full feature
+        vector rides on the record so every classification can be audited
+        after the fact.
+      * SHADOW ONLY — computed inside the LOGGING hooks, after routing is
+        decided. It influences NOTHING: no routing, no latency on the request
+        path. Repeat: this is telemetry, not policy.
+
+    The decision tree (in precedence order):
+      * agentic — tools are offered AND the conversation shows an agent loop
+                  in motion: a tool/function-role message or an assistant
+                  message carrying tool_calls, or >2 turns with tools.
+      * toolful — tools are offered, single-shot (no loop evidence yet).
+      * heavy   — no tools, but a big prompt (approx_prompt_tokens > 2000)
+                  or a long transcript (> 4 turns).
+      * trivial — everything else: the short tool-less ask.
+
+    approx_prompt_tokens is chars/4 over message content (string or list-part
+    text) PLUS the serialized tool schemas — tools are injected into the real
+    prompt, so they count toward its weight. A crude proxy on purpose: stable,
+    dependency-free, good enough to bucket by; the exact token count already
+    rides on the records (goal 3/20).
+
+    Returns None when messages are absent/unreadable — the record then simply
+    OMITS the tag (never a crash, never a guess)."""
+    if not isinstance(messages, list) or not messages:
+        return None
+    tools_n = len(tools) if isinstance(tools, list) else 0
+    turns = len(messages)
+    chars = 0
+    loop_evidence = False
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") in ("tool", "function"):
+            loop_evidence = True
+        if isinstance(m.get("tool_calls"), list) and m.get("tool_calls"):
+            loop_evidence = True
+        content = m.get("content")
+        if isinstance(content, str):
+            chars += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    chars += len(part["text"])
+    if tools_n:
+        try:
+            chars += len(json.dumps(tools, default=str))
+        except Exception:  # pragma: no cover - defensive
+            pass
+    approx_tokens = max(1, chars // 4)
+    if tools_n and (loop_evidence or turns > 2):
+        bucket = "agentic"
+    elif tools_n:
+        bucket = "toolful"
+    elif approx_tokens > 2000 or turns > 4:
+        bucket = "heavy"
+    else:
+        bucket = "trivial"
+    return {
+        "bucket": bucket,
+        "approx_prompt_tokens": approx_tokens,
+        "turns": turns,
+        "tools": tools_n,
+    }
+
+
 def _llm_call_record(kwargs, fallback_status: str) -> dict:
     """Build an `llm_call` record from a success/failure event's kwargs."""
     slo = kwargs.get("standard_logging_object") or {}
@@ -256,6 +339,17 @@ def _llm_call_record(kwargs, fallback_status: str) -> dict:
     ttft = _ttft_ms(slo)
     if ttft is not None:
         record["ttft_ms"] = ttft
+    # SHADOW complexity (goal 21) — best-effort on the attempt trail: the raw
+    # messages/tools ride the logging kwargs on this pinned litellm; when absent
+    # the tag is simply omitted. Attempt-level stamping matters because STREAMED
+    # requests fire no `delivered` record on this pin (docs/09) — the attempt
+    # trail is their only carrier.
+    cx = _complexity(
+        kwargs.get("messages") or slo.get("messages"),
+        (kwargs.get("optional_params") or {}).get("tools"),
+    )
+    if cx is not None:
+        record["complexity"] = cx
     return record
 
 
@@ -334,6 +428,12 @@ class RoutingRecorder(CustomLogger):
         # delivered record. Null under the master key / no key store, so the
         # bare-pytest + cli-auth profiles are unaffected.
         record.update(_identity(user_api_key_dict))
+        # SHADOW complexity (goal 21): classified from the ORIGINAL request
+        # (`data` is the proxy's request dict — messages + tools), inside a
+        # post-response hook, so it can influence nothing. See _complexity.
+        cx = _complexity(data.get("messages"), data.get("tools"))
+        if cx is not None:
+            record["complexity"] = cx
         _emit(record)
 
 

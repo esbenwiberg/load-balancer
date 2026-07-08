@@ -508,5 +508,37 @@ class TestOverheadAttribution(unittest.TestCase):
         self.assertIsNone(ov["overhead_ratio"])
 
 
+# --- shadow complexity: the traffic-mix telemetry (goal 21) ------------------
+# The classifier itself (decision tree, precedence, degradations) pins in
+# obs_callback_test.py; these cover the dashboard FOLD — the per-request
+# passthrough and the distribution rollup, including the "unclassified" bucket
+# that keeps the denominator honest.
+
+
+class TestComplexityShaping(unittest.TestCase):
+    def test_request_row_carries_complexity(self):
+        cx = {"bucket": "agentic", "approx_prompt_tokens": 900, "turns": 3, "tools": 2}
+        row = dashboard._requests_view([_delivered(complexity=cx)])[0]
+        self.assertEqual(row["complexity"], cx)
+
+    def test_untagged_record_degrades_to_none(self):
+        row = dashboard._requests_view([_delivered()])[0]
+        self.assertIsNone(row["complexity"])
+
+    def test_buckets_count_delivered_by_bucket(self):
+        records = [
+            _delivered(complexity={"bucket": "trivial"}),
+            _delivered(complexity={"bucket": "trivial"}),
+            _delivered(complexity={"bucket": "agentic"}),
+            _delivered(),  # no tag -> unclassified, never dropped
+            {"event": "llm_call", "complexity": {"bucket": "heavy"}},  # not delivered
+        ]
+        buckets = dashboard._complexity_buckets(records)
+        self.assertEqual(buckets, {"trivial": 2, "agentic": 1, "unclassified": 1})
+
+    def test_buckets_empty_stream_is_empty(self):
+        self.assertEqual(dashboard._complexity_buckets([]), {})
+
+
 if __name__ == "__main__":
     unittest.main()
