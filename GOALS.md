@@ -51,12 +51,12 @@ unattended run.
 The "complete the idea" arc (harness core, dev stack, observability, wallet
 guards, both dashboard halves, control plane, Ollama profile, Azure IaC) is
 **done** — see § Done. The 2026-07-07 status audit opened a new arc:
-**attribution + observability refinement** — the dashboard shows *where*
-prompts went but not *whose* they were, attempts aren't joined to requests,
-and there's no repo/session slicing or TTFT. Recommended order:
-identity (15) → repo/session attribution (17) → manual profile (19) →
-trace join (16) → TTFT (18); the Fugu-inspired pair slots after — overhead
-attribution (20, needs 16) and the shadow complexity spike (21, independent).
+**attribution + observability refinement** — its first batch (identity 15,
+repo/session 17, manual profile 19, trace join 16, TTFT 18) is **done** —
+see § Done. Next up is the Fugu-inspired pair (from the 2026-07-08 Fugu
+research session): overhead attribution (20 — its goal-16 prereq landed in
+PR #33, so it's unblocked) and the shadow complexity spike (21, independent);
+either order works, both are autonomy-friendly.
 Spark-infra-shaped work stays parked.
 The keystone § Needs-a-human item remains the **routing-granularity decision**
 — it unblocks the actual task-aware router (the control plane is a registry
@@ -70,17 +70,15 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 
 ## § Autonomy-friendly (safe to run unattended)
 
-_None queued right now — the last batch (goals 15–18) is done; see § Done. Add
-new autonomy-friendly goals here as the next status audit vets them._
-
 ### 20. Router-overhead attribution — visible vs consumed tokens — risk: low
 **Why:** the Fugu lesson (Sakana's orchestration model, reverse-engineered by
 Requesty 2026-06): a request returning ~2,200 visible tokens consumed ~22,700
 total — a 10x overhead invisible to the client. Our gateway has the same
 failure mode in miniature: retries and failed fallback attempts consume
-backend tokens the `delivered` record never rolls up. Today attempts and
-requests aren't even joined (goal 16), so per-request true cost is
-unanswerable. Prereq: **goal 16** (the attempt↔request join is the substrate).
+backend tokens the `delivered` record never rolls up. Prereq: **goal 16**
+(the attempt↔request join is the substrate) — **satisfied**, merged as
+PR #33; build on whatever join shape it verified (full or documented-partial
+per its condition).
 **Completion condition:**
 ```
 the dashboard's per-request view carries {tokens_delivered, tokens_consumed} where tokens_consumed sums tokens across ALL attempts joined to the request (failed + retried + winner; attempts with no usage reported count 0 and that convention is documented), plus a fleet/summary rollup of overhead (consumed vs delivered) so a silently-expensive routing config is visible at a glance; an e2e test proves a forced-fallback request reports tokens_consumed > tokens_delivered while a clean direct request reports them equal; docs/09 gains an "overhead attribution" note recording the Fugu 10x rationale; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked (including: goal 16 not yet on main), stop after 30 turns and leave a draft PR
