@@ -493,6 +493,61 @@ to justify a context-length routing rule. The bucket thresholds are the
 tunable starting point; the recorded feature vectors are the data to tune them
 against.
 
+## Shadow session classification — session-turn vs one-shot (goal 22)
+
+**Why this exists.** The decided **hybrid routing granularity**
+([docs/03](03-open-questions-and-risks.md) decision block, 2026-07-08) splits
+traffic into **sticky sessions** and **freely-routed one-shots**. Its
+foundational assumption — *the proxy can tell those apart* — is proven here as
+shadow telemetry before any routing policy consumes it. Same discipline as the
+complexity tag: deterministic, documented, computed in the logging hooks after
+routing — zero influence, zero request-path latency.
+
+**The tag.** Both record shapes carry
+`session: {request_class, stickiness_key, key_source}`
+(`obs_callback._session`):
+
+- **`request_class`** is transcript shape, *per request*: `session-turn` when
+  the transcript shows a conversation in progress (any assistant/tool-role
+  message — a coding agent's turn 2+ always matches, since the client replays
+  the growing transcript); `one-shot` otherwise. **Honest edge:** turn 1 of a
+  real session also looks like a one-shot — the proxy can't see the future.
+  The explicit session tag below is what disambiguates turn 1, and that
+  asymmetry is precisely the telemetry this goal exposes.
+- **`stickiness_key`** is what a sticky router would pin on. Precedence:
+  1. **`tag`** — a `session:<id>` entry in the **`x-litellm-tags`** header.
+     **Verified on the pinned `v1.83.14` (probed live, not guessed):** the raw
+     inbound header map reaches *both* logging surfaces — the delivered hook at
+     `data["metadata"]["headers"]` and attempt events at
+     `kwargs["litellm_params"]["metadata"]["headers"]` (streamed included) —
+     while LiteLLM's own `request_tags` parsing does **not** pick this header
+     up on this pin (it only derives User-Agent tags), so the callback reads
+     the raw header itself. Auth headers are already stripped from that map by
+     LiteLLM, and the callback reads only the one tags key, never emitting the
+     header map. Per goal 17: Codex can carry its native `session_id` here;
+     Claude Code injects it via `ANTHROPIC_CUSTOM_HEADERS` — no client patching.
+     Trusted from turn 1, one-shots included.
+  2. **`transcript`** — untagged session-turns: sha256 of the *first user
+     turn's content*, truncated to 16 hex chars. Agent transcripts grow
+     append-only, so the first user turn is constant across a session — a
+     stable key with zero client cooperation (pinned by
+     `test_transcript_key_stable_as_transcript_grows`). Documented limitation:
+     two sessions opening with byte-identical first prompts collide; the tag
+     path is the fix.
+  3. **`null`** — an untagged one-shot needs no stickiness.
+
+**Where it lands.** Delivered records AND attempt records (streamed traffic has
+no `delivered` record on this pin — the attempt trail is its carrier). The
+dashboard shows a class badge per request (stickiness key + source on hover)
+and `/api/records` carries a **`request_classes`** distribution (untagged ⇒
+`unclassified`) — the sticky-vs-free load split the hybrid router's capacity
+planning hangs on.
+
+**How it feeds the router.** Goal 23's spec consumes exactly these fields:
+`stickiness_key` is the pin for sticky routing, `request_class` gates the
+free-routing path, and the accumulated distribution says how much traffic each
+policy arm will actually carry.
+
 ## What this is *not* (yet)
 
 - **Not durable.** All sinks are ephemeral (stdout ring / mockd + dashboard

@@ -244,6 +244,10 @@ def _requests_view(records: list) -> list:
                 # for the future router, zero routing influence. None on records
                 # from a stack without the tag.
                 "complexity": r.get("complexity"),
+                # SHADOW session classification (goal 22): session-turn vs
+                # one-shot + the stickiness key a sticky router would pin on.
+                # Same shadow discipline; None on untagged records.
+                "session": r.get("session"),
                 # TRACE CORRELATION (goal 16): the join key + this request's own
                 # attempt trail, nested under it by that id.
                 "correlation_id": cid,
@@ -370,6 +374,24 @@ def _complexity_buckets(records: list) -> dict:
         label = bucket if bucket else "unclassified"
         buckets[label] = buckets.get(label, 0) + 1
     return buckets
+
+
+def _request_class_distribution(records: list) -> dict:
+    """The request-class mix (goal 22): how much of the traffic is stateful
+    conversation (routes STICKY under the decided hybrid granularity) vs
+    stateless one-shots (routes freely) — the load-shape number the hybrid
+    router's capacity planning hangs on. Counts `delivered` records by
+    session.request_class; untagged records count `unclassified` (same honesty
+    convention as the complexity buckets)."""
+    dist: dict = {}
+    for r in records:
+        if r.get("event") != "delivered":
+            continue
+        sess = r.get("session") or {}
+        cls = sess.get("request_class") if isinstance(sess, dict) else None
+        label = cls if cls else "unclassified"
+        dist[label] = dist.get(label, 0) + 1
+    return dist
 
 
 def _attempts_view(records: list) -> list:
@@ -548,11 +570,11 @@ _PAGE = """<!doctype html>
   <div class="tablewrap">
     <table>
       <thead><tr>
-        <th>requested</th><th></th><th>served</th><th>route</th><th>complexity</th>
+        <th>requested</th><th></th><th>served</th><th>route</th><th>complexity</th><th>class</th>
         <th>key</th><th>user</th>
         <th>provider</th><th class="num">delivered</th><th class="num">consumed</th><th class="num">cost</th>
       </tr></thead>
-      <tbody id="requests"><tr><td class="empty" colspan="11">no requests yet</td></tr></tbody>
+      <tbody id="requests"><tr><td class="empty" colspan="12">no requests yet</td></tr></tbody>
     </table>
   </div>
 
@@ -597,7 +619,18 @@ function reqTrail(r){
   if(!atts.length) return '';
   const chips = atts.map(attemptChip).join('<span class="arrow"> &rarr; </span>');
   const cid = r.correlation_id ? ' <span class="cid">('+esc(r.correlation_id)+')</span>' : '';
-  return '<tr class="trail"><td></td><td colspan="10">why'+cid+': '+chips+'</td></tr>';
+  return '<tr class="trail"><td></td><td colspan="11">why'+cid+': '+chips+'</td></tr>';
+}
+// Shadow session classification (goal 22): session-turn vs one-shot, with the
+// stickiness key + its source on hover — the hybrid-granularity telemetry.
+function sessCell(s){
+  if(!s || !s.request_class) return '<span class="muted">&mdash;</span>';
+  const isSession = s.request_class==='session-turn';
+  const cls = isSession ? 'yes' : 'no';
+  const why = s.stickiness_key
+    ? ('key '+s.stickiness_key+' ('+(s.key_source||'?')+')')
+    : 'no stickiness key';
+  return '<span class="badge '+cls+'" title="'+esc(why)+'">'+esc(s.request_class)+'</span>';
 }
 // Shadow complexity (goal 21): the bucket as a badge, the full feature vector
 // as a hover title — every classification auditable in place, never a mystery.
@@ -625,6 +658,7 @@ function reqRow(r){
     + '<td><code>'+esc(r.served_model)+'</code></td>'
     + '<td>'+badge+'</td>'
     + '<td>'+cxCell(r.complexity)+'</td>'
+    + '<td>'+sessCell(r.session)+'</td>'
     + '<td>'+idCell(r.key_alias)+'</td>'
     + '<td>'+idCell(r.user_id)+'</td>'
     + '<td>'+esc(r.provider)+'</td>'
@@ -740,7 +774,7 @@ async function refresh(){
       : '<tr><td class="empty" colspan="7">no keyed traffic yet</td></tr>';
     document.getElementById('requests').innerHTML = reqs.length
       ? reqs.map(reqRow).join('')
-      : '<tr><td class="empty" colspan="11">no requests yet</td></tr>';
+      : '<tr><td class="empty" colspan="12">no requests yet</td></tr>';
     document.getElementById('attempts').innerHTML = atts.length
       ? atts.map(attRow).join('')
       : '<tr><td class="empty" colspan="8">no attempts yet</td></tr>';
@@ -754,7 +788,11 @@ async function refresh(){
     // goal 21: the shadow-complexity traffic mix, at a glance.
     const cx = data.complexity_buckets || {};
     const mix = Object.keys(cx).sort().map(k=>esc(k)+' '+esc(cx[k])).join(' / ');
-    document.getElementById('cxdist').innerHTML = mix ? '&middot; mix: '+mix : '';
+    // goal 22: the session-turn vs one-shot mix rides the same strip.
+    const rc = data.request_classes || {};
+    const cmix = Object.keys(rc).sort().map(k=>esc(k)+' '+esc(rc[k])).join(' / ');
+    document.getElementById('cxdist').innerHTML =
+      (mix ? '&middot; mix: '+mix : '') + (cmix ? ' &middot; class: '+cmix : '');
     document.getElementById('status').textContent =
       reqs.length+' requests \\u00b7 '+atts.length+' attempts \\u00b7 '+(data.count||0)+' records';
   } catch(e) {
@@ -820,6 +858,9 @@ class Handler(BaseHTTPRequestHandler):
                     # goal 21: the shadow-complexity traffic mix — see
                     # _complexity_buckets.
                     "complexity_buckets": _complexity_buckets(recs),
+                    # goal 22: session-turn vs one-shot mix — see
+                    # _request_class_distribution.
+                    "request_classes": _request_class_distribution(recs),
                     "records": recs,
                 },
             )

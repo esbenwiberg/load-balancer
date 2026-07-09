@@ -29,7 +29,7 @@ sys.modules.setdefault("litellm", types.ModuleType("litellm"))
 sys.modules.setdefault("litellm.integrations", types.ModuleType("litellm.integrations"))
 sys.modules.setdefault("litellm.integrations.custom_logger", _stub)
 
-from obs_callback import _complexity  # noqa: E402  (needs the stub above)
+from obs_callback import _complexity, _session  # noqa: E402  (needs the stub above)
 
 
 def _user(text):
@@ -149,6 +149,110 @@ class TestDegradations(unittest.TestCase):
         # Same input, same answer — the auditable-routing constraint in test form.
         msgs = [_user("classify me")]
         self.assertEqual(_complexity(msgs, _TOOLS), _complexity(msgs, _TOOLS))
+
+
+# --- shadow session classification (goal 22) --------------------------------
+# The e2e suite proves the live path (headers reach both logging surfaces on
+# the pinned litellm — verified by probe); these pin the classifier itself:
+# the class rule, the stickiness-key precedence (tag > transcript > null), the
+# append-only stability that makes the transcript hash a usable key, and the
+# never-crash degradations.
+
+_SESSION_HDRS = {"x-litellm-tags": "session:sess-42,repo:demo"}
+
+
+class TestRequestClass(unittest.TestCase):
+    def test_bare_single_turn_is_one_shot(self):
+        s = _session({}, [_user("say hi")])
+        self.assertEqual(s["request_class"], "one-shot")
+        self.assertIsNone(s["stickiness_key"])
+        self.assertIsNone(s["key_source"])
+
+    def test_assistant_turn_means_session(self):
+        msgs = [_user("hi"), {"role": "assistant", "content": "hello"}, _user("more")]
+        self.assertEqual(_session({}, msgs)["request_class"], "session-turn")
+
+    def test_tool_history_means_session(self):
+        msgs = [
+            _user("fix it"),
+            {"role": "tool", "tool_call_id": "c1", "content": "result"},
+        ]
+        self.assertEqual(_session({}, msgs)["request_class"], "session-turn")
+
+    def test_system_plus_user_is_still_one_shot(self):
+        msgs = [{"role": "system", "content": "be brief"}, _user("hi")]
+        self.assertEqual(_session({}, msgs)["request_class"], "one-shot")
+
+
+class TestStickinessKey(unittest.TestCase):
+    def test_session_tag_wins_even_on_one_shot(self):
+        # Turn 1 of a real session LOOKS like a one-shot — the explicit tag is
+        # what makes it sticky from the first request.
+        s = _session(_SESSION_HDRS, [_user("first turn")])
+        self.assertEqual(s["request_class"], "one-shot")
+        self.assertEqual(s["stickiness_key"], "sess-42")
+        self.assertEqual(s["key_source"], "tag")
+
+    def test_tag_parsed_from_comma_separated_list(self):
+        s = _session({"x-litellm-tags": "repo:demo , session:abc-1"}, [_user("x")])
+        self.assertEqual(s["stickiness_key"], "abc-1")
+
+    def test_untagged_session_turn_falls_back_to_transcript_hash(self):
+        msgs = [_user("build me a router"), {"role": "assistant", "content": "ok"}]
+        s = _session({}, msgs)
+        self.assertEqual(s["key_source"], "transcript")
+        self.assertTrue(s["stickiness_key"])
+
+    def test_transcript_key_stable_as_transcript_grows(self):
+        # Agent transcripts grow append-only: turn N and turn N+2 share the
+        # first user message, so they derive the SAME key — that stability is
+        # what makes the heuristic usable for stickiness at all.
+        turn2 = [_user("build me a router"), {"role": "assistant", "content": "ok"}]
+        turn4 = turn2 + [
+            _user("now add tests"),
+            {"role": "assistant", "content": "done"},
+        ]
+        self.assertEqual(
+            _session({}, turn2)["stickiness_key"],
+            _session({}, turn4)["stickiness_key"],
+        )
+
+    def test_different_sessions_get_different_transcript_keys(self):
+        a = [_user("prompt A"), {"role": "assistant", "content": "x"}]
+        b = [_user("prompt B"), {"role": "assistant", "content": "x"}]
+        self.assertNotEqual(
+            _session({}, a)["stickiness_key"], _session({}, b)["stickiness_key"]
+        )
+
+    def test_empty_tag_value_is_ignored(self):
+        # "session:" with no id is not a key — fall through, never a "" key.
+        s = _session({"x-litellm-tags": "session:"}, [_user("hi")])
+        self.assertIsNone(s["stickiness_key"])
+
+
+class TestSessionDegradations(unittest.TestCase):
+    def test_no_messages_returns_none(self):
+        self.assertIsNone(_session(_SESSION_HDRS, None))
+        self.assertIsNone(_session(_SESSION_HDRS, []))
+
+    def test_garbage_headers_never_crash(self):
+        for hdrs in (None, "not a dict", {"x-litellm-tags": 42}):
+            s = _session(hdrs, [_user("hi")])
+            self.assertEqual(s["request_class"], "one-shot")
+            self.assertIsNone(s["stickiness_key"])
+
+    def test_list_content_first_user_turn_hashes(self):
+        msgs = [
+            {"role": "user", "content": [{"type": "text", "text": "multimodal"}]},
+            {"role": "assistant", "content": "ok"},
+        ]
+        s = _session({}, msgs)
+        self.assertEqual(s["key_source"], "transcript")
+        self.assertTrue(s["stickiness_key"])
+
+    def test_deterministic(self):
+        msgs = [_user("same"), {"role": "assistant", "content": "same"}]
+        self.assertEqual(_session(_SESSION_HDRS, msgs), _session(_SESSION_HDRS, msgs))
 
 
 if __name__ == "__main__":

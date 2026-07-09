@@ -65,6 +65,12 @@ over request features only, with the full feature vector on the record so it is
 auditable. Computed in the logging hooks AFTER routing: pure telemetry for the
 future task-aware router, zero influence on anything. See _complexity + docs/09.
 
+SHADOW SESSION CLASSIFICATION (goal 22): both record shapes also carry a
+`session` tag — {request_class: session-turn|one-shot, stickiness_key,
+key_source: tag|transcript|null} — the telemetry backing the decided HYBRID
+routing granularity (docs/03): sticky sessions vs freely-routed one-shots.
+Same shadow discipline as goal 21. See _session + docs/09.
+
 Sinks (independent, both optional):
 
   * stdout  — ALWAYS. One JSON object per line, prefixed `ROUTING_RECORD `.
@@ -87,6 +93,7 @@ config dir to sys.path).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
@@ -300,6 +307,94 @@ def _complexity(messages, tools):
     }
 
 
+# The LiteLLM-native session carrier (goal 22). VERIFIED on the pinned
+# v1.83.14 (probed live, not guessed): the raw inbound header map reaches BOTH
+# logging surfaces — the delivered hook at data["metadata"]["headers"] and the
+# attempt events at kwargs["litellm_params"]["metadata"]["headers"] (streamed
+# included) — while LiteLLM's own request_tags parsing does NOT pick this
+# header up on this pin (it only derives User-Agent tags). So we read the raw
+# header ourselves. Auth headers are already stripped from that map by LiteLLM;
+# we additionally read ONLY this one key and never emit the header map.
+_SESSION_HEADER = "x-litellm-tags"
+_SESSION_TAG_PREFIX = "session:"
+
+
+def _session(headers, messages):
+    """SHADOW session classification (goal 22) — is this request a turn of a
+    stateful conversation or a stateless one-shot, and what key would a sticky
+    router pin it on? The decided HYBRID granularity (docs/03 decision block)
+    routes those two shapes differently; this tag PROVES the classification is
+    possible at the proxy, as telemetry, before any routing policy consumes it.
+    Same discipline as goal 21: deterministic, documented, computed in the
+    logging hooks AFTER routing — zero influence, zero request-path latency.
+
+    request_class — transcript shape, per request (NOT a session tracker):
+      * session-turn — the transcript shows a conversation in progress: any
+                       assistant/tool/function-role message. A coding agent's
+                       turn 2+ always matches (the client replays the growing
+                       transcript).
+      * one-shot    — no prior conversational state. NOTE the honest edge: the
+                       FIRST turn of a real session also looks like this — the
+                       proxy cannot see the future. The explicit session tag
+                       (below) is what disambiguates turn 1; that asymmetry is
+                       exactly the telemetry this goal exists to expose.
+
+    stickiness_key — precedence, first hit wins:
+      1. tag        — the client declared a session: a `session:<id>` entry in
+                      the x-litellm-tags header (comma-separated; Codex can
+                      carry its native session_id here, Claude Code injects it
+                      via ANTHROPIC_CUSTOM_HEADERS — goal 17, no client
+                      patching). Trusted from turn 1, one-shots included.
+      2. transcript — session-turns only: sha256 of the FIRST user turn's
+                      content, truncated. Agent transcripts grow append-only,
+                      so the first user turn is constant across a session —
+                      a stable key with zero client cooperation. Documented
+                      limitation: two sessions opening with byte-identical
+                      first prompts collide; the tag path is the fix.
+      3. null       — an untagged one-shot needs no stickiness.
+
+    Returns {request_class, stickiness_key, key_source} or None when messages
+    are absent/unreadable (the record then omits the tag — never a guess)."""
+    if not isinstance(messages, list) or not messages:
+        return None
+    has_prior = any(
+        isinstance(m, dict) and m.get("role") in ("assistant", "tool", "function")
+        for m in messages
+    )
+    request_class = "session-turn" if has_prior else "one-shot"
+    key = None
+    source = None
+    raw = headers.get(_SESSION_HEADER) if isinstance(headers, dict) else None
+    if isinstance(raw, str):
+        for tag in raw.split(","):
+            tag = tag.strip()
+            if tag.startswith(_SESSION_TAG_PREFIX) and len(tag) > len(
+                _SESSION_TAG_PREFIX
+            ):
+                key = tag[len(_SESSION_TAG_PREFIX) :]
+                source = "tag"
+                break
+    if key is None and request_class == "session-turn":
+        for m in messages:
+            if isinstance(m, dict) and m.get("role") == "user":
+                content = m.get("content")
+                if not isinstance(content, str):
+                    try:
+                        content = json.dumps(content, default=str)
+                    except Exception:  # pragma: no cover - defensive
+                        content = str(content)
+                key = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()[
+                    :16
+                ]
+                source = "transcript"
+                break
+    return {
+        "request_class": request_class,
+        "stickiness_key": key,
+        "key_source": source,
+    }
+
+
 def _llm_call_record(kwargs, fallback_status: str) -> dict:
     """Build an `llm_call` record from a success/failure event's kwargs."""
     slo = kwargs.get("standard_logging_object") or {}
@@ -350,6 +445,16 @@ def _llm_call_record(kwargs, fallback_status: str) -> dict:
     )
     if cx is not None:
         record["complexity"] = cx
+    # SHADOW session classification (goal 22) — attempt-side stamping for the
+    # same reason as complexity: streamed requests fire no `delivered` record
+    # on this pin, so the attempt trail is their only carrier. Headers verified
+    # to reach litellm_params.metadata.headers on v1.83.14 (see _session).
+    sess = _session(
+        ((kwargs.get("litellm_params") or {}).get("metadata") or {}).get("headers"),
+        kwargs.get("messages") or slo.get("messages"),
+    )
+    if sess is not None:
+        record["session"] = sess
     return record
 
 
@@ -434,6 +539,14 @@ class RoutingRecorder(CustomLogger):
         cx = _complexity(data.get("messages"), data.get("tools"))
         if cx is not None:
             record["complexity"] = cx
+        # SHADOW session classification (goal 22): the inbound header map is
+        # verified to reach data["metadata"]["headers"] on the pinned v1.83.14
+        # (auth headers already stripped by LiteLLM; we read only the tags key).
+        sess = _session(
+            (data.get("metadata") or {}).get("headers"), data.get("messages")
+        )
+        if sess is not None:
+            record["session"] = sess
         _emit(record)
 
 

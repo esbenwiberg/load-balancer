@@ -540,5 +540,35 @@ class TestComplexityShaping(unittest.TestCase):
         self.assertEqual(dashboard._complexity_buckets([]), {})
 
 
+# --- shadow session classification: the traffic-mix fold (goal 22) -----------
+
+
+class TestSessionShaping(unittest.TestCase):
+    def test_request_row_carries_session(self):
+        sess = {
+            "request_class": "session-turn",
+            "stickiness_key": "sess-1",
+            "key_source": "tag",
+        }
+        row = dashboard._requests_view([_delivered(session=sess)])[0]
+        self.assertEqual(row["session"], sess)
+
+    def test_untagged_record_degrades_to_none(self):
+        self.assertIsNone(dashboard._requests_view([_delivered()])[0]["session"])
+
+    def test_class_distribution_counts_delivered(self):
+        records = [
+            _delivered(session={"request_class": "session-turn"}),
+            _delivered(session={"request_class": "one-shot"}),
+            _delivered(session={"request_class": "one-shot"}),
+            _delivered(),  # untagged -> unclassified, never dropped
+            {"event": "llm_call", "session": {"request_class": "one-shot"}},
+        ]
+        self.assertEqual(
+            dashboard._request_class_distribution(records),
+            {"session-turn": 1, "one-shot": 2, "unclassified": 1},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
