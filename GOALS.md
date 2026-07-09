@@ -103,10 +103,16 @@ decision is made.
   telemetry once it has real distributions, ideally alongside the engine fork
   below. Hard constraints regardless: deterministic + auditable, never buffer
   the stream behind a verdict.
-- **LiteLLM-only vs `archgw` evaluation** — architecture fork; research + a
-  call. The requirements table is ready: [docs/12 §7](docs/12-hybrid-router-spec.md)
-  (R1–R9, with LiteLLM's verified/suspected notes filled in and the archgw
-  column deliberately left as the evaluation's homework).
+- **LiteLLM-only vs `archgw`/Plano evaluation** — architecture fork; research
+  + a call. The requirements table is ready: [docs/12 §7](docs/12-hybrid-router-spec.md)
+  (R1–R9, LiteLLM's verified/suspected notes filled in). 2026-07-09 research
+  input recorded in §7: archgw was renamed/re-architected into **Plano**
+  (2026-01-10, early-stage; session affinity undocumented) — earliest sensible
+  re-look ≈ 12 months post-rename + documented session affinity. Note the
+  separable sub-option: Katanemo's open-weights *router model* as a
+  learned taster inside our deterministic policy (docs/12 §4 note + open
+  decision 5, gated on shadow-telemetry evidence) — adoptable without Plano
+  the proxy.
 - **First Azure deploy + exposure model** (after goal 14) — subscription/resource
   choices, private endpoint vs public + IP allowlist, TLS, dashboard auth, who
   gets keys and how they rotate. A hosted OpenAI-compatible proxy with Foundry
