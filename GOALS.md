@@ -57,10 +57,12 @@ see § Done, as is the Fugu-inspired pair — overhead attribution (20) and the
 shadow complexity signal (21). **The keystone routing-granularity decision is
 MADE (2026-07-08): HYBRID** — sticky sessions, free per-request stateless
 routing, one upward-only escalation hop ([docs/03](docs/03-open-questions-and-risks.md)
-decision block). The router arc is moving: shadow session classification (22)
-is done; next is the hybrid-router spec (23), whose requirements table feeds
-the LiteLLM-vs-archgw fork (still at the keyboard, § Needs-a-human, along
-with the escalation-trigger choice). Spark-infra-shaped work stays parked.
+decision block). The router arc's build-up is COMPLETE: shadow session
+classification (22) and the hybrid-router spec (23, [docs/12](docs/12-hybrid-router-spec.md))
+are done — the router is now specified, its telemetry is accumulating, and
+what remains is keyboard work: the **escalation trigger** and the
+**LiteLLM-vs-archgw engine fork** (§ Needs-a-human; docs/12 §7 is that
+evaluation's scoring table). Spark-infra-shaped work stays parked.
 
 Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 [`docs/06`](docs/06-recommendation.md) (decision), [`docs/03`](docs/03-open-questions-and-risks.md) (risks).
@@ -69,16 +71,10 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 
 ## § Autonomy-friendly (safe to run unattended)
 
-### 23. Hybrid-router design spec — docs only, engine-agnostic — risk: low
-**Why:** the granularity decision is made; the *mechanics* need a spec before
-any engine work: exact policy semantics and the requirements list that feeds
-the LiteLLM-vs-archgw fork (§ Needs-a-human). Docs only — proposing, not
-deciding: the spec's open calls (escalation trigger, engine) stay flagged for
-the keyboard.
-**Completion condition:**
-```
-a new docs/12-hybrid-router-spec.md specifies: request classification (consuming goals 21+22's shadow signals), stickiness semantics (key derivation, where state lives — gateway vs control-plane — with the control-plane contract named per docs/10), the upward-only single-escalation rule (state transition, what happens to the transcript, cache-loss accounting via goal 20's overhead instrument), stateless per-request policy (cheapest capable backend, agent_capable gate), failure semantics (how availability-fallback interacts with stickiness), and a requirements table mapped against BOTH candidate engines (LiteLLM 1.83.x primitives vs archgw) feeding that fork's evaluation; every still-open decision is explicitly flagged Needs-a-human (escalation trigger, engine choice); no code, no config, no routing behavior changes; e2e/run.sh exits 0 surfaced (docs-only sanity); squash-merged with the merge confirmation surfaced; if blocked, stop after 25 turns and leave a draft PR
-```
+_None queued right now — the router arc's autonomy-friendly slice is done
+through the spec (23); what remains on the router is keyboard work (escalation
+trigger, engine fork — § Needs-a-human). Add new goals as the next status
+audit vets them._
 
 ---
 
@@ -108,8 +104,9 @@ decision is made.
   below. Hard constraints regardless: deterministic + auditable, never buffer
   the stream behind a verdict.
 - **LiteLLM-only vs `archgw` evaluation** — architecture fork; research + a
-  call. Goal 23's spec produces the requirements table this evaluation runs
-  against — do 23 first.
+  call. The requirements table is ready: [docs/12 §7](docs/12-hybrid-router-spec.md)
+  (R1–R9, with LiteLLM's verified/suspected notes filled in and the archgw
+  column deliberately left as the evaluation's homework).
 - **First Azure deploy + exposure model** (after goal 14) — subscription/resource
   choices, private endpoint vs public + IP allowlist, TLS, dashboard auth, who
   gets keys and how they rotate. A hosted OpenAI-compatible proxy with Foundry
@@ -140,6 +137,21 @@ decision is made.
    its condition literally holds on `main` — if in doubt, re-check it, don't
    trust the checkmark.
 
+- ✅ 23. Hybrid-router design spec — [docs/12](docs/12-hybrid-router-spec.md):
+  request classification (consumes goals 21+22 verbatim — promotion to routing
+  input is semantic, not a rewrite), the decision table, sticky-pin semantics
+  (derivation per goal 22; pin-store call spec'd as gateway-memory now →
+  Postgres at replica time, control-plane rejected to keep docs/10's
+  registry-not-router-state boundary), upward-only single-escalation state
+  machine (pin replacement, transcript re-sent as-is, re-ingestion visible via
+  goal 20's overhead instrument, `escalated` flag required on records),
+  stateless cheapest-capable policy (governance filter → agent_capable gate →
+  health → cost/in_flight order), failure semantics (pinned-backend-down
+  follows the fallback chain WITHOUT moving the pin — a blip must not burn the
+  session's one hop), and the R1–R9 requirements table feeding the
+  LiteLLM-vs-archgw evaluation. All open calls flagged ⛔ Needs-a-human
+  (trigger, engine, pin store at replica time, streaming-latency override).
+  No code/config/routing changes. — PR #41 (2026-07)
 - ✅ 22. Shadow session classification — session-turn vs one-shot — routing
   records (delivered + llm_call, streamed covered) carry
   `session: {request_class, stickiness_key, key_source}` from
