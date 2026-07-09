@@ -57,10 +57,10 @@ see § Done, as is the Fugu-inspired pair — overhead attribution (20) and the
 shadow complexity signal (21). **The keystone routing-granularity decision is
 MADE (2026-07-08): HYBRID** — sticky sessions, free per-request stateless
 routing, one upward-only escalation hop ([docs/03](docs/03-open-questions-and-risks.md)
-decision block). That unblocks the router arc: shadow session classification
-(22) → hybrid-router spec (23), whose requirements table feeds the
-LiteLLM-vs-archgw fork (still at the keyboard, § Needs-a-human, along with
-the escalation-trigger choice). Spark-infra-shaped work stays parked.
+decision block). The router arc is moving: shadow session classification (22)
+is done; next is the hybrid-router spec (23), whose requirements table feeds
+the LiteLLM-vs-archgw fork (still at the keyboard, § Needs-a-human, along
+with the escalation-trigger choice). Spark-infra-shaped work stays parked.
 
 Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 [`docs/06`](docs/06-recommendation.md) (decision), [`docs/03`](docs/03-open-questions-and-risks.md) (risks).
@@ -68,23 +68,6 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 ---
 
 ## § Autonomy-friendly (safe to run unattended)
-
-### 22. Shadow session classification — session-turn vs stateless one-shot — risk: low
-**Why:** the routing-granularity decision (2026-07-08, [docs/03](docs/03-open-questions-and-risks.md)
-risks 1–2) is **HYBRID**: sticky sessions, free per-request stateless routing,
-one upward-only escalation. Its foundational assumption — "we can tell a
-session turn from a stateless one-shot at the proxy" — should be proven as
-SHADOW telemetry before any routing policy consumes it, exactly like goal 21
-(same anti-Fugu constraints: deterministic, feature-vector-on-record, logging
-hooks only, zero routing influence). Build on goal 17's captured facts:
-Codex emits `session_id`/`prompt_cache_key`; Claude Code needs the
-`x-litellm-tags: session:<id>` carrier (injectable via ANTHROPIC_CUSTOM_HEADERS,
-no client patching); transcript shape (prior assistant/tool turns present) is
-the no-cooperation fallback.
-**Completion condition:**
-```
-routing records gain a shadow request_class tag (session-turn | one-shot) plus a stickiness_key (the session tag/id when the request carries one via a LiteLLM-native carrier verified on the pinned 1.83.x, else a documented transcript-shape heuristic, else null) computed in the existing logging hooks from request features only — no routing influence, no request-path latency; the dashboard surfaces both per request plus a class distribution; e2e proves (a) a bare single-turn request classifies one-shot, (b) a multi-turn transcript with tool history classifies session-turn, (c) two requests sent with the same session tag surface the same stickiness_key while a different tag yields a different key; docs/09 or docs/12 documents the exact features and carrier; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR
-```
 
 ### 23. Hybrid-router design spec — docs only, engine-agnostic — risk: low
 **Why:** the granularity decision is made; the *mechanics* need a spec before
@@ -157,6 +140,22 @@ decision is made.
    its condition literally holds on `main` — if in doubt, re-check it, don't
    trust the checkmark.
 
+- ✅ 22. Shadow session classification — session-turn vs one-shot — routing
+  records (delivered + llm_call, streamed covered) carry
+  `session: {request_class, stickiness_key, key_source}` from
+  `obs_callback._session`: class = transcript shape (assistant/tool turns ⇒
+  session-turn; honest edge documented — turn 1 of a real session looks
+  one-shot, the explicit tag disambiguates); key precedence tag >
+  transcript-hash > null (tag = `session:<id>` in `x-litellm-tags`, VERIFIED
+  by live probe on v1.83.14 to reach both logging surfaces at
+  metadata.headers — litellm's own request_tags does NOT parse it on this pin,
+  so the callback reads the raw header; transcript key = sha256 of the first
+  user turn, stable across append-only growth, collision limitation
+  documented). Dashboard: class badge (key+source on hover) +
+  `request_classes` distribution. Tests: 14 offline classifier cases +
+  shaping tests + e2e `test_routing_records_carry_shadow_session_classification`
+  (one-shot / session-turn / same-tag-same-key / different-tag-different-key).
+  Docs: docs/09 "Shadow session classification". — PR #40 (2026-07)
 - ✅ 21. Complexity-signal spike — shadow-mode request classifier — every
   routing record (delivered + best-effort llm_call, so streamed traffic is
   covered via the attempt trail) carries a `complexity` tag from a

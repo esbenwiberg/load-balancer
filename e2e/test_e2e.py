@@ -1666,6 +1666,131 @@ def test_routing_records_carry_shadow_complexity():
     assert not agentic_rows[0].get("fallback"), agentic_rows[0]
 
 
+# --- shadow session classification (goal 22) --------------------------------
+# The decided HYBRID routing granularity (docs/03 decision block) splits traffic
+# into sticky sessions vs freely-routed one-shots. Before any routing policy
+# consumes that split, this proves the classification works at the proxy — as
+# SHADOW telemetry (obs_callback._session), same discipline as goal 21. The
+# session carrier is the x-litellm-tags header, VERIFIED on the pinned litellm
+# to reach both logging surfaces (docs/09 "Shadow session classification").
+
+
+def test_routing_records_carry_shadow_session_classification():
+    """Goal 22, the three condition proofs:
+    (a) a bare single-turn request classifies one-shot (null stickiness);
+    (b) a multi-turn transcript with tool history classifies session-turn
+        (transcript-hash stickiness key, no client cooperation needed);
+    (c) two requests carrying the SAME session tag surface the same
+        stickiness_key (source=tag), a different tag yields a different key —
+    and the class distribution counts the mix."""
+    # (a) bare one-shot
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": "claude-sonnet",
+            "messages": [{"role": "user", "content": "one shot ping"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+
+    # (b) session-turn: transcript with assistant + tool history, no tag
+    session_messages = [
+        {"role": "user", "content": "keep fixing the port"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_9",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "x"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_9", "content": "port=9090"},
+    ]
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={"model": "claude-sonnet", "messages": session_messages},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+
+    # (c) two tagged requests, same session; one with a different tag
+    for tag, content in (
+        ("session:e2e-sess-A", "tagged turn one"),
+        ("session:e2e-sess-A", "tagged turn two"),
+        ("session:e2e-sess-B", "other session"),
+    ):
+        r = httpx.post(
+            GATEWAY + "/v1/chat/completions",
+            headers={**AUTH, "x-litellm-tags": tag},
+            json={
+                "model": "qwen3-coder",
+                "messages": [{"role": "user", "content": content}],
+            },
+            timeout=TIMEOUT,
+        )
+        assert r.status_code == 200, r.text
+
+    def _all_classified(data):
+        rows = [
+            rq
+            for rq in data.get("requests", [])
+            if (rq.get("session") or {}).get("request_class")
+        ]
+        return len(rows) >= 5
+
+    data = _poll_dash(_all_classified)
+    rows = data["requests"]  # newest first
+
+    # (a) the bare one-shot: class one-shot, no stickiness key
+    one_shots = [
+        rq
+        for rq in rows
+        if rq.get("requested_model") == "claude-sonnet"
+        and (rq.get("session") or {}).get("request_class") == "one-shot"
+        and (rq.get("session") or {}).get("stickiness_key") is None
+    ]
+    assert one_shots, "expected an untagged one-shot with a null stickiness key: %r" % (
+        rows,
+    )
+
+    # (b) the tool-history transcript: session-turn + transcript-derived key
+    session_rows = [
+        rq
+        for rq in rows
+        if rq.get("requested_model") == "claude-sonnet"
+        and (rq.get("session") or {}).get("request_class") == "session-turn"
+    ]
+    assert session_rows, rows
+    sb = session_rows[0]["session"]
+    assert sb["key_source"] == "transcript" and sb["stickiness_key"], sb
+
+    # (c) tag-derived keys: A == A != B, all source=tag
+    tagged = [
+        rq["session"]
+        for rq in rows
+        if rq.get("requested_model") == "qwen3-coder"
+        and (rq.get("session") or {}).get("key_source") == "tag"
+    ]
+    keys = [t["stickiness_key"] for t in tagged]
+    assert keys.count("e2e-sess-A") == 2, (
+        "both same-tag requests must share the declared stickiness key: %r" % tagged
+    )
+    assert keys.count("e2e-sess-B") == 1, (
+        "a different session tag must yield a different key: %r" % tagged
+    )
+
+    # The mix distribution counts both classes.
+    dist = data.get("request_classes") or {}
+    assert dist.get("one-shot", 0) >= 4, dist  # (a) + the three tagged one-shots
+    assert dist.get("session-turn", 0) >= 1, dist
+
+
 def test_dashboard_page_renders():
     """The read-only page itself serves (GET /) and is wired to its data endpoint.
     Not a headless-browser test — we assert the HTML is served and references the
