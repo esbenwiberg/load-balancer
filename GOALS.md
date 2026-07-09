@@ -59,10 +59,16 @@ MADE (2026-07-08): HYBRID** — sticky sessions, free per-request stateless
 routing, one upward-only escalation hop ([docs/03](docs/03-open-questions-and-risks.md)
 decision block). The router arc's build-up is COMPLETE: shadow session
 classification (22) and the hybrid-router spec (23, [docs/12](docs/12-hybrid-router-spec.md))
-are done — the router is now specified, its telemetry is accumulating, and
-what remains is keyboard work: the **escalation trigger** and the
-**LiteLLM-vs-archgw engine fork** (§ Needs-a-human; docs/12 §7 is that
-evaluation's scoring table). Spark-infra-shaped work stays parked.
+are done — the router is specified and its telemetry is accumulating. **The
+engine fork is DECIDED (2026-07-09): LiteLLM custom policy layer** — archgw
+was renamed into Plano (early-stage, session affinity undocumented); re-look
+gate ≥ 2027-01 + documented affinity ([docs/03](docs/03-open-questions-and-risks.md)
+engine decision block, [docs/12 §7](docs/12-hybrid-router-spec.md)). That
+unblocks the **policy-layer build arc: goals 24 → 25 → 26** (shadow stateless
+policy → shadow pins + escalation mechanics → enforcement flip behind a flag),
+all autonomy-friendly. The **escalation trigger** stays § Needs-a-human
+(telemetry-gated); goal 25's stub client-signaled trigger builds the mechanics
+without pre-deciding it. Spark-infra-shaped work stays parked.
 
 Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 [`docs/06`](docs/06-recommendation.md) (decision), [`docs/03`](docs/03-open-questions-and-risks.md) (risks).
@@ -71,10 +77,53 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 
 ## § Autonomy-friendly (safe to run unattended)
 
-_None queued right now — the router arc's autonomy-friendly slice is done
-through the spec (23); what remains on the router is keyboard work (escalation
-trigger, engine fork — § Needs-a-human). Add new goals as the next status
-audit vets them._
+_The policy-layer build arc (engine decided 2026-07-09: LiteLLM custom policy
+layer). Order matters: 24 → 25 → 26 — each consumes the previous._
+
+### 24. Shadow routing policy — the stateless arm, zero influence — risk: low
+**Why:** the engine is decided ([docs/03](docs/03-open-questions-and-risks.md)
+engine decision block): we own the policy layer as LiteLLM hook code. The
+safest first brick is [docs/12 §4](docs/12-hybrid-router-spec.md)'s stateless
+cheapest-capable policy computed at ingress but SHADOW — the decision rides
+the routing record next to what actually happened, so its choices are
+auditable against reality before anything enforces. Same anti-Fugu
+constraints as goals 21/22: deterministic, inputs-on-record, zero routing
+influence, never buffer the stream. This is also the first *consumer* of the
+control-plane registry (R7) — the degrade story when the registry is absent
+must be explicit, not accidental.
+**Completion condition:**
+```
+routing records gain a shadow policy block {arm: "stateless", candidate_set, chosen, reason, actual, agree} computed pre-call in an owned hook applying docs/12 §4's order verbatim (key/tag governance allowlist → agent_capable gate for toolful/agentic complexity buckets → control-plane derived health → cheaper tier first, tie-break lowest in_flight) with zero routing influence and no stream buffering; when the control-plane registry is absent or stale the policy degrades to config-only candidates and the record says so; the dashboard surfaces chosen-vs-actual agreement per request plus an agreement rollup; e2e proves (a) records carry the block with a non-empty candidate_set, (b) a request addressed to an expensive alias while a cheaper capable backend is healthy yields agree:false with the cheaper backend named in chosen, (c) a key with a restricted model allowlist yields a candidate_set that excludes the restricted backend; the policy function has offline fast-tier tests; docs/09 documents the record shape; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR
+```
+
+### 25. Shadow sticky pins + escalation mechanics (stub trigger) — risk: low
+**Why:** the session arm ([docs/12 §2/§3/§5](docs/12-hybrid-router-spec.md))
+needs the pin store and the upward-only state machine. Build both in shadow on
+goal 22's stickiness_key. Pin store = docs/12 §3 option (a), gateway-local
+memory with a TTL knob — the spec's decided default for the single-gateway
+build phase (Postgres promotion is a later, flagged decision). The escalation
+*trigger* decision stays open (§ Needs-a-human) — so use the spec's
+manual/client-signaled option as a STUB: an explicit escalate tag on the
+request fires the mechanics. That proves pin replacement, upward-only, and
+exactly-once without pre-empting the real trigger.
+**Completion condition:**
+```
+prerequisite goal 24 merged; the shadow policy gains the session arm: a gateway-memory pin store keyed by goal-22 stickiness_key with a config-knob TTL (default 24h) — first sight of a key records the shadow pin, subsequent same-key requests carry {arm: "session", pin_hit, pinned_backend, escalated} on their policy block; an explicit escalate signal via the verified tag carrier (x-litellm-tags) fires docs/12 §5's state machine in shadow: the pin is replaced upward (local tier → foundry tier) exactly once, no downward edge, a second signal is a recorded no-op; all still zero routing influence; e2e proves (a) two requests with the same session tag show the same pinned_backend, (b) different tags get independent pins, (c) an escalate-tagged request flips the shadow pin upward once and marks escalated, (d) a further escalate signal does not move it again; TTL expiry and the restart-loses-pins-safely story are covered by offline fast-tier tests with an injected clock; docs/09 and docs/12 updated; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR
+```
+
+### 26. Enforcement flip — policy drives routing behind a flag — risk: medium
+**Why:** with 24+25 shadow-proven, flip the switch — but reversibly: a
+`ROUTER_POLICY` knob defaulting to `shadow` so every existing profile, test,
+and manual stack is byte-for-byte unaffected; `enforce` makes the owned hook
+rewrite the requested model to the policy's choice (R1). The single riskiest
+unknown is R4 — does LiteLLM's availability-fallback chain compose with a
+hook-rewritten model? — so the condition pins it explicitly. Enforcement
+changes served_model semantics, which existing tests assert on; enforce mode
+therefore runs in dedicated coverage while the default suite stays shadow.
+**Completion condition:**
+```
+prerequisite goals 24+25 merged; a ROUTER_POLICY knob (values shadow|enforce, default shadow — the full existing e2e suite passes unchanged under the default); under enforce the owned pre-call hook rewrites the requested model to the policy decision for both arms including the stub escalation, streaming untouched on all three surfaces (chat/messages/responses); R4 composition proven: with enforce on, a forced 503 on the policy-chosen backend still follows the fallback chain to a clean response AND the shadow pin does not move (docs/12 §6 blip-must-not-burn-the-hop); records under enforce carry enforced:true plus requested vs chosen vs served; dedicated e2e enforce-mode tests prove (a) a one-shot addressed to an expensive alias is actually SERVED by the cheapest capable backend with the decision cited on its record, (b) same-session-tag requests are served by the pinned backend, (c) the fallback case above; docs/09 + docs/12 + e2e/README document the knob and the enforce coverage; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR
+```
 
 ---
 
@@ -100,19 +149,22 @@ decision is made.
   Verifier role: cheap verification pass on local output, escalate on
   failure — mind Fugu Ultra's 8–160s latency floor, the cautionary tale), or
   manual/client-signaled. Decide against goal 21's accumulated traffic-mix
-  telemetry once it has real distributions, ideally alongside the engine fork
-  below. Hard constraints regardless: deterministic + auditable, never buffer
-  the stream behind a verdict.
-- **LiteLLM-only vs `archgw`/Plano evaluation** — architecture fork; research
-  + a call. The requirements table is ready: [docs/12 §7](docs/12-hybrid-router-spec.md)
-  (R1–R9, LiteLLM's verified/suspected notes filled in). 2026-07-09 research
-  input recorded in §7: archgw was renamed/re-architected into **Plano**
-  (2026-01-10, early-stage; session affinity undocumented) — earliest sensible
-  re-look ≈ 12 months post-rename + documented session affinity. Note the
-  separable sub-option: Katanemo's open-weights *router model* as a
-  learned taster inside our deterministic policy (docs/12 §4 note + open
-  decision 5, gated on shadow-telemetry evidence) — adoptable without Plano
-  the proxy.
+  telemetry once it has real distributions. Hard constraints regardless:
+  deterministic + auditable, never buffer the stream behind a verdict.
+  *(The engine fork below is decided; goal 25 builds the escalation
+  mechanics with a client-signaled STUB trigger — that proves the state
+  machine without pre-deciding this. This bullet remains the real call.)*
+- ~~**LiteLLM-only vs `archgw`/Plano evaluation**~~ — **✅ DECIDED 2026-07-09:
+  LiteLLM custom policy layer** — recorded in [docs/03](docs/03-open-questions-and-risks.md)
+  (engine decision block after risk 2) against [docs/12 §7](docs/12-hybrid-router-spec.md)'s
+  R1–R9 table. Short version: LiteLLM has R1/R2/R4/R5/R9 verified on our pin
+  and R3 is a small owned component; archgw was renamed into **Plano**
+  (2026-01-10, early-stage) with session affinity — the one switch-worthy
+  feature — undocumented. **Re-look gate: ≥ 2027-01 AND documented session
+  affinity.** Still open + separable: Katanemo's open-weights *router model*
+  as a learned taster inside our deterministic policy (docs/12 §8 decision 5,
+  gated on shadow-telemetry evidence) — adoptable without Plano the proxy.
+  Unblocked goals 24–26 above.
 - **First Azure deploy + exposure model** (after goal 14) — subscription/resource
   choices, private endpoint vs public + IP allowlist, TLS, dashboard auth, who
   gets keys and how they rotate. A hosted OpenAI-compatible proxy with Foundry
