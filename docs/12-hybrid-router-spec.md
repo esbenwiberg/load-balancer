@@ -4,7 +4,8 @@
 granularity ([docs/03](03-open-questions-and-risks.md) decision block,
 2026-07-08 — **HYBRID**: sticky sessions, freely-routed one-shots, one
 upward-only escalation hop) into buildable mechanics, and produces the
-requirements table the **LiteLLM-vs-`archgw` engine fork** runs against.
+requirements table the **LiteLLM-vs-`archgw` engine fork** runs against
+(fork since decided — §7/§8).
 Nothing here changes gateway behavior. Decisions still open are flagged
 **⛔ Needs-a-human** inline and collected at the end.
 
@@ -68,7 +69,7 @@ Hard constraints (carried from the Fugu research, non-negotiable):
   turn 1), transcript-hash for untagged session-turns (documented collision
   caveat), null otherwise.
 - **Where the pin lives** — ⛔ **Needs-a-human** at implementation time, spec'd
-  as requirement R6 below. Candidates:
+  as requirement R3 below. Candidates:
   - *(a) gateway-local memory* — trivial, lost on restart (acceptable: an
     unpinned session-turn just re-pins; the cache-loss cost is the same as a
     restart today), broken with >1 gateway replica;
@@ -190,12 +191,20 @@ hook code — deterministic, testable, but ours to maintain) and R3 is the only
 structural gap. The archgw column is empty on purpose — filling it IS the
 evaluation, and goal 23 forbids pre-deciding it.
 
-## 8. Open decisions (all ⛔ Needs-a-human, collected)
+**→ DECIDED (2026-07-09, at the keyboard, post-goal-23): LiteLLM custom policy
+layer.** Recorded in [docs/03](03-open-questions-and-risks.md) (engine decision
+block after risk 2) with the full basis. The table above stands as the
+evaluation record; the archgw/Plano column stays as-researched (rename note
+above). Re-look gate: ≥ 2027-01 AND Plano documents session affinity.
+
+## 8. Open decisions (⛔ Needs-a-human, collected; ✅ = since decided)
 
 1. **Escalation trigger** — complexity threshold / verify-then-escalate /
    manual / N-fallback-turns. Decide against goal 21+22 telemetry.
-2. **Engine** — LiteLLM custom policy layer vs archgw/Plano. Input: §7 table
-   including the rename note.
+2. ~~**Engine** — LiteLLM custom policy layer vs archgw/Plano.~~
+   **✅ DECIDED 2026-07-09: LiteLLM custom policy layer** — see §7 and the
+   docs/03 engine decision block. Re-look gate ≥ 2027-01 + documented session
+   affinity. Unblocks GOALS.md 24–26.
 3. **Pin store at replica time** — §3's (a)→(c) promotion point.
 4. **Streaming-latency override** (docs/03 risk 3) — whether `heavy`/long-
    stream traffic skips local regardless of complexity; fold into decision 1.

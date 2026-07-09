@@ -66,6 +66,34 @@ cost once)?
 > data-governance moat), and never buffer the stream behind a routing decision.
 > Implementation is unblocked but engine-shaped: the hybrid's requirements are the
 > input to the LiteLLM-vs-`archgw` evaluation (checklist below).
+> **→ engine DECIDED 2026-07-09 — next decision block.**
+
+> **DECISION (2026-07-09) — routing engine: LiteLLM custom policy layer** (over
+> archgw/Plano). Made at the keyboard against the R1–R9 requirements table
+> ([docs/12 §7](12-hybrid-router-spec.md)). Basis:
+>
+> 1. **LiteLLM (pinned 1.83.x) covers the table today**: R1/R2/R4/R5/R9 are
+>    *verified* in our own harness (pre-call hook rewrites `data["model"]`,
+>    headers reach hooks, fallbacks proven, capability flags queryable, all
+>    three surfaces exercised daily by e2e). R3 (sticky pin store) is the one
+>    structural gap and it is a small owned component already spec'd
+>    (docs/12 §3: gateway-memory now → Postgres at replica time).
+> 2. **archgw no longer exists under that name**: Katanemo renamed and
+>    re-architected it into **Plano** (2026-01-10, early-stage). Session
+>    affinity — the single best reason to switch — is **undocumented** (R3
+>    unverified), and Responses-bridge parity (R9, the Codex commitment) is
+>    unverified. Migrating would mean re-proving the entire e2e surface
+>    (three protocols, fallback semantics, obs callbacks) on a new data plane
+>    for no verified gain.
+> 3. **Blast radius**: the policy layer is hook code we own — deterministic,
+>    offline-testable, reversible; a data-plane swap is the whole gateway.
+>
+> **Re-look condition (a gate, not a date preference): no earlier than 2027-01
+> AND Plano documents session affinity.** Separable and still open: Katanemo's
+> open-weights *router model* as a learned taster inside our deterministic
+> policy (docs/12 §4 note + open decision 5) — telemetry-gated, adoptable
+> without Plano the proxy. This decision unblocks the policy-layer build goals
+> (GOALS.md 24–26).
 
 ### 3. Spark interactive latency for big models
 A 30B-class model on a Spark is **single-digit tok/s for one user.** A coding agent
@@ -262,5 +290,9 @@ depend on a flaky component.
       one upward-only escalation hop; see the decision block after risk 2. Escalation
       trigger still open (GOALS.md § Needs-a-human).**
 - [ ] Decide what "belongs" on a Spark vs always-Foundry (latency-driven, not just size).
-- [ ] Evaluate LiteLLM-only vs Arch(`archgw`) for the routing layer.
+- [x] Evaluate LiteLLM-only vs Arch(`archgw`) for the routing layer.
+      **→ DECIDED 2026-07-09: LiteLLM custom policy layer — see the engine decision
+      block after risk 2. archgw was renamed/re-architected into Plano (2026-01-10);
+      re-look gate: ≥ 2027-01 AND documented session affinity. The learned-taster
+      sub-option (docs/12 §8 decision 5) stays open, telemetry-gated.**
 - [ ] Data-governance sign-off with DISCO on Foundry usage + transparent routing.
