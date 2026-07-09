@@ -34,9 +34,17 @@ the audit trail that the router did what the classifier said.
 
 Hard constraints (carried from the Fugu research, non-negotiable):
 - **Deterministic + auditable**: same request ⇒ same decision; every decision
-  writes a routing record naming its inputs. No learned/opaque routing.
+  writes a routing record naming its inputs. The constraint binds the
+  **policy**, not the toolbox: an opaque end-to-end learned router (the Fugu
+  shape) is out, but a learned *matcher* proposing a route from a
+  human-written candidate set — with rules and governance filters disposing —
+  is compatible; see the §4 learned-taster note and open decision 5. What must
+  always hold: the citable reason ("why did THIS prompt go to Foundry?") is a
+  rule or a logged preference-match, never "the model said so".
 - **Never buffer the stream** behind a routing decision: classify from the
-  request alone (no model calls) before the first backend byte.
+  request alone before the first backend byte. Today that means no model
+  calls; decision 5 would relax it to at most ONE bounded local matcher
+  inference pre-routing (a TTFT tax to be measured, never mid-stream work).
 - **Data governance**: the classifier must be able to enforce "this key/tag
   never routes to Foundry" (DISCO constraint) — a *candidate-set* filter, not
   an afterthought.
@@ -92,6 +100,22 @@ order:
    toward Foundry per docs/03 risk 3 (streaming latency beats complexity) —
    the exact rule is part of the escalation-trigger decision.
 
+**Note — the learned-taster slot (future option, ⛔ decision 5).** Step 4 is
+where a *learned matcher* could later replace the goal-21 decision tree as the
+taster: a small open-weights router model (e.g. Katanemo's preference-aligned
+router line — pinned weights like the LiteLLM image pin, run locally so no
+prompt leaves the building) proposes a route **from the candidate set that
+survived steps 1–3**; the deterministic filters still dispose, and the routing
+record logs the matched preference. "Model proposes, config disposes" — the
+Fugu lesson applied selectively rather than as a blanket ML ban. Costs to
+weigh when the time comes: a ~1.5–4B inference on the request path before the
+first byte (TTFT tax + a hosted, warm meta-model on hardware meant for real
+models), and reproducibility-without-explainability (pinned weights give
+same-input-same-output, not enumerable failure modes). **Adoption gate:**
+goals 21+22's shadow records ARE the eval set — adopt a learned taster only
+when accumulated telemetry shows the deterministic tree's misclassification
+cost exceeds the taster's TTFT+infra tax. Measured, not argued.
+
 ## 5. Escalation — one hop, upward only
 
 - **Trigger**: ⛔ **Needs-a-human** (GOALS.md § Needs-a-human bullet). The spec
@@ -136,6 +160,19 @@ R-numbers are what the LiteLLM-vs-archgw evaluation scores. "LiteLLM 1.83.x"
 notes what is verified vs suspected on the pinned build; archgw column is
 research homework for the evaluation (⛔ engine choice is Needs-a-human).
 
+**⚠️ Evaluation input (researched 2026-07-09): archgw no longer exists under
+that name.** Katanemo renamed and re-architected it into **Plano**
+(2026-01-10), scope-expanded from LLM routing to "delivery infrastructure for
+agentic apps". Facts gathered so far: Envoy-based out-of-process data plane
+(Envoy-contributor pedigree, streaming-first); model/alias routing plus
+preference routing via a learned open-weights router (`plano_orchestrator_v1`,
+~4B — usable compatibly only in the §4 learned-taster shape); session affinity
+**not documented** (R3 unverified); Responses-bridge parity (R9) unverified;
+early-stage post-rename. Two consequences for the evaluation: (1) the earliest
+sensible re-look is roughly 12 months post-rename *and* documented session
+affinity; (2) adopting Katanemo's *router model* as a §4 taster is separable
+from adopting Plano the *proxy* — score them independently.
+
 | # | Requirement | LiteLLM 1.83.x (pinned) | archgw (to evaluate) |
 |---|---|---|---|
 | R1 | Per-request candidate-set routing hook (pre-call, no stream buffering) | `async_pre_call_hook` can rewrite `data["model"]` — verified the hook exists + mutates data (goal 16 uses it); routing via it is a custom policy layer we own | native "routing policy" story? |
@@ -157,10 +194,17 @@ evaluation, and goal 23 forbids pre-deciding it.
 
 1. **Escalation trigger** — complexity threshold / verify-then-escalate /
    manual / N-fallback-turns. Decide against goal 21+22 telemetry.
-2. **Engine** — LiteLLM custom policy layer vs archgw. Input: §7 table.
+2. **Engine** — LiteLLM custom policy layer vs archgw/Plano. Input: §7 table
+   including the rename note.
 3. **Pin store at replica time** — §3's (a)→(c) promotion point.
 4. **Streaming-latency override** (docs/03 risk 3) — whether `heavy`/long-
    stream traffic skips local regardless of complexity; fold into decision 1.
+5. **Learned taster inside the deterministic policy** (§4 note) — whether to
+   replace the goal-21 tree with a pinned open-weights matcher proposing from
+   the filtered candidate set. Adoption gate: shadow-telemetry evidence that
+   the tree's misclassification cost exceeds the taster's TTFT+infra tax.
+   Separable from decision 2 — the router *model* is adoptable without Plano
+   the *proxy*.
 
 ## 9. What this spec deliberately does NOT do
 
