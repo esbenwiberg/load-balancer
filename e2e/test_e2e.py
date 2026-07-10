@@ -2680,3 +2680,145 @@ def test_shadow_policy_candidate_set_respects_key_allowlist():
     # claude-opus by name — and reality (claude-sonnet served) stays untouched.
     assert row["served_model"] == "claude-sonnet", row
     assert not row.get("fallback"), row
+
+
+# --- shadow sticky pins + escalation mechanics — the session arm (goal 25) ---
+# docs/12 §2/§3/§5 in shadow: a stickiness key (goal 22's tag) switches the
+# policy to the session arm — first sight pins the stateless choice in
+# gateway-local memory, subsequent same-key requests carry the pin, and an
+# explicit `escalate` entry on x-litellm-tags (the STUB trigger — the real
+# trigger stays Needs-a-human) fires the upward-only, exactly-once state
+# machine. The state machine itself pins offline in obs_callback_test.py
+# (TTL/restart with an injected clock); these prove the live path: the tag
+# reaches the PRE-CALL hook, pins survive across requests in the running
+# gateway, and — zero influence — every request is still served by exactly
+# what it asked for. Each step requests a DIFFERENT model so its row is
+# uniquely addressable as (stickiness_key, requested_model).
+
+
+def _session_policy_of(data, key, requested_model):
+    """The newest request row for `requested_model` carrying a session-arm
+    policy block pinned on `key`, or None."""
+    for rq in data.get("requests", []):
+        pol = rq.get("policy") or {}
+        if (
+            rq.get("requested_model") == requested_model
+            and pol.get("arm") == "session"
+            and pol.get("stickiness_key") == key
+        ):
+            return rq
+    return None
+
+
+def _tagged_request(model, tags, content):
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers={**AUTH, "x-litellm-tags": tags},
+        json={"model": model, "messages": [{"role": "user", "content": content}]},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+    return r
+
+
+def _await_session_row(key, requested_model):
+    data = _poll_dash(lambda d: _session_policy_of(d, key, requested_model) is not None)
+    row = _session_policy_of(data, key, requested_model)
+    assert row is not None, "no session-arm policy row for (%s, %s): %r" % (
+        key,
+        requested_model,
+        data.get("requests"),
+    )
+    return row
+
+
+def test_shadow_session_pin_sticks_and_pins_are_independent():
+    """Conditions (a)+(b): two requests with the SAME session tag show the same
+    pinned_backend (recorded at first sight, carried on the hit); a different
+    tag gets its own independent pin. All shadow: every request is served by
+    the model it addressed."""
+    _beat("wb-e2e-policy", "qwen3-coder", warm=True, agent_capable=True, healthy=True)
+    key_a = _unique("pin-a")
+    key_b = _unique("pin-b")
+
+    # Turn 1 of declared session A: first sight ⇒ the stateless arm's choice
+    # (the healthy local workbench) becomes the pin.
+    _tagged_request("qwen3-coder", "session:" + key_a, "session A turn 1")
+    row = _await_session_row(key_a, "qwen3-coder")
+    pol = row["policy"]
+    assert pol["pin_hit"] is False, pol
+    assert pol["pinned_backend"] == "qwen3-coder", pol
+    assert pol["escalated"] is False, pol
+    assert pol["registry"] == "live", pol  # the pin-recording evaluation ran
+    assert pol["chosen"] == "qwen3-coder" and pol["agree"] is True, pol
+
+    # Turn 2, same tag, addressed to a DIFFERENT model: the pin holds (that is
+    # the stickiness contract) — and in shadow, claude-sonnet still serves.
+    _tagged_request("claude-sonnet", "session:" + key_a, "session A turn 2")
+    row = _await_session_row(key_a, "claude-sonnet")
+    pol = row["policy"]
+    assert pol["pin_hit"] is True, pol
+    assert pol["pinned_backend"] == "qwen3-coder", pol
+    assert pol["chosen"] == "qwen3-coder", pol
+    assert pol["agree"] is False, pol  # policy would have kept the session local
+    assert pol["registry"] is None, pol  # pure pin hit: no evaluation ran
+    assert row["served_model"] == "claude-sonnet", row  # zero influence
+    assert not row.get("fallback"), row
+
+    # A different tag is a different session: its own first sight, own pin.
+    _tagged_request("qwen3-coder", "session:" + key_b, "session B turn 1")
+    pol = _await_session_row(key_b, "qwen3-coder")["policy"]
+    assert pol["pin_hit"] is False, pol
+    assert pol["pinned_backend"] == "qwen3-coder", pol
+
+
+def test_shadow_escalation_flips_the_pin_upward_exactly_once():
+    """Conditions (c)+(d): an escalate-tagged request replaces the shadow pin
+    upward (local → foundry) exactly once — visible on the record as
+    escalated:true + escalated_from — and any further signal is a recorded
+    no-op that moves nothing. A bystander session pinned before the escalation
+    is untouched (per-key isolation), and reality is never influenced."""
+    _beat("wb-e2e-policy", "qwen3-coder", warm=True, agent_capable=True, healthy=True)
+    key = _unique("pin-esc")
+    bystander = _unique("pin-bystander")
+
+    # Pin both sessions on the local workbench.
+    _tagged_request("qwen3-coder", "session:" + key, "escalating session turn 1")
+    pol = _await_session_row(key, "qwen3-coder")["policy"]
+    assert pol["pinned_backend"] == "qwen3-coder" and pol["escalated"] is False, pol
+    _tagged_request("qwen3-coder", "session:" + bystander, "bystander turn 1")
+    _await_session_row(bystander, "qwen3-coder")
+
+    # The STUB trigger fires: the pin is REPLACED upward. Among the foundry
+    # tier the stateless re-run tie-breaks by name ⇒ claude-opus. The request
+    # itself (addressed to claude-sonnet) is served untouched.
+    _tagged_request("claude-sonnet", "session:" + key + ",escalate", "please escalate")
+    row = _await_session_row(key, "claude-sonnet")
+    pol = row["policy"]
+    assert pol["escalated"] is True, pol
+    assert pol["pinned_backend"] == "claude-opus", pol
+    assert pol["escalated_from"] == "qwen3-coder", pol
+    assert pol["registry"] == "live", pol  # the upward evaluation ran
+    assert "upward, exactly once" in pol["reason"], pol
+    assert row["served_model"] == "claude-sonnet", row  # zero influence
+    assert not row.get("fallback"), row
+
+    # A SECOND signal: recorded no-op — the pin does not move again (d).
+    _tagged_request("claude-opus", "session:" + key + ",escalate", "escalate harder")
+    pol = _await_session_row(key, "claude-opus")["policy"]
+    assert pol["pinned_backend"] == "claude-opus", pol
+    assert pol["escalated"] is True, pol
+    assert "escalated_from" not in pol, pol  # nothing flipped THIS request
+    assert "no-op (already escalated" in pol["reason"], pol
+
+    # The escalated pin is durable for plain turns (no downward edge)...
+    _tagged_request("gpt", "session:" + key, "post-escalation turn")
+    pol = _await_session_row(key, "gpt")["policy"]
+    assert pol["pin_hit"] is True, pol
+    assert pol["pinned_backend"] == "claude-opus" and pol["escalated"] is True, pol
+
+    # ...and the bystander session never moved (independent pins).
+    _tagged_request("claude-sonnet", "session:" + bystander, "bystander turn 2")
+    pol = _await_session_row(bystander, "claude-sonnet")["policy"]
+    assert pol["pinned_backend"] == "qwen3-coder", pol
+    assert pol["escalated"] is False, pol

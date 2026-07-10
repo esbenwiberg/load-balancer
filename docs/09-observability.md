@@ -649,7 +649,100 @@ carries a **`policy_agreement`** rollup `{evaluated, agree, disagree,
 unevaluated, agreement_rate}` rendered on the Requests header — the number the
 goal-26 enforcement flip will be judged against. Honest-denominator convention
 throughout: no-block and no-verdict records count as `unevaluated`, and an
-empty stream yields `agreement_rate: null`, not a fake 100%.
+empty stream yields `agreement_rate: null`, not a fake 100%. Session-arm
+blocks (below) flow through the same badge and rollup — `agree` semantics are
+identical (`chosen == actual`), and the pin story is in the hover reason.
+
+## Shadow sticky pins + escalation — the session arm (goal 25)
+
+**Why this exists.** The stateless arm covers one-shots; the decided HYBRID
+granularity ([docs/03](03-open-questions-and-risks.md)) says *sessions route
+sticky, with one upward-only escalation hop*. Goal 25 builds those mechanics
+([docs/12 §2/§3/§5](12-hybrid-router-spec.md)) — still **SHADOW**, zero
+routing influence — on goal 22's stickiness key. The escalation **trigger**
+decision stays open (§ Needs-a-human): the trigger built here is the spec's
+manual/client-signaled option as a **STUB** — an explicit `escalate` entry on
+`x-litellm-tags` — which proves pin replacement, upward-only, and
+exactly-once without pre-deciding the real trigger.
+
+**Arm dispatch (docs/12 §2).** `async_pre_call_hook` derives the stickiness
+key **pre-call** (goal 22's derivation verbatim: `session:<id>` tag >
+transcript hash > null; the header map is read from the request metadata,
+whichever of its per-surface shapes is present). A key ⇒ the session arm; no
+key ⇒ the stateless arm (goal 24, unchanged).
+
+**The pin store** (`obs_callback._PinStore`) is docs/12 §3 option (a) — the
+decided default for the single-gateway build phase: **gateway-local**, keyed
+by stickiness key, bounded (least-recently-seen eviction past 4096), with an
+**inactivity TTL** knob `POLICY_PIN_TTL_S` (default 86400 = the spec's 24h;
+every hit refreshes it). First sight of a key runs the stateless arm and
+**pins its choice**; subsequent same-key requests carry the pin, bypassing
+re-evaluation — a pure pin hit reads no registry and stamps `registry: null`
+(no health signal was consulted, and the record must not claim one). Because
+this is the *shadow* router's own state, the pin records what the policy
+**would have** pinned, not what actually served.
+
+**Backing: a container-scoped SQLite file, not process memory** (knob
+`POLICY_PIN_DB`, default under the container's `/tmp` — the control-plane's
+own SQLite pattern). Discovered building this: **every profile runs the proxy
+with `--num_workers 2`**, and pins are the first *cross-request* state in the
+callback — per-process memory gave each worker its own contradictory pin
+universe (requests round-robin, so a session's pin "flapped" ~50% of turns).
+A multi-worker gateway is already "replicas" in docs/12 §3(a)'s sense. The
+file keeps §3(a)'s intent — nothing leaves the gateway container, no shared
+infra, no schema in the shared Postgres — while giving all workers one store;
+guarded SQL (`INSERT OR IGNORE` for pin-once, `UPDATE … WHERE escalated=0`
+for the hop) makes first-writer-wins and **exactly-once escalation atomic
+across workers**, not just threads. **Restart story, by design:** a recreated
+container starts with a fresh `/tmp`, so pins are lost — the next turn just
+re-pins (docs/12 §3's "the cache-loss cost is the same as a restart today").
+TTL, restart, worker-sharing, and cross-worker exactly-once are all proven
+offline with an injected clock (`obs_callback_test.py`), no docker, no
+sleeping. Postgres promotion — needed only when *replicas* (separate hosts)
+arrive — stays a later, flagged decision (docs/12 §8.3).
+
+**The block.** Same-key requests carry:
+
+```json
+"shadow_policy": {
+  "arm": "session",
+  "stickiness_key": "e2e-pin-esc-…",
+  "pin_hit": true,
+  "pinned_backend": "claude-opus",
+  "escalated": true,
+  "chosen": "claude-opus",
+  "reason": "pin hit: qwen3-coder (tier=local, escalated=False); escalate signal: pin qwen3-coder -> claude-opus (upward, exactly once) [governance: key unrestricted; …]",
+  "registry": "live",
+  "actual": "claude-sonnet",
+  "agree": false,
+  "escalated_from": "qwen3-coder"
+}
+```
+
+**Escalation mechanics (docs/12 §5), exactly as spec'd.** The `escalate`
+signal replaces the pin **upward only** — the target is the stateless arm
+re-run over the tiers *strictly above* the pin's, so governance, the
+agent_capable gate, and health still bound it. The state machine is
+`pinned(local) → escalated(foundry)` with **no reverse edge and no second
+hop**: the firing request carries `escalated: true` + `escalated_from` (the
+old pin — escalation is visible on the record, never silent); any further
+signal is a recorded no-op ("already escalated"). A signal that finds **no
+capable higher-tier candidate** (already top-tier, or filters emptied the
+pool) is also a recorded no-op that does **not** burn the hop — nothing
+moved, and a blip must not spend the session's one escalation (the §6
+blip-must-not-burn-the-hop spirit, applied to the trigger).
+
+**Proofs.** Offline (`obs_callback_test.py`): the full state machine —
+first-sight pinning, stickiness-beats-re-evaluation, per-key independence,
+TTL expiry + activity refresh (injected clock), restart-loses-pins-safely,
+upward/exactly-once/no-downward, governance-bounded targets, recorded no-ops,
+determinism. Live (`test_e2e.py`):
+`test_shadow_session_pin_sticks_and_pins_are_independent` (same tag ⇒ same
+`pinned_backend` across requests, different tags ⇒ independent pins) and
+`test_shadow_escalation_flips_the_pin_upward_exactly_once` (the flip, the
+no-op second signal, pin durability, bystander isolation) — every assertion
+paired with the zero-influence check that each request was served by exactly
+the model it addressed.
 
 ## What this is *not* (yet)
 
