@@ -69,9 +69,16 @@ HTTP surface:
                                              #  rollup (requests, fallbacks,
                                              #  tokens, cost), `overhead` is
                                              #  the goal-20 delivered-vs-consumed
-                                             #  summary, and `policy_agreement`
+                                             #  summary, `policy_agreement`
                                              #  is the goal-24 shadow-policy
-                                             #  chosen-vs-actual rollup
+                                             #  chosen-vs-actual rollup (plus
+                                             #  the goal-27 enforced split),
+                                             #  and goal 27 adds `models`
+                                             #  (traffic per model, demand vs
+                                             #  supply), `users`, `sessions`
+                                             #  (per stickiness key: turns,
+                                             #  pin state, escalation) and
+                                             #  `backends` (per deployment)
   GET  /api/fleet                            # {"available":bool, "models":[...],
                                              #  "instances":[...]} — the goal-13
                                              #  fleet data endpoint: a server-side
@@ -90,6 +97,7 @@ import json
 import os
 import sys
 import threading
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -120,6 +128,13 @@ class Records:
 
     def add(self, record: dict) -> None:
         with self._lock:
+            # SINK ARRIVAL TIME (goal 27). Routing records carry latency but no
+            # wall-clock stamp of their own, so the sink stamps arrival — good
+            # enough for "most recent activity" ordering (sessions view) and
+            # honest about what it is: when the record REACHED the dashboard,
+            # not when the backend answered. Never overwrites a stamp already
+            # present (a future obs_callback may stamp at the source).
+            record.setdefault("received_at", time.time())
             self._records.append(record)
             if len(self._records) > self._CAP:
                 self._records = self._records[-self._CAP :]
@@ -259,6 +274,9 @@ def _requests_view(records: list) -> list:
                 # attempt trail, nested under it by that id.
                 "correlation_id": cid,
                 "attempts": attempts,
+                # Sink arrival time (goal 27) — ordering signal for the
+                # sessions rollup; None on records injected without one.
+                "received_at": r.get("received_at"),
             }
         )
     out.reverse()  # newest first
@@ -315,6 +333,229 @@ def _key_rollup(records: list) -> list:
     return rows
 
 
+def _model_rollup(requests: list) -> list:
+    """Per-MODEL traffic (goal 27): demand vs supply per alias. One row per
+    model name seen in the delivered stream, carrying:
+      * requested — how many requests ASKED for this alias (demand). Under
+        enforcement/fallback this can differ wildly from served — that drift
+        IS the router working (or misfiring), so both counts sit side by side.
+      * served    — how many requests this model actually answered (supply),
+        plus the tokens/cost attributed to serving them and how many of those
+        wins arrived via fallback.
+    Note: `requested` uses the record's requested_model, which under
+    ROUTER_POLICY=enforce is the post-rewrite ask (the original ask lives in
+    the policy block's `requested` stash) — so under enforcement this shows
+    what the ROUTER asked the backend pool for. Sorted busiest-served first."""
+    agg: dict = {}
+    order = []
+
+    def _entry(name):
+        e = agg.get(name)
+        if e is None:
+            e = {
+                "model": name,
+                "requested": 0,
+                "served": 0,
+                "fallbacks_in": 0,
+                "tokens_delivered": 0,
+                "tokens_consumed": 0,
+                "cost": 0.0,
+            }
+            agg[name] = e
+            order.append(name)
+        return e
+
+    for rq in requests:
+        req_name = rq.get("requested_model")
+        srv_name = rq.get("served_model")
+        if req_name:
+            _entry(req_name)["requested"] += 1
+        if srv_name:
+            e = _entry(srv_name)
+            e["served"] += 1
+            if rq.get("fallback"):
+                e["fallbacks_in"] += 1
+            d = rq.get("tokens_delivered")
+            if isinstance(d, (int, float)):
+                e["tokens_delivered"] += d
+            c = rq.get("tokens_consumed")
+            if isinstance(c, (int, float)):
+                e["tokens_consumed"] += c
+            cost = rq.get("response_cost")
+            if isinstance(cost, (int, float)):
+                e["cost"] += cost
+    rows = [agg[k] for k in order]
+    rows.sort(key=lambda e: (-e["served"], -e["requested"], e["model"]))
+    return rows
+
+
+# The label the per-user rollup uses when a delivered record carries no
+# user_id (master key / no key store) — same collapse convention as _NO_KEY.
+_NO_USER = "(no user)"
+
+
+def _user_rollup(requests: list) -> list:
+    """Per-USER traffic (goal 27): the identity counterpart the per-key rollup
+    can't give — a user with two virtual keys is two rows there, one row here.
+    Requests, fallbacks, delivered tokens, cost, and how many DISTINCT keys the
+    user drove traffic through. Null user_ids collapse into one `(no user)`
+    row (honest denominator, never scattered). Busiest first."""
+    agg: dict = {}
+    order = []
+    for rq in requests:
+        uid = rq.get("user_id")
+        label = uid if uid else _NO_USER
+        e = agg.get(label)
+        if e is None:
+            e = {
+                "user_id": uid,
+                "requests": 0,
+                "fallbacks": 0,
+                "tokens": 0,
+                "cost": 0.0,
+                "_keys": set(),
+            }
+            agg[label] = e
+            order.append(label)
+        e["requests"] += 1
+        if rq.get("fallback"):
+            e["fallbacks"] += 1
+        d = rq.get("tokens_delivered")
+        if isinstance(d, (int, float)):
+            e["tokens"] += d
+        cost = rq.get("response_cost")
+        if isinstance(cost, (int, float)):
+            e["cost"] += cost
+        if rq.get("key_alias"):
+            e["_keys"].add(rq["key_alias"])
+    rows = []
+    for label in order:
+        e = agg[label]
+        e["keys"] = len(e.pop("_keys"))
+        rows.append(e)
+    rows.sort(key=lambda e: (-e["requests"], e["user_id"] or _NO_USER))
+    return rows
+
+
+def _session_rollup(requests: list) -> list:
+    """Per-SESSION rollup (goal 27): the view goal 22's classification and goal
+    25's pins were pointing at all along — one row per stickiness key, folding
+    that session's turns together: how many, which backends served them, the
+    session arm's pin state (pinned backend, pin hits, the one escalation), and
+    whether any turn was ENFORCED (goal 26) vs shadow. Only requests that carry
+    a stickiness key appear — one-shots have no session to roll up. `requests`
+    is newest-first, so the first policy block seen per key is the LATEST pin
+    state, and `last_received_at` is the newest turn's sink-arrival stamp.
+    Sorted most-recently-active first (unstamped rows sink to the bottom)."""
+    agg: dict = {}
+    order = []
+    for rq in requests:  # newest first (by _requests_view construction)
+        sess = rq.get("session") or {}
+        key = sess.get("stickiness_key") if isinstance(sess, dict) else None
+        if not key:
+            continue
+        e = agg.get(key)
+        if e is None:
+            e = {
+                "stickiness_key": key,
+                "key_source": sess.get("key_source"),
+                "turns": 0,
+                "backends": [],
+                "pinned_backend": None,
+                "pin_hits": 0,
+                "escalated": False,
+                "enforced": False,
+                "tokens": 0,
+                "cost": 0.0,
+                "last_received_at": rq.get("received_at"),
+            }
+            agg[key] = e
+            order.append(key)
+        e["turns"] += 1
+        srv = rq.get("served_model")
+        if srv and srv not in e["backends"]:
+            e["backends"].append(srv)
+        pol = rq.get("policy")
+        if isinstance(pol, dict) and pol.get("arm") == "session":
+            # Newest-first: the FIRST session-arm block seen is the freshest
+            # pin state — later (older) blocks never overwrite it.
+            if e["pinned_backend"] is None and pol.get("pinned_backend"):
+                e["pinned_backend"] = pol["pinned_backend"]
+            if pol.get("pin_hit"):
+                e["pin_hits"] += 1
+            if pol.get("escalated"):
+                e["escalated"] = True
+            if pol.get("enforced"):
+                e["enforced"] = True
+        d = rq.get("tokens_delivered")
+        if isinstance(d, (int, float)):
+            e["tokens"] += d
+        cost = rq.get("response_cost")
+        if isinstance(cost, (int, float)):
+            e["cost"] += cost
+    rows = [agg[k] for k in order]
+    rows.sort(
+        key=lambda e: (
+            -(e["last_received_at"] or 0),
+            -e["turns"],
+            e["stickiness_key"],
+        )
+    )
+    return rows
+
+
+def _backend_rollup(records: list) -> list:
+    """Per-BACKEND traffic (goal 27): attempt-trail traffic folded per concrete
+    deployment — (backend, api_base) — with its tier, attempt/failure counts,
+    tokens, and mean completion latency. This is the closest HONEST per-
+    workbench traffic attribution today's data supports: the control-plane
+    registry keys workbenches by workbench_id but carries no api_base, so a
+    hard attempts→workbench join does not exist yet (queued as a follow-up
+    goal — heartbeat gains api_base). In the dev/e2e stacks each workbench IS
+    a distinct api_base, so this table already reads per-box. Busiest first."""
+    agg: dict = {}
+    order = []
+    for r in records:
+        if r.get("event") != "llm_call":
+            continue
+        key = (r.get("backend") or "(unknown)", r.get("api_base") or "")
+        e = agg.get(key)
+        if e is None:
+            e = {
+                "backend": r.get("backend"),
+                "api_base": r.get("api_base"),
+                "tier": r.get("tier"),
+                "attempts": 0,
+                "failures": 0,
+                "tokens": 0,
+                "_lat_sum": 0.0,
+                "_lat_n": 0,
+            }
+            agg[key] = e
+            order.append(key)
+        e["attempts"] += 1
+        if r.get("status") == "failure":
+            e["failures"] += 1
+        if e["tier"] is None and r.get("tier"):
+            e["tier"] = r.get("tier")
+        t = (r.get("tokens") or {}).get("total")
+        if isinstance(t, (int, float)):
+            e["tokens"] += t
+        lat = r.get("latency_ms")
+        if isinstance(lat, (int, float)):
+            e["_lat_sum"] += lat
+            e["_lat_n"] += 1
+    rows = []
+    for key in order:
+        e = agg[key]
+        n = e.pop("_lat_n")
+        s = e.pop("_lat_sum")
+        e["latency_ms_avg"] = round(s / n, 1) if n else None
+        rows.append(e)
+    rows.sort(key=lambda e: (-e["attempts"], e["backend"] or "", e["api_base"] or ""))
+    return rows
+
+
 def _overhead_rollup(records: list, requests: list) -> dict:
     """The at-a-glance overhead summary (goal 20): across every attributable
     request, how many tokens the clients were HANDED vs how many the backends
@@ -345,11 +586,15 @@ def _overhead_rollup(records: list, requests: list) -> dict:
         if r.get("event") == "delivered" and r.get("correlation_id") is not None
     }
     unattributed = 0
+    unattributed_cids = set()
     for r in records:
         if r.get("event") != "llm_call":
             continue
-        if r.get("correlation_id") in delivered_cids:
+        cid = r.get("correlation_id")
+        if cid in delivered_cids:
             continue
+        if cid is not None:
+            unattributed_cids.add(cid)
         t = (r.get("tokens") or {}).get("total")
         if isinstance(t, (int, float)):
             unattributed += t
@@ -361,6 +606,15 @@ def _overhead_rollup(records: list, requests: list) -> dict:
         # consumed per delivered token; None when nothing delivered (no signal).
         "overhead_ratio": round(consumed / delivered, 3) if delivered else None,
         "unattributed_attempt_tokens": unattributed,
+        # HOW MANY requests the per-request view is BLIND to (goal 27): distinct
+        # correlation ids with attempts but no delivered record — chiefly
+        # streamed traffic (no delivered event fires on the pin; docs/09
+        # caveat) plus requests that errored out entirely. Surfaced as a COUNT
+        # so the dashboard says "N requests happened that the tables below
+        # don't show" instead of lying by omission. Attempts with no
+        # correlation_id at all can't be grouped into requests and are covered
+        # by the token counter above only.
+        "unattributed_requests": len(unattributed_cids),
     }
 
 
@@ -414,11 +668,23 @@ def _policy_agreement(records: list) -> dict:
     agree = 0
     disagree = 0
     unevaluated = 0
+    # ENFORCEMENT visibility (goal 27): under ROUTER_POLICY=enforce the block
+    # carries enforced:true and "agree" stops meaning "would have" — it means
+    # "did the chosen backend actually serve, or did the availability-fallback
+    # chain fire AFTER the rewrite" (docs/12 R4). Counted separately so the
+    # page can distinguish live routing from shadow opinion at a glance.
+    enforced = {"count": 0, "agree": 0, "disagree": 0}
     for r in records:
         if r.get("event") != "delivered":
             continue
         pol = r.get("shadow_policy")
         verdict = pol.get("agree") if isinstance(pol, dict) else None
+        if isinstance(pol, dict) and pol.get("enforced"):
+            enforced["count"] += 1
+            if verdict is True:
+                enforced["agree"] += 1
+            elif verdict is False:
+                enforced["disagree"] += 1
         if verdict is True:
             agree += 1
         elif verdict is False:
@@ -434,6 +700,7 @@ def _policy_agreement(records: list) -> dict:
         # Share of evaluated requests where policy and reality matched; None
         # when nothing was evaluated (no signal, not a fake 100%).
         "agreement_rate": round(agree / evaluated, 3) if evaluated else None,
+        "enforced": enforced,
     }
 
 
@@ -554,6 +821,9 @@ _PAGE = """<!doctype html>
   .fleetstatus { text-transform:none; letter-spacing:0; font-weight:400;
     color:var(--warn); margin-left:8px; }
   .num { text-align:right; font-variant-numeric:tabular-nums; }
+  /* goal 27: two-up layout for the narrow rollup tables */
+  .cols { display:flex; gap:16px; flex-wrap:wrap; }
+  .cols > div { flex:1 1 420px; min-width:0; }
   .muted { color:var(--muted); }
   .empty { color:var(--muted); padding:18px 12px; }
   code { color:var(--fg); }
@@ -595,14 +865,71 @@ _PAGE = """<!doctype html>
     </table>
   </div>
 
-  <h2>Per key &mdash; who asked, and what it cost</h2>
+  <div class="cols">
+    <div>
+      <h2>Per model &mdash; traffic: demand vs supply <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">&middot; goal 27</span></h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr>
+            <th>model</th><th class="num">asked</th><th class="num">served</th>
+            <th class="num">via&nbsp;fallback</th><th class="num">delivered</th>
+            <th class="num">consumed</th><th class="num">cost</th>
+          </tr></thead>
+          <tbody id="modeltraffic"><tr><td class="empty" colspan="7">no traffic yet</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div>
+      <h2>Per backend &mdash; deployment traffic <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">&middot; per (backend, api_base) &mdash; the per-box view</span></h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr>
+            <th>backend</th><th>api base</th><th>tier</th><th class="num">attempts</th>
+            <th class="num">failures</th><th class="num">tokens</th><th class="num">avg&nbsp;latency</th>
+          </tr></thead>
+          <tbody id="backends"><tr><td class="empty" colspan="7">no attempts yet</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="cols">
+    <div>
+      <h2>Per key &mdash; who asked, and what it cost</h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr>
+            <th>key</th><th>user</th><th>team</th><th class="num">requests</th>
+            <th class="num">fallbacks</th><th class="num">tokens</th><th class="num">cost</th>
+          </tr></thead>
+          <tbody id="keys"><tr><td class="empty" colspan="7">no keyed traffic yet</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div>
+      <h2>Per user &mdash; across all their keys <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">&middot; goal 27</span></h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr>
+            <th>user</th><th class="num">keys</th><th class="num">requests</th>
+            <th class="num">fallbacks</th><th class="num">tokens</th><th class="num">cost</th>
+          </tr></thead>
+          <tbody id="users"><tr><td class="empty" colspan="6">no traffic yet</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <h2>Sessions &mdash; sticky keys, pins &amp; the one escalation hop
+    <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">&middot; one row per stickiness key (goals 22/25/26 made visible)</span></h2>
   <div class="tablewrap">
     <table>
       <thead><tr>
-        <th>key</th><th>user</th><th>team</th><th class="num">requests</th>
-        <th class="num">fallbacks</th><th class="num">tokens</th><th class="num">cost</th>
+        <th>session key</th><th>source</th><th class="num">turns</th><th>pinned</th>
+        <th class="num">pin&nbsp;hits</th><th>escalated</th><th>mode</th><th>backends served</th>
+        <th class="num">tokens</th><th class="num">cost</th><th class="num">last&nbsp;seen</th>
       </tr></thead>
-      <tbody id="keys"><tr><td class="empty" colspan="7">no keyed traffic yet</td></tr></tbody>
+      <tbody id="sessions"><tr><td class="empty" colspan="11">no sticky sessions yet</td></tr></tbody>
     </table>
   </div>
 
@@ -664,18 +991,35 @@ function reqTrail(r){
   const cid = r.correlation_id ? ' <span class="cid">('+esc(r.correlation_id)+')</span>' : '';
   return '<tr class="trail"><td></td><td colspan="12">why'+cid+': '+chips+'</td></tr>';
 }
-// Shadow routing policy (goal 24): would the stateless cheapest-capable arm
-// have routed here? agree/disagree as a badge, the chosen backend + the full
-// citable reason (and registry degrade mode) on hover — auditable in place.
+// Routing policy (goals 24/25/26, rendered fully since goal 27): the badge now
+// tells shadow opinion apart from LIVE routing. enforced:true means the policy
+// REWROTE the request (goal 26) — agree:false there is post-rewrite fallback
+// drift (the chain fired after the rewrite), not disagreement. Session-arm
+// blocks add pin/esc chips (goal 25). Arm, original ask, pin and the full
+// citable reason ride the hover title — auditable in place.
 function polCell(p){
   if(!p) return '<span class="muted">&mdash;</span>';
-  const why = 'policy chose '+(p.chosen||'(none)')+' \\u00b7 registry '+(p.registry||'?')
-    +' \\u00b7 '+(p.reason||'');
+  const bits = ['arm '+(p.arm||'?')];
+  if(p.requested) bits.push('asked '+p.requested);
+  bits.push('policy chose '+(p.chosen||'(none)'));
+  if(p.pinned_backend) bits.push('pin '+p.pinned_backend);
+  bits.push('registry '+(p.registry||'?'));
+  if(p.reason) bits.push(p.reason);
+  const why = bits.join(' \\u00b7 ');
+  const chips =
+    (p.pin_hit ? ' <span class="badge tier" title="served from the sticky pin">pin</span>' : '')
+    +(p.escalated ? ' <span class="badge fall" title="this session took its one upward hop'
+        +(p.escalated_from ? ' from '+esc(p.escalated_from) : '')+'">esc</span>' : '');
+  if(p.enforced){
+    if(p.agree===false)
+      return '<span class="badge fall" title="'+esc(why)+'">enforced&middot;drift</span>'+chips;
+    return '<span class="badge yes" title="'+esc(why)+'">enforced</span>'+chips;
+  }
   if(p.agree===true)
-    return '<span class="badge direct" title="'+esc(why)+'">agree</span>';
+    return '<span class="badge direct" title="'+esc(why)+'">agree</span>'+chips;
   if(p.agree===false)
-    return '<span class="badge fall" title="'+esc(why)+'">chose '+esc(p.chosen)+'</span>';
-  return '<span class="badge no" title="'+esc(why)+'">no verdict</span>';
+    return '<span class="badge fall" title="'+esc(why)+'">chose '+esc(p.chosen)+'</span>'+chips;
+  return '<span class="badge no" title="'+esc(why)+'">no verdict</span>'+chips;
 }
 // Shadow session classification (goal 22): session-turn vs one-shot, with the
 // stickiness key + its source on hover — the hybrid-granularity telemetry.
@@ -762,6 +1106,77 @@ function attRow(a){
     + '<td>'+err+'</td>'
     + '</tr>';
 }
+// goal 27: the per-dimension rollup rows.
+function modelRow(m){
+  // consumed > delivered on a model = backend burn its clients never saw.
+  const over = m.tokens_consumed > m.tokens_delivered;
+  const con = over
+    ? '<span class="badge fall">'+esc(m.tokens_consumed)+'</span>'
+    : esc(m.tokens_consumed);
+  const fb = m.fallbacks_in
+    ? '<span class="badge fall">'+esc(m.fallbacks_in)+'</span>' : '0';
+  return '<tr>'
+    + '<td><code>'+esc(m.model)+'</code></td>'
+    + '<td class="num">'+esc(m.requested)+'</td>'
+    + '<td class="num">'+esc(m.served)+'</td>'
+    + '<td class="num">'+fb+'</td>'
+    + '<td class="num">'+esc(m.tokens_delivered)+'</td>'
+    + '<td class="num">'+con+'</td>'
+    + '<td class="num">$'+Number(m.cost||0).toFixed(6)+'</td>'
+    + '</tr>';
+}
+function userRow(u){
+  const user = u.user_id==null
+    ? '<span class="muted">no user</span>' : '<code>'+esc(u.user_id)+'</code>';
+  const fb = u.fallbacks
+    ? '<span class="badge fall">'+esc(u.fallbacks)+'</span>' : '0';
+  return '<tr>'
+    + '<td>'+user+'</td>'
+    + '<td class="num">'+esc(u.keys)+'</td>'
+    + '<td class="num">'+esc(u.requests)+'</td>'
+    + '<td class="num">'+fb+'</td>'
+    + '<td class="num">'+esc(u.tokens)+'</td>'
+    + '<td class="num">$'+Number(u.cost||0).toFixed(6)+'</td>'
+    + '</tr>';
+}
+function backendRow(b){
+  const fails = b.failures
+    ? '<span class="badge fail">'+esc(b.failures)+'</span>' : '0';
+  const tier = b.tier ? '<span class="badge tier">'+esc(b.tier)+'</span>' : '&mdash;';
+  const lat = b.latency_ms_avg==null ? '&mdash;' : esc(b.latency_ms_avg)+' ms';
+  return '<tr>'
+    + '<td><code>'+esc(b.backend)+'</code></td>'
+    + '<td class="muted">'+esc(b.api_base||'')+'</td>'
+    + '<td>'+tier+'</td>'
+    + '<td class="num">'+esc(b.attempts)+'</td>'
+    + '<td class="num">'+fails+'</td>'
+    + '<td class="num">'+esc(b.tokens)+'</td>'
+    + '<td class="num">'+lat+'</td>'
+    + '</tr>';
+}
+function sessionRow(s){
+  const pinned = s.pinned_backend
+    ? '<code>'+esc(s.pinned_backend)+'</code>' : '<span class="muted">&mdash;</span>';
+  const escd = s.escalated
+    ? '<span class="badge fall">esc</span>' : '<span class="badge no">no</span>';
+  const mode = s.enforced
+    ? '<span class="badge yes">enforced</span>' : '<span class="badge no">shadow</span>';
+  const seen = s.last_received_at==null ? '&mdash;'
+    : Math.max(0, Math.round(Date.now()/1000 - s.last_received_at))+' s ago';
+  return '<tr>'
+    + '<td><code>'+esc(s.stickiness_key)+'</code></td>'
+    + '<td class="muted">'+esc(s.key_source||'&mdash;')+'</td>'
+    + '<td class="num">'+esc(s.turns)+'</td>'
+    + '<td>'+pinned+'</td>'
+    + '<td class="num">'+esc(s.pin_hits)+'</td>'
+    + '<td>'+escd+'</td>'
+    + '<td>'+mode+'</td>'
+    + '<td>'+(s.backends||[]).map(b=>'<code>'+esc(b)+'</code>').join(' ')+'</td>'
+    + '<td class="num">'+esc(s.tokens)+'</td>'
+    + '<td class="num">$'+Number(s.cost||0).toFixed(6)+'</td>'
+    + '<td class="num">'+seen+'</td>'
+    + '</tr>';
+}
 function healthBadge(inst){
   if(inst.stale) return '<span class="badge stale">stale</span>';
   return inst.healthy
@@ -826,6 +1241,21 @@ async function refresh(){
     const res = await fetch('api/records', {cache:'no-store'});
     const data = await res.json();
     const reqs = data.requests||[], atts = data.attempts||[], keys = data.keys||[];
+    // goal 27: the per-dimension rollups.
+    const models = data.models||[], users = data.users||[],
+          sessions = data.sessions||[], backends = data.backends||[];
+    document.getElementById('modeltraffic').innerHTML = models.length
+      ? models.map(modelRow).join('')
+      : '<tr><td class="empty" colspan="7">no traffic yet</td></tr>';
+    document.getElementById('users').innerHTML = users.length
+      ? users.map(userRow).join('')
+      : '<tr><td class="empty" colspan="6">no traffic yet</td></tr>';
+    document.getElementById('backends').innerHTML = backends.length
+      ? backends.map(backendRow).join('')
+      : '<tr><td class="empty" colspan="7">no attempts yet</td></tr>';
+    document.getElementById('sessions').innerHTML = sessions.length
+      ? sessions.map(sessionRow).join('')
+      : '<tr><td class="empty" colspan="11">no sticky sessions yet</td></tr>';
     document.getElementById('keys').innerHTML = keys.length
       ? keys.map(keyRow).join('')
       : '<tr><td class="empty" colspan="7">no keyed traffic yet</td></tr>';
@@ -841,7 +1271,9 @@ async function refresh(){
       : '&middot; &Sigma; delivered '+esc(ov.tokens_delivered)
         +' / consumed '+esc(ov.tokens_consumed)
         +(ov.overhead_ratio!=null ? ' (ratio '+esc(ov.overhead_ratio)+')' : '')
-        +(ov.unattributed_attempt_tokens ? ' &middot; +'+esc(ov.unattributed_attempt_tokens)+' unattributed (streamed/aborted)' : '');
+        +(ov.unattributed_requests ? ' &middot; '+esc(ov.unattributed_requests)+' req / '
+          +esc(ov.unattributed_attempt_tokens)+' tok unattributed (streamed/aborted — NOT in these tables)'
+          : (ov.unattributed_attempt_tokens ? ' &middot; +'+esc(ov.unattributed_attempt_tokens)+' unattributed (streamed/aborted)' : ''));
     // goal 21: the shadow-complexity traffic mix, at a glance.
     const cx = data.complexity_buckets || {};
     const mix = Object.keys(cx).sort().map(k=>esc(k)+' '+esc(cx[k])).join(' / ');
@@ -852,15 +1284,25 @@ async function refresh(){
     // every evaluated request (the number goal 26's enforcement flip is judged
     // against).
     const pa = data.policy_agreement;
+    // goal 27: enforced requests counted apart from shadow opinion — drift
+    // under enforcement = the fallback chain fired AFTER the rewrite.
+    const enf = (pa && pa.enforced && pa.enforced.count)
+      ? ', '+esc(pa.enforced.count)+' enforced'
+        +(pa.enforced.disagree ? ' ('+esc(pa.enforced.disagree)+' drift)' : '')
+      : '';
     const pmix = (pa && pa.evaluated)
       ? ' &middot; policy: '+esc(pa.agree)+'/'+esc(pa.evaluated)+' agree'
         +(pa.agreement_rate!=null ? ' ('+esc(pa.agreement_rate)+')' : '')
         +(pa.unevaluated ? ', '+esc(pa.unevaluated)+' unevaluated' : '')
+        + enf
       : '';
     document.getElementById('cxdist').innerHTML =
       (mix ? '&middot; mix: '+mix : '') + (cmix ? ' &middot; class: '+cmix : '') + pmix;
+    const ov2 = data.overhead||{};
     document.getElementById('status').textContent =
-      reqs.length+' requests \\u00b7 '+atts.length+' attempts \\u00b7 '+(data.count||0)+' records';
+      reqs.length+' requests \\u00b7 '+atts.length+' attempts'
+      +(ov2.unattributed_requests ? ' \\u00b7 +'+ov2.unattributed_requests+' unattributed' : '')
+      +' \\u00b7 '+(data.count||0)+' records';
   } catch(e) {
     document.getElementById('status').textContent = 'sink unreachable';
   }
@@ -930,6 +1372,13 @@ class Handler(BaseHTTPRequestHandler):
                     # goal 24: shadow-policy chosen-vs-actual agreement — see
                     # _policy_agreement.
                     "policy_agreement": _policy_agreement(recs),
+                    # goal 27: the per-dimension rollups. `models` here is
+                    # TRAFFIC per model (demand vs supply) — fleet CAPACITY
+                    # per model lives at /api/fleet.
+                    "models": _model_rollup(requests),
+                    "users": _user_rollup(requests),
+                    "sessions": _session_rollup(requests),
+                    "backends": _backend_rollup(recs),
                     "records": recs,
                 },
             )

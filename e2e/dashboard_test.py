@@ -623,6 +623,340 @@ class TestPolicyShaping(unittest.TestCase):
         pa = dashboard._policy_agreement([])
         self.assertEqual(pa["evaluated"], 0)
         self.assertIsNone(pa["agreement_rate"])
+        self.assertEqual(pa["enforced"], {"count": 0, "agree": 0, "disagree": 0})
+
+    def test_enforced_counted_apart_from_shadow(self):
+        # goal 27: enforcement visibility. Two enforced records (one clean, one
+        # post-rewrite drift) + one shadow record. The enforced split counts
+        # ONLY the enforced ones; the overall verdict counts keep counting all.
+        records = [
+            _delivered(shadow_policy=_policy_block(enforced=True)),
+            _delivered(
+                shadow_policy=_policy_block(
+                    enforced=True, actual="claude-sonnet", agree=False
+                )
+            ),
+            _delivered(shadow_policy=_policy_block()),  # shadow, agree
+        ]
+        pa = dashboard._policy_agreement(records)
+        self.assertEqual(pa["enforced"], {"count": 2, "agree": 1, "disagree": 1})
+        self.assertEqual(pa["agree"], 2)
+        self.assertEqual(pa["disagree"], 1)
+
+
+# --- goal 27: the per-dimension rollups ---------------------------------------
+# Per-model (demand vs supply), per-user (across keys), per-session (turns +
+# pin state), per-backend (deployment traffic) — the folds that turn the
+# request/attempt streams into "stats per model/user/session/workbench".
+
+
+class TestModelRollup(unittest.TestCase):
+    def _requests(self, records):
+        return dashboard._requests_view(records)
+
+    def test_demand_vs_supply_split_on_fallback(self):
+        # qwen3-coder was ASKED for twice but served once; claude-sonnet was
+        # never asked for but WON one via fallback — both sides visible.
+        records = [
+            _delivered(tokens={"total": 10}, response_cost=0.01),
+            _delivered(
+                served_model="claude-sonnet",
+                fallback=True,
+                tokens={"total": 6},
+                response_cost=0.02,
+            ),
+        ]
+        rows = dashboard._model_rollup(self._requests(records))
+        by = {r["model"]: r for r in rows}
+        q = by["qwen3-coder"]
+        self.assertEqual(q["requested"], 2)
+        self.assertEqual(q["served"], 1)
+        self.assertEqual(q["fallbacks_in"], 0)
+        self.assertEqual(q["tokens_delivered"], 10)
+        s = by["claude-sonnet"]
+        self.assertEqual(s["requested"], 0)
+        self.assertEqual(s["served"], 1)
+        self.assertEqual(s["fallbacks_in"], 1)
+        self.assertEqual(s["tokens_delivered"], 6)
+        self.assertAlmostEqual(s["cost"], 0.02)
+
+    def test_consumed_attributed_to_serving_model(self):
+        # The goal-20 join rides into the rollup: a token-burning failed
+        # attempt lands in the WINNER's consumed column.
+        cid = "obs-m1"
+        records = [
+            {
+                "event": "llm_call",
+                "status": "failure",
+                "tokens": {"total": 7},
+                "correlation_id": cid,
+            },
+            {
+                "event": "llm_call",
+                "status": "success",
+                "tokens": {"total": 16},
+                "correlation_id": cid,
+            },
+            _delivered(
+                served_model="claude-sonnet",
+                fallback=True,
+                tokens={"total": 16},
+                correlation_id=cid,
+            ),
+        ]
+        rows = dashboard._model_rollup(self._requests(records))
+        by = {r["model"]: r for r in rows}
+        self.assertEqual(by["claude-sonnet"]["tokens_consumed"], 23)
+
+    def test_sorted_busiest_served_first(self):
+        records = [
+            _delivered(requested_model="a", served_model="a"),
+            _delivered(requested_model="b", served_model="b"),
+            _delivered(requested_model="b", served_model="b"),
+        ]
+        rows = dashboard._model_rollup(self._requests(records))
+        self.assertEqual([r["model"] for r in rows], ["b", "a"])
+
+    def test_empty_is_empty(self):
+        self.assertEqual(dashboard._model_rollup([]), [])
+
+
+class TestUserRollup(unittest.TestCase):
+    def test_aggregates_across_keys(self):
+        # THE reason this rollup exists: one user, two virtual keys — the
+        # per-key table shows two rows, this shows ONE with keys=2.
+        records = [
+            _delivered(
+                user_id="u1",
+                key_alias="repo-a",
+                tokens={"total": 5},
+                response_cost=0.01,
+            ),
+            _delivered(
+                user_id="u1",
+                key_alias="repo-b",
+                tokens={"total": 3},
+                response_cost=0.02,
+                fallback=True,
+            ),
+            _delivered(user_id="u2", key_alias="repo-a", tokens={"total": 2}),
+        ]
+        rows = dashboard._user_rollup(dashboard._requests_view(records))
+        by = {r["user_id"]: r for r in rows}
+        u1 = by["u1"]
+        self.assertEqual(u1["requests"], 2)
+        self.assertEqual(u1["keys"], 2)
+        self.assertEqual(u1["fallbacks"], 1)
+        self.assertEqual(u1["tokens"], 8)
+        self.assertAlmostEqual(u1["cost"], 0.03)
+        self.assertEqual(by["u2"]["keys"], 1)
+        # Busiest first.
+        self.assertEqual(rows[0]["user_id"], "u1")
+
+    def test_null_user_collapses_into_one_row(self):
+        rows = dashboard._user_rollup(
+            dashboard._requests_view([_delivered(), _delivered()])
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["user_id"])
+        self.assertEqual(rows[0]["requests"], 2)
+        self.assertEqual(rows[0]["keys"], 0)
+
+
+def _session_delivered(key, **kw):
+    """A delivered record for one turn of a sticky session."""
+    sess = {
+        "request_class": "session-turn",
+        "stickiness_key": key,
+        "key_source": kw.pop("key_source", "tag"),
+    }
+    return _delivered(session=sess, **kw)
+
+
+class TestSessionRollup(unittest.TestCase):
+    def test_groups_turns_by_stickiness_key(self):
+        records = [
+            _session_delivered("sess-1", tokens={"total": 4}, response_cost=0.01),
+            _session_delivered("sess-1", tokens={"total": 6}, response_cost=0.01),
+            _session_delivered("sess-2", tokens={"total": 2}),
+            _delivered(),  # one-shot: no session to roll up, never a row
+        ]
+        rows = dashboard._session_rollup(dashboard._requests_view(records))
+        by = {r["stickiness_key"]: r for r in rows}
+        self.assertEqual(set(by), {"sess-1", "sess-2"})
+        s1 = by["sess-1"]
+        self.assertEqual(s1["turns"], 2)
+        self.assertEqual(s1["tokens"], 10)
+        self.assertAlmostEqual(s1["cost"], 0.02)
+        self.assertEqual(s1["key_source"], "tag")
+
+    def test_pin_state_reflects_latest_session_arm_block(self):
+        # Stream order (oldest -> newest): pin miss on qwen, then an escalated
+        # ENFORCED pin on sonnet. The rollup must show the NEWEST pin state
+        # (sonnet, escalated, enforced), with both pin hits counted.
+        records = [
+            _session_delivered(
+                "sess-1",
+                shadow_policy={
+                    "arm": "session",
+                    "stickiness_key": "sess-1",
+                    "pin_hit": False,
+                    "pinned_backend": "qwen3-coder",
+                    "escalated": False,
+                    "chosen": "qwen3-coder",
+                },
+            ),
+            _session_delivered(
+                "sess-1",
+                shadow_policy={
+                    "arm": "session",
+                    "stickiness_key": "sess-1",
+                    "pin_hit": True,
+                    "pinned_backend": "claude-sonnet",
+                    "escalated": True,
+                    "enforced": True,
+                    "chosen": "claude-sonnet",
+                },
+            ),
+        ]
+        row = dashboard._session_rollup(dashboard._requests_view(records))[0]
+        self.assertEqual(row["pinned_backend"], "claude-sonnet")
+        self.assertTrue(row["escalated"])
+        self.assertTrue(row["enforced"])
+        self.assertEqual(row["pin_hits"], 1)
+
+    def test_distinct_backends_served_are_listed(self):
+        records = [
+            _session_delivered("sess-1", served_model="qwen3-coder"),
+            _session_delivered("sess-1", served_model="claude-sonnet"),
+            _session_delivered("sess-1", served_model="claude-sonnet"),
+        ]
+        row = dashboard._session_rollup(dashboard._requests_view(records))[0]
+        self.assertEqual(sorted(row["backends"]), ["claude-sonnet", "qwen3-coder"])
+
+    def test_most_recently_active_first(self):
+        records = [
+            _session_delivered("sess-old", received_at=100.0),
+            _session_delivered("sess-new", received_at=200.0),
+        ]
+        rows = dashboard._session_rollup(dashboard._requests_view(records))
+        self.assertEqual([r["stickiness_key"] for r in rows], ["sess-new", "sess-old"])
+        self.assertEqual(rows[0]["last_received_at"], 200.0)
+
+
+class TestBackendRollup(unittest.TestCase):
+    def test_folds_attempts_per_deployment(self):
+        records = [
+            {
+                "event": "llm_call",
+                "status": "success",
+                "backend": "qwen",
+                "api_base": "http://wb-a:8000",
+                "tier": "local",
+                "tokens": {"total": 10},
+                "latency_ms": 10.0,
+            },
+            {
+                "event": "llm_call",
+                "status": "failure",
+                "backend": "qwen",
+                "api_base": "http://wb-a:8000",
+                "tier": "local",
+                "latency_ms": 30.0,
+            },
+            {
+                "event": "llm_call",
+                "status": "success",
+                "backend": "sonnet",
+                "api_base": "http://foundry:9000",
+                "tier": "foundry",
+                "tokens": {"total": 5},
+            },
+            _delivered(),  # delivered records never count as attempts
+        ]
+        rows = dashboard._backend_rollup(records)
+        self.assertEqual(len(rows), 2)
+        # Busiest first: qwen@wb-a has 2 attempts.
+        q = rows[0]
+        self.assertEqual(q["backend"], "qwen")
+        self.assertEqual(q["api_base"], "http://wb-a:8000")
+        self.assertEqual(q["tier"], "local")
+        self.assertEqual(q["attempts"], 2)
+        self.assertEqual(q["failures"], 1)
+        self.assertEqual(q["tokens"], 10)
+        self.assertEqual(q["latency_ms_avg"], 20.0)
+
+    def test_same_backend_on_two_bases_is_two_rows(self):
+        # Two workbenches serving the same model must NOT collapse — the
+        # per-box view is the point.
+        records = [
+            {"event": "llm_call", "backend": "qwen", "api_base": "http://wb-a:8000"},
+            {"event": "llm_call", "backend": "qwen", "api_base": "http://wb-b:8000"},
+        ]
+        rows = dashboard._backend_rollup(records)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            sorted(r["api_base"] for r in rows),
+            ["http://wb-a:8000", "http://wb-b:8000"],
+        )
+
+    def test_no_latency_yields_null_average(self):
+        rows = dashboard._backend_rollup([{"event": "llm_call", "backend": "x"}])
+        self.assertIsNone(rows[0]["latency_ms_avg"])
+
+
+class TestUnattributedRequests(unittest.TestCase):
+    def test_streamed_attempts_counted_as_unattributed_requests(self):
+        # Two attempts sharing one correlation_id with no delivered record are
+        # ONE unattributed request (a streamed fallback, say); a third with its
+        # own id is another. Attempts with no id at all can't be grouped and
+        # must not inflate the count.
+        records = [
+            {
+                "event": "llm_call",
+                "status": "failure",
+                "correlation_id": "s1",
+                "tokens": {"total": 2},
+            },
+            {
+                "event": "llm_call",
+                "status": "success",
+                "correlation_id": "s1",
+                "tokens": {"total": 8},
+            },
+            {"event": "llm_call", "status": "success", "correlation_id": "s2"},
+            {"event": "llm_call", "status": "success"},  # no id: tokens-only
+        ]
+        ov = dashboard._overhead_rollup(records, dashboard._requests_view(records))
+        self.assertEqual(ov["unattributed_requests"], 2)
+        self.assertEqual(ov["unattributed_attempt_tokens"], 10)
+
+    def test_delivered_requests_are_not_unattributed(self):
+        cid = "obs-ok"
+        records = [
+            {"event": "llm_call", "status": "success", "correlation_id": cid},
+            _delivered(correlation_id=cid),
+        ]
+        ov = dashboard._overhead_rollup(records, dashboard._requests_view(records))
+        self.assertEqual(ov["unattributed_requests"], 0)
+
+
+class TestReceivedAtStamp(unittest.TestCase):
+    def test_sink_stamps_arrival_time(self):
+        store = dashboard.Records()
+        store.add({"event": "delivered"})
+        rec = store.all()[0]
+        self.assertIn("received_at", rec)
+        self.assertIsInstance(rec["received_at"], float)
+
+    def test_existing_stamp_is_never_overwritten(self):
+        store = dashboard.Records()
+        store.add({"event": "delivered", "received_at": 123.0})
+        self.assertEqual(store.all()[0]["received_at"], 123.0)
+
+    def test_request_row_carries_received_at(self):
+        row = dashboard._requests_view([_delivered(received_at=42.0)])[0]
+        self.assertEqual(row["received_at"], 42.0)
 
 
 if __name__ == "__main__":
