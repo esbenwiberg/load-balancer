@@ -101,6 +101,25 @@ block's `registry` field says so ("absent"/"stale" vs "live"). Registry reads
 are TTL-cached (POLICY_REGISTRY_CACHE_S; the e2e stack sets 0 for determinism)
 with a short timeout so a hung control-plane costs bounded pre-call latency.
 
+SHADOW STICKY PINS + ESCALATION MECHANICS — the session arm (goal 25): when a
+request carries a stickiness key (goal 22's derivation: session tag >
+transcript hash), the shadow policy switches to docs/12 §2/§3/§5's session
+arm. First sight of a key PINS the stateless arm's choice in a gateway-local,
+TTL'd pin store (docs/12 §3 option (a) — the decided default for the
+single-gateway phase; lost on restart BY DESIGN, an unpinned session-turn just
+re-pins). Subsequent same-key requests carry the pin, bypassing re-evaluation:
+`shadow_policy: {arm: "session", stickiness_key, pin_hit, pinned_backend,
+escalated, chosen, ...}`. An explicit `escalate` tag on the verified carrier
+(x-litellm-tags) fires docs/12 §5's state machine IN SHADOW: the pin is
+replaced upward (local tier -> foundry tier) exactly once — the escalation
+target is the stateless arm re-run over the strictly-higher tiers, so
+governance/gate/health still apply — no downward edge ever, and any further
+signal is a recorded no-op. The escalate tag is a STUB trigger: it proves the
+mechanics; the real trigger decision stays open (GOALS.md § Needs-a-human).
+Same shadow discipline throughout: zero routing influence, and the pin store
+is the SHADOW router's own state — it records what the policy WOULD have
+pinned, not what actually served. See _PinStore/_policy_session + docs/09.
+
 The block crosses hook boundaries via the goal-16 correlation id in a bounded
 module-level map (_POLICY_BLOCKS) — the id is already proven to reach every
 surface (delivered via data, attempts via slo.trace_id), unlike the metadata
@@ -359,6 +378,20 @@ def _complexity(messages, tools):
 # we additionally read ONLY this one key and never emit the header map.
 _SESSION_HEADER = "x-litellm-tags"
 _SESSION_TAG_PREFIX = "session:"
+# The STUB escalation trigger (goal 25): a bare `escalate` entry in the same
+# header fires docs/12 §5's state machine in shadow. Client-signaled on
+# purpose — it proves the mechanics without pre-deciding the real trigger
+# (still § Needs-a-human, decided against accumulated telemetry).
+_ESCALATE_TAG = "escalate"
+
+
+def _tags(headers):
+    """The x-litellm-tags header parsed to a list of non-empty entries.
+    Empty on anything unreadable — never a crash."""
+    raw = headers.get(_SESSION_HEADER) if isinstance(headers, dict) else None
+    if not isinstance(raw, str):
+        return []
+    return [t.strip() for t in raw.split(",") if t.strip()]
 
 
 def _session(headers, messages):
@@ -406,16 +439,11 @@ def _session(headers, messages):
     request_class = "session-turn" if has_prior else "one-shot"
     key = None
     source = None
-    raw = headers.get(_SESSION_HEADER) if isinstance(headers, dict) else None
-    if isinstance(raw, str):
-        for tag in raw.split(","):
-            tag = tag.strip()
-            if tag.startswith(_SESSION_TAG_PREFIX) and len(tag) > len(
-                _SESSION_TAG_PREFIX
-            ):
-                key = tag[len(_SESSION_TAG_PREFIX) :]
-                source = "tag"
-                break
+    for tag in _tags(headers):
+        if tag.startswith(_SESSION_TAG_PREFIX) and len(tag) > len(_SESSION_TAG_PREFIX):
+            key = tag[len(_SESSION_TAG_PREFIX) :]
+            source = "tag"
+            break
     if key is None and request_class == "session-turn":
         for m in messages:
             if isinstance(m, dict) and m.get("role") == "user":
@@ -602,6 +630,235 @@ def _config_candidates() -> list:
     return list(out.values())
 
 
+# --- SHADOW sticky pins + escalation mechanics — the session arm (goal 25) ---
+# docs/12 §2 (decision table), §3 (sticky sessions) and §5 (escalation, one hop
+# upward only) as code, still in shadow. _policy_session is sync + clock-
+# injected so the offline fast tier can pin the whole state machine (TTL
+# expiry, restart, exactly-once) without docker or a real clock.
+
+# Pin TTL — inactivity-based (docs/12 §3): a pin a session keeps touching
+# never expires; an abandoned one ages out and the next turn re-pins. The
+# spec's suggested default: 24h, config knob.
+_PIN_TTL_S = float(os.environ.get("POLICY_PIN_TTL_S", "86400"))
+_PIN_CAP = 4096
+
+
+class _PinStore:
+    """Gateway-local shadow pin store — docs/12 §3 option (a), the decided
+    default for the single-gateway build phase (Postgres promotion is a later,
+    flagged decision — docs/12 §8.3). Keyed by goal-22 stickiness_key; a pin
+    is {backend, tier, escalated, pinned_at, last_seen}.
+
+    Restart story, BY DESIGN: this is process memory, so a restart loses every
+    pin. That is safe — an unpinned session-turn just re-pins on its next
+    request (docs/12 §3: "the cache-loss cost is the same as a restart
+    today"), and the exactly-once escalation guarantee is per-PIN, not
+    per-session-eternal: a re-pinned session gets its hop back, which is the
+    honest reading of losing the state. Bounded LRU-ish (cap + move_to_end on
+    write/touch) so a tag-spraying client can't grow gateway memory without
+    bound. Lock because the sync log_* variants may run off-loop."""
+
+    def __init__(self, ttl_s=None, cap=_PIN_CAP):
+        self.ttl_s = _PIN_TTL_S if ttl_s is None else float(ttl_s)
+        self.cap = cap
+        self._pins: OrderedDict = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key, now):
+        """The live pin for `key`, or None. An expired pin is deleted and
+        reported absent — expiry is not an error, the caller re-pins."""
+        with self._lock:
+            pin = self._pins.get(key)
+            if pin is None:
+                return None
+            if now - pin["last_seen"] > self.ttl_s:
+                del self._pins[key]
+                return None
+            return dict(pin)
+
+    def put(self, key, backend, tier, escalated, now):
+        with self._lock:
+            prior = self._pins.get(key)
+            self._pins[key] = {
+                "backend": backend,
+                "tier": tier,
+                "escalated": bool(escalated),
+                # An escalation REPLACES the pin but the session started when
+                # it was first pinned — keep the original birth time.
+                "pinned_at": prior["pinned_at"] if prior else now,
+                "last_seen": now,
+            }
+            self._pins.move_to_end(key)
+            while len(self._pins) > self.cap:
+                self._pins.popitem(last=False)
+
+    def touch(self, key, now):
+        """Refresh the inactivity TTL on a pin hit."""
+        with self._lock:
+            pin = self._pins.get(key)
+            if pin is not None:
+                pin["last_seen"] = now
+                self._pins.move_to_end(key)
+
+
+_PINS = _PinStore()
+
+
+def _tier_of(candidates, model):
+    for c in candidates:
+        if isinstance(c, dict) and c.get("model") == model:
+            return c.get("tier")
+    return None
+
+
+def _policy_session(
+    pins,
+    key,
+    escalate,
+    candidates,
+    key_models,
+    bucket,
+    registry_models,
+    registry_state,
+    now,
+):
+    """The session arm (docs/12 §2 rows 2–5 + §5's state machine), in shadow.
+
+    * pin MISS — route as if new: the stateless arm (docs/12 §4, all four
+      filters) picks, and its choice becomes the key's pin. This covers both
+      turn 1 of a declared session and an unpinned session-turn (gateway
+      restarted / TTL-expired / heuristic key).
+    * pin HIT — the pinned backend, always: stickiness bypasses re-evaluation
+      by design (no registry read, `registry: null` on the block — no health
+      signal was consulted; docs/12 §6's down-backend interplay is the
+      availability-fallback layer's job, not the pin's).
+    * ESCALATE signal (the stub trigger) — upward only, exactly once:
+      the target is the stateless arm re-run over the KNOWN tiers strictly
+      above the pin's (governance/agent-gate/health still apply), the pin is
+      REPLACED with it and marked escalated, and the request that fired the
+      flip carries `escalated_from`. No downward edge exists. A second signal
+      is a recorded no-op ("already escalated"). A signal that finds no
+      capable higher-tier candidate is ALSO a recorded no-op that does NOT
+      burn the hop — nothing moved, and a blip must not spend the session's
+      one escalation (the §6 blip-must-not-burn-the-hop spirit).
+
+    Pure over (pins-state, args): same store state + same inputs ⇒ same block
+    and same store mutation. `now` is injected so offline tests drive the TTL
+    with a fake clock. Returns the shadow block; actual/agree are filled
+    post-response like the stateless arm's."""
+    steps = []
+    used_registry = None
+    escalated_from = None
+    pin = pins.get(key, now)
+    pin_hit = pin is not None
+    if pin is None:
+        base = _policy_stateless(
+            candidates, key_models, bucket, registry_models, registry_state
+        )
+        used_registry = registry_state
+        if base["chosen"] is None:
+            steps.append("pin miss: no capable candidate to pin [%s]" % base["reason"])
+        else:
+            tier = _tier_of(candidates, base["chosen"])
+            pins.put(key, base["chosen"], tier, False, now)
+            pin = {"backend": base["chosen"], "tier": tier, "escalated": False}
+            steps.append(
+                "pin miss: pinned %s (tier=%s) via stateless arm [%s]"
+                % (base["chosen"], tier, base["reason"])
+            )
+    else:
+        pins.touch(key, now)
+        steps.append(
+            "pin hit: %s (tier=%s, escalated=%s)"
+            % (pin["backend"], pin["tier"], pin["escalated"])
+        )
+    if escalate:
+        if pin is None:
+            steps.append("escalate signal: no-op (nothing pinned to escalate)")
+        elif pin["escalated"]:
+            steps.append(
+                "escalate signal: no-op (already escalated — one hop per session, ever)"
+            )
+        else:
+            floor = _TIER_RANK.get(pin["tier"])
+            if floor is None:
+                # An undeclared tier has no place in the upward order — there
+                # is nothing provably "higher" to move to.
+                steps.append(
+                    "escalate signal: no-op (pinned tier undeclared — no upward order)"
+                )
+            else:
+                upward = [
+                    c
+                    for c in candidates
+                    if isinstance(c, dict)
+                    and _TIER_RANK.get(c.get("tier")) is not None
+                    and _TIER_RANK[c["tier"]] > floor
+                ]
+                base = _policy_stateless(
+                    upward, key_models, bucket, registry_models, registry_state
+                )
+                used_registry = registry_state
+                if base["chosen"]:
+                    escalated_from = pin["backend"]
+                    tier = _tier_of(candidates, base["chosen"])
+                    pins.put(key, base["chosen"], tier, True, now)
+                    pin = {
+                        "backend": base["chosen"],
+                        "tier": tier,
+                        "escalated": True,
+                    }
+                    steps.append(
+                        "escalate signal: pin %s -> %s (upward, exactly once)"
+                        " [%s]" % (escalated_from, base["chosen"], base["reason"])
+                    )
+                else:
+                    steps.append(
+                        "escalate signal: no-op, hop NOT burned (no capable"
+                        " higher-tier candidate: %s)" % base["reason"]
+                    )
+    block = {
+        "arm": "session",
+        # The pin key on the block itself so a record is auditable alone
+        # (the session tag block carries it too — deliberate redundancy).
+        "stickiness_key": key,
+        "pin_hit": pin_hit,
+        "pinned_backend": pin["backend"] if pin else None,
+        "escalated": bool(pin["escalated"]) if pin else False,
+        "chosen": pin["backend"] if pin else None,
+        "reason": "; ".join(steps),
+        # null on a pure pin hit: no candidate evaluation ran, so no health
+        # signal was sourced — stamping "live" would be a lie.
+        "registry": used_registry,
+        "actual": None,
+        "agree": None,
+    }
+    if escalated_from is not None:
+        block["escalated_from"] = escalated_from
+    return block
+
+
+def _request_headers(data):
+    """The inbound header map at PRE-CALL time. LiteLLM stamps it into the
+    request metadata before pre-call hooks run, but the metadata key varies
+    across the three inbound protocols on this pin ("metadata" for
+    chat/completions, "litellm_metadata" elsewhere) — check both, then fall
+    back to the raw proxy_server_request map (stamped at the same point; may
+    still carry auth headers, which is fine because callers read ONLY the
+    tags key and never emit the map). None when absent: the request then
+    simply has no tag-derived session signal."""
+    if not isinstance(data, dict):
+        return None
+    for mk in ("metadata", "litellm_metadata"):
+        md = data.get(mk)
+        if isinstance(md, dict) and isinstance(md.get("headers"), dict):
+            return md["headers"]
+    psr = data.get("proxy_server_request")
+    if isinstance(psr, dict) and isinstance(psr.get("headers"), dict):
+        return psr["headers"]
+    return None
+
+
 # Control-plane registry access for step 3 — TTL-cached so the pre-call cost is
 # one bounded HTTP read per cache window, not per request. The e2e stack sets
 # POLICY_REGISTRY_CACHE_S=0 so every request sees the test's freshest
@@ -780,10 +1037,13 @@ class RoutingRecorder(CustomLogger):
                 data[_CORRELATION_KEY] = "obs-" + uuid.uuid4().hex
         except Exception:  # pragma: no cover - defensive
             pass
-        # SHADOW routing policy (goal 24): compute, PRE-CALL, what the stateless
-        # cheapest-capable arm would choose — then do NOTHING with it except
-        # remember it for the records (keyed by the correlation id above, which
-        # every record of this request will carry). data["model"] is never
+        # SHADOW routing policy (goals 24+25): compute, PRE-CALL, what the
+        # hybrid policy would choose — then do NOTHING with it except remember
+        # it for the records (keyed by the correlation id above, which every
+        # record of this request will carry). Arm dispatch per docs/12 §2: a
+        # stickiness key (goal 22's derivation, read pre-call) selects the
+        # session arm — pin store + stub-trigger escalation; keyless requests
+        # take the stateless arm (goal 24, unchanged). data["model"] is never
         # touched, the stream is never buffered, and any error degrades to "no
         # block" — the request path is sacred.
         try:
@@ -791,14 +1051,47 @@ class RoutingRecorder(CustomLogger):
                 candidates = _config_candidates()
                 if candidates:
                     cx = _complexity(data.get("messages"), data.get("tools"))
-                    registry_models, registry_state = await _registry_snapshot()
-                    block = _policy_stateless(
-                        candidates,
-                        getattr(user_api_key_dict, "models", None),
-                        (cx or {}).get("bucket"),
-                        registry_models,
-                        registry_state,
-                    )
+                    bucket = (cx or {}).get("bucket")
+                    key_models = getattr(user_api_key_dict, "models", None)
+                    headers = _request_headers(data)
+                    sess = _session(headers, data.get("messages"))
+                    key = (sess or {}).get("stickiness_key")
+                    if key:
+                        escalate = _ESCALATE_TAG in _tags(headers)
+                        now = time.monotonic()
+                        # Registry read only when the session arm will actually
+                        # evaluate candidates (pin miss, or a live escalation):
+                        # a pure pin hit consults no health signal, so it must
+                        # not pay for one. The double get() is benign — the
+                        # peek and _policy_session see the same `now`, and a
+                        # same-key race between them just turns one miss into
+                        # a hit (both would pin the same choice anyway).
+                        pin = _PINS.get(key, now)
+                        needs_eval = pin is None or (escalate and not pin["escalated"])
+                        if needs_eval:
+                            registry_models, registry_state = await _registry_snapshot()
+                        else:
+                            registry_models, registry_state = None, None
+                        block = _policy_session(
+                            _PINS,
+                            key,
+                            escalate,
+                            candidates,
+                            key_models,
+                            bucket,
+                            registry_models,
+                            registry_state,
+                            now,
+                        )
+                    else:
+                        registry_models, registry_state = await _registry_snapshot()
+                        block = _policy_stateless(
+                            candidates,
+                            key_models,
+                            bucket,
+                            registry_models,
+                            registry_state,
+                        )
                     _policy_remember(data[_CORRELATION_KEY], block)
         except Exception:  # pragma: no cover - defensive
             pass

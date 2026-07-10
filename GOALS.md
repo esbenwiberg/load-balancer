@@ -66,12 +66,15 @@ gate ≥ 2027-01 + documented affinity ([docs/03](docs/03-open-questions-and-ris
 engine decision block, [docs/12 §7](docs/12-hybrid-router-spec.md)). That
 unblocked the **policy-layer build arc: goals 24 → 25 → 26** (shadow stateless
 policy → shadow pins + escalation mechanics → enforcement flip behind a flag),
-all autonomy-friendly. **Goal 24 is DONE** — the stateless arm runs in shadow
-(docs/09 "Shadow routing policy"), its chosen-vs-actual agreement is on the
-dashboard, and it is the first live consumer of the control-plane registry.
-Next up: **goal 25**. The **escalation trigger** stays § Needs-a-human
-(telemetry-gated); goal 25's stub client-signaled trigger builds the mechanics
-without pre-deciding it. Spark-infra-shaped work stays parked.
+all autonomy-friendly. **Goals 24 and 25 are DONE** — the stateless arm runs
+in shadow (docs/09 "Shadow routing policy"), its chosen-vs-actual agreement is
+on the dashboard, and it is the first live consumer of the control-plane
+registry; the session arm now runs beside it (docs/09 "Shadow sticky pins"):
+gateway-memory pins on goal 22's stickiness key plus the upward-only,
+exactly-once escalation state machine, fired by a STUB client-signaled
+`escalate` tag. Next up: **goal 26**, the enforcement flip. The **escalation
+trigger** stays § Needs-a-human (telemetry-gated) — the stub proved the
+mechanics without pre-deciding it. Spark-infra-shaped work stays parked.
 
 Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 [`docs/06`](docs/06-recommendation.md) (decision), [`docs/03`](docs/03-open-questions-and-risks.md) (risks).
@@ -81,23 +84,8 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 ## § Autonomy-friendly (safe to run unattended)
 
 _The policy-layer build arc (engine decided 2026-07-09: LiteLLM custom policy
-layer). Order matters: 24 → 25 → 26 — each consumes the previous. 24 is done;
-25 is next._
-
-### 25. Shadow sticky pins + escalation mechanics (stub trigger) — risk: low
-**Why:** the session arm ([docs/12 §2/§3/§5](docs/12-hybrid-router-spec.md))
-needs the pin store and the upward-only state machine. Build both in shadow on
-goal 22's stickiness_key. Pin store = docs/12 §3 option (a), gateway-local
-memory with a TTL knob — the spec's decided default for the single-gateway
-build phase (Postgres promotion is a later, flagged decision). The escalation
-*trigger* decision stays open (§ Needs-a-human) — so use the spec's
-manual/client-signaled option as a STUB: an explicit escalate tag on the
-request fires the mechanics. That proves pin replacement, upward-only, and
-exactly-once without pre-empting the real trigger.
-**Completion condition:**
-```
-prerequisite goal 24 merged; the shadow policy gains the session arm: a gateway-memory pin store keyed by goal-22 stickiness_key with a config-knob TTL (default 24h) — first sight of a key records the shadow pin, subsequent same-key requests carry {arm: "session", pin_hit, pinned_backend, escalated} on their policy block; an explicit escalate signal via the verified tag carrier (x-litellm-tags) fires docs/12 §5's state machine in shadow: the pin is replaced upward (local tier → foundry tier) exactly once, no downward edge, a second signal is a recorded no-op; all still zero routing influence; e2e proves (a) two requests with the same session tag show the same pinned_backend, (b) different tags get independent pins, (c) an escalate-tagged request flips the shadow pin upward once and marks escalated, (d) a further escalate signal does not move it again; TTL expiry and the restart-loses-pins-safely story are covered by offline fast-tier tests with an injected clock; docs/09 and docs/12 updated; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR
-```
+layer). Order matters: 24 → 25 → 26 — each consumes the previous. 24 and 25
+are done; 26 is next._
 
 ### 26. Enforcement flip — policy drives routing behind a flag — risk: medium
 **Why:** with 24+25 shadow-proven, flip the switch — but reversibly: a

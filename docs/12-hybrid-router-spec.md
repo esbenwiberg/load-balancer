@@ -62,14 +62,22 @@ Hard constraints (carried from the Fugu research, non-negotiable):
 
 ## 3. Sticky sessions
 
+> **Status: BUILT in shadow (goal 25).** `obs_callback._PinStore` +
+> `_policy_session` implement this section on goal 22's stickiness key —
+> gateway-local pins with an inactivity-TTL knob (`POLICY_PIN_TTL_S`, default
+> 24h), zero routing influence. TTL + restart are proven offline with an
+> injected clock. See [docs/09 "Shadow sticky pins"](09-observability.md).
+> Enforcement is goal 26.
+
 - **Pin at first sight of a stickiness key**: the backend chosen for that
   request becomes the session's backend. All subsequent requests with the same
   key route there, bypassing load-based choice (but not health — §6).
 - **Key derivation** is goal 22's, verbatim: explicit tag wins (trusted from
   turn 1), transcript-hash for untagged session-turns (documented collision
   caveat), null otherwise.
-- **Where the pin lives** — ⛔ **Needs-a-human** at implementation time, spec'd
-  as requirement R3 below. Candidates:
+- **Where the pin lives** — **✅ decided for the build phase (goal 25,
+  reversible):** option (a), per the recommendation below. Promotion to (c)
+  at replica time stays open (§8.3). Spec'd as requirement R3. Candidates:
   - *(a) gateway-local memory* — trivial, lost on restart (acceptable: an
     unpinned session-turn just re-pins; the cache-loss cost is the same as a
     restart today), broken with >1 gateway replica;
@@ -124,6 +132,12 @@ when accumulated telemetry shows the deterministic tree's misclassification
 cost exceeds the taster's TTFT+infra tax. Measured, not argued.
 
 ## 5. Escalation — one hop, upward only
+
+> **Status: mechanics BUILT in shadow (goal 25).** The state machine below —
+> pin replaced upward, exactly once, no downward edge, no-ops recorded — runs
+> in shadow, fired by the manual/client-signaled option as a **STUB**: an
+> explicit `escalate` entry on `x-litellm-tags`. The trigger *decision* below
+> remains open — the stub proves the mechanics without pre-deciding it.
 
 - **Trigger**: ⛔ **Needs-a-human** (GOALS.md § Needs-a-human bullet). The spec
   reserves the *mechanics* regardless of trigger choice:
