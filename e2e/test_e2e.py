@@ -3188,9 +3188,11 @@ def test_enforce_governance_is_the_sole_guard():
 # stream -> success event -> delivered record -> dashboard requests view.
 
 
-def _drain_stream(payload, key=None, tags=None):
+def _drain_chat_stream(payload, key=None, tags=None):
     """POST a STREAMED chat request and consume it fully — LiteLLM only fires
-    the streamed success event once the whole stream is drained."""
+    the streamed success event once the whole stream is drained. (Distinct
+    from _drain_stream above, the goal-6 raw-SSE inspector with a different
+    signature.)"""
     headers = {"Authorization": "Bearer " + (key or KEY)}
     if tags:
         headers["x-litellm-tags"] = tags
@@ -3227,7 +3229,7 @@ def test_streamed_request_is_first_class_in_requests_view():
         {"models": ["qwen3-coder"], "key_alias": key_alias, "user_id": user_id},
     )
     skey = _unique("g29-direct")
-    _drain_stream(
+    _drain_chat_stream(
         {
             "model": "qwen3-coder",
             "stream": True,
@@ -3270,7 +3272,7 @@ def test_streamed_fallback_is_first_class_in_requests_view():
     elsewhere; here the chain is REAL litellm availability fallback.)"""
     _inject({"model": "qwen3-coder", "status": 503})  # cleared by the fixture
     skey = _unique("g29-fb")
-    _drain_stream(
+    _drain_chat_stream(
         {
             "model": "qwen3-coder",
             "stream": True,
