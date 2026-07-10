@@ -91,11 +91,23 @@ are done; 26 is next._
 **Why:** with 24+25 shadow-proven, flip the switch — but reversibly: a
 `ROUTER_POLICY` knob defaulting to `shadow` so every existing profile, test,
 and manual stack is byte-for-byte unaffected; `enforce` makes the owned hook
-rewrite the requested model to the policy's choice (R1). The single riskiest
-unknown is R4 — does LiteLLM's availability-fallback chain compose with a
-hook-rewritten model? — so the condition pins it explicitly. Enforcement
+rewrite the requested model to the policy's choice (R1). Enforcement
 changes served_model semantics, which existing tests assert on; enforce mode
 therefore runs in dedicated coverage while the default suite stays shadow.
+**Pre-build research DONE (2026-07-10, probed on the pin — docs/12 §7
+"Goal-26 pre-build research"):** R1/R4/R9 all VERIFIED live (rewrite feeds
+routing on all three surfaces; a 503 on the rewrite target follows the
+REWRITTEN group's fallback chain to a clean 200; streams stay intact with
+proper terminators). Two constraints the build must honor: (1) LiteLLM's
+key allowlist is auth-time-only — NO post-rewrite backstop, so the policy's
+governance filter is the sole guard and needs its own enforce-mode test;
+(2) after the rewrite nothing downstream can reconstruct the original ask
+(the pipeline sees only the new model; the client's response.model is
+restored to the original on the direct path, shows the winner on fallback)
+— the hook must stash requested-vs-chosen-vs-served BEFORE rewriting. Plus
+the PR #45 lesson: any cross-request state must be worker-shared
+(--num_workers 2 everywhere); enforce keeps state in the SQLite pin store
+only.
 **Completion condition:**
 ```
 prerequisite goals 24+25 merged; a ROUTER_POLICY knob (values shadow|enforce, default shadow — the full existing e2e suite passes unchanged under the default); under enforce the owned pre-call hook rewrites the requested model to the policy decision for both arms including the stub escalation, streaming untouched on all three surfaces (chat/messages/responses); R4 composition proven: with enforce on, a forced 503 on the policy-chosen backend still follows the fallback chain to a clean response AND the shadow pin does not move (docs/12 §6 blip-must-not-burn-the-hop); records under enforce carry enforced:true plus requested vs chosen vs served; dedicated e2e enforce-mode tests prove (a) a one-shot addressed to an expensive alias is actually SERVED by the cheapest capable backend with the decision cited on its record, (b) same-session-tag requests are served by the pinned backend, (c) the fallback case above; docs/09 + docs/12 + e2e/README document the knob and the enforce coverage; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR
