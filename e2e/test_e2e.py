@@ -1243,10 +1243,14 @@ def test_dashboard_data_endpoint_shows_direct_request():
     assert r.status_code == 200, r.text
 
     def _has_request(data):
+        # The delivered record and its llm_call attempt arrive via SEPARATE
+        # webhooks — wait for BOTH the request row and the attempt-fed
+        # backends rollup (goal 27), so the rollup asserts below never race
+        # the second webhook.
         return any(
             rq.get("requested_model") == "claude-sonnet"
             for rq in data.get("requests", [])
-        )
+        ) and any(b.get("attempts", 0) >= 1 for b in data.get("backends", []))
 
     data = _poll_dash(_has_request)
     reqs = [
