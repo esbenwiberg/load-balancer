@@ -843,6 +843,53 @@ class TestSessionRollup(unittest.TestCase):
         self.assertEqual([r["stickiness_key"] for r in rows], ["sess-new", "sess-old"])
         self.assertEqual(rows[0]["last_received_at"], 200.0)
 
+    def test_title_material_identity_and_span(self):
+        # Goal 30: the metadata-only title material. Stream order oldest->newest;
+        # identity (key_alias/user_id) must come from the NEWEST turn,
+        # first_received_at from the OLDEST, and the complexity mix counts every
+        # turn (untagged -> unclassified, same honesty convention as goal 21).
+        records = [
+            _session_delivered(
+                "sess-1",
+                received_at=100.0,
+                key_alias="repo-old",
+                user_id="u-old",
+                complexity={"bucket": "toolful"},
+            ),
+            _session_delivered(
+                "sess-1",
+                received_at=200.0,
+                key_alias="repo-new",
+                user_id="u-new",
+                complexity={"bucket": "agentic"},
+            ),
+            _session_delivered("sess-1", received_at=300.0),  # untagged complexity
+        ]
+        row = dashboard._session_rollup(dashboard._requests_view(records))[0]
+        # requests view is newest-first, so the newest turn (300.0) has no
+        # key_alias/user_id -> identity should fall to... no: identity comes
+        # from the newest turn, whatever it carries. Here the newest carries
+        # None (the default _delivered has no identity), so assert on the span
+        # fields and the mix; identity precedence is pinned separately below.
+        self.assertEqual(row["first_received_at"], 100.0)
+        self.assertEqual(row["last_received_at"], 300.0)
+        self.assertEqual(
+            row["complexity_mix"], {"toolful": 1, "agentic": 1, "unclassified": 1}
+        )
+
+    def test_identity_comes_from_newest_turn(self):
+        records = [
+            _session_delivered(
+                "sess-1", received_at=100.0, key_alias="repo-old", user_id="u-old"
+            ),
+            _session_delivered(
+                "sess-1", received_at=200.0, key_alias="repo-new", user_id="u-new"
+            ),
+        ]
+        row = dashboard._session_rollup(dashboard._requests_view(records))[0]
+        self.assertEqual(row["key_alias"], "repo-new")
+        self.assertEqual(row["user_id"], "u-new")
+
 
 class TestBackendRollup(unittest.TestCase):
     def test_folds_attempts_per_deployment(self):

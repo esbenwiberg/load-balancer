@@ -468,10 +468,26 @@ def _session_rollup(requests: list) -> list:
                 "tokens": 0,
                 "cost": 0.0,
                 "last_received_at": rq.get("received_at"),
+                # Goal 30: identity + title material. key_alias/user_id come
+                # from the NEWEST turn (set once, here); first_received_at is
+                # overwritten every iteration so it ends on the OLDEST turn;
+                # complexity_mix counts buckets across the session's turns.
+                # Together these derive the METADATA-ONLY session title —
+                # records carry no prompt content by design (docs/09).
+                "key_alias": rq.get("key_alias"),
+                "user_id": rq.get("user_id"),
+                "first_received_at": rq.get("received_at"),
+                "complexity_mix": {},
             }
             agg[key] = e
             order.append(key)
         e["turns"] += 1
+        # Newest-first stream: the last write per key is the oldest turn.
+        e["first_received_at"] = rq.get("received_at")
+        cx = rq.get("complexity")
+        cx_bucket = cx.get("bucket") if isinstance(cx, dict) else None
+        cx_label = cx_bucket if cx_bucket else "unclassified"
+        e["complexity_mix"][cx_label] = e["complexity_mix"].get(cx_label, 0) + 1
         srv = rq.get("served_model")
         if srv and srv not in e["backends"]:
             e["backends"].append(srv)
@@ -776,11 +792,12 @@ def _fetch_fleet() -> dict:
 # Inlined HTML/CSS/JS: served from a container with no outbound network, so no
 # external assets. The page polls /api/records and re-renders; it never writes.
 
-_PAGE = """<!doctype html>
+_PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%E2%87%86%3C/text%3E%3C/svg%3E">
 <title>Router dashboard — where did my prompt go?</title>
 <style>
   :root {
@@ -790,14 +807,27 @@ _PAGE = """<!doctype html>
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg);
     font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
-  header { padding:16px 20px; border-bottom:1px solid var(--line);
-    display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  header { padding:12px 20px; border-bottom:1px solid var(--line);
+    display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+    position:sticky; top:0; background:var(--bg); z-index:5; }
   h1 { font-size:16px; margin:0; font-weight:600; }
   .sub { color:var(--muted); font-size:12px; }
   .status { margin-left:auto; color:var(--muted); font-size:12px; }
+  /* goal 30: hash-route navigation */
+  nav.routes { display:flex; gap:4px; flex-wrap:wrap; }
+  nav.routes a { color:var(--muted); text-decoration:none; font-size:13px;
+    padding:3px 10px; border-radius:999px; border:1px solid transparent; }
+  nav.routes a:hover { color:var(--fg); }
+  nav.routes a.active { color:var(--fg); background:var(--panel);
+    border-color:var(--line); }
   .wrap { padding:20px; max-width:1200px; }
+  section[data-view] { display:none; }
+  section[data-view].on { display:block; }
   h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em;
     color:var(--muted); margin:26px 0 10px; }
+  h2:first-child { margin-top:0; }
+  .h2note { text-transform:none; letter-spacing:0; font-weight:400;
+    color:var(--muted); }
   .tablewrap { overflow-x:auto; border:1px solid var(--line); border-radius:8px;
     background:var(--panel); }
   table { border-collapse:collapse; width:100%; font-size:13px; }
@@ -821,16 +851,33 @@ _PAGE = """<!doctype html>
   .fleetstatus { text-transform:none; letter-spacing:0; font-weight:400;
     color:var(--warn); margin-left:8px; }
   .num { text-align:right; font-variant-numeric:tabular-nums; }
-  /* goal 27: two-up layout for the narrow rollup tables */
-  .cols { display:flex; gap:16px; flex-wrap:wrap; }
-  .cols > div { flex:1 1 420px; min-width:0; }
   .muted { color:var(--muted); }
   .empty { color:var(--muted); padding:18px 12px; }
   code { color:var(--fg); }
+  a.ent { color:var(--accent); text-decoration:none; }
+  a.ent:hover { text-decoration:underline; }
+  a.ent code { color:var(--accent); }
+  /* goal 30: identifier truncation — one hostile value must never blow up a
+     table; the full value lives on the detail view (and title=). */
+  .trunc { display:inline-block; max-width:240px; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; vertical-align:bottom; }
+  .copy { cursor:pointer; border-bottom:1px dashed var(--line); }
+  .copy.copied { border-bottom-color:var(--ok); }
+  .strips { color:var(--muted); font-size:12px; margin:0 0 14px;
+    line-height:1.8; }
+  .crumb { font-size:12px; margin-bottom:12px; }
+  .crumb a { color:var(--accent); text-decoration:none; }
+  .detailmeta { margin:0 0 14px; line-height:2; }
+  .cols { display:flex; gap:16px; flex-wrap:wrap; }
+  .cols > div { flex:1 1 420px; min-width:0; }
   /* trace correlation (goal 16): the attempt trail nested UNDER its request */
   tr.trail td { border-bottom:1px solid var(--line); padding:4px 12px 8px;
     white-space:normal; color:var(--muted); font-size:12px; }
   tr.trail .cid { color:var(--muted); }
+  /* goal 30: the visible "why" — hover-only tooltips carry nothing exclusive
+     anymore on detail views */
+  tr.why td { border-bottom:1px solid var(--line); padding:4px 12px 10px;
+    white-space:normal; color:var(--muted); font-size:12px; }
   .attempt { display:inline-block; padding:1px 6px; margin:2px 2px;
     border:1px solid var(--line); border-radius:6px; }
   .attempt.failed { border-color:var(--warn); }
@@ -840,10 +887,19 @@ _PAGE = """<!doctype html>
 <body>
 <header>
   <h1>Router dashboard</h1>
-  <span class="sub">where did my prompt go? &amp; what's the fleet doing? &middot; goals 12 + 13</span>
+  <nav class="routes" id="nav">
+    <a href="#/overview" data-route="overview">Overview</a>
+    <a href="#/traffic" data-route="traffic">Traffic</a>
+    <a href="#/identity" data-route="identity">Identity</a>
+    <a href="#/sessions" data-route="sessions">Sessions</a>
+    <a href="#/requests" data-route="requests">Requests</a>
+  </nav>
   <span class="status" id="status">loading&hellip;</span>
 </header>
 <div class="wrap">
+
+<section data-view="overview">
+  <div class="strips" id="ovstrips"></div>
   <h2>Fleet &mdash; workbenches subscribed, models carried, health &amp; load
     <span class="fleetstatus" id="fleetstatus"></span></h2>
   <div class="tablewrap">
@@ -864,10 +920,12 @@ _PAGE = """<!doctype html>
       <tbody id="fleetinstances"><tr><td class="empty" colspan="6">no workbenches subscribed</td></tr></tbody>
     </table>
   </div>
+</section>
 
+<section data-view="traffic">
   <div class="cols">
     <div>
-      <h2>Per model &mdash; traffic: demand vs supply <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">&middot; goal 27</span></h2>
+      <h2>Per model &mdash; traffic: demand vs supply</h2>
       <div class="tablewrap">
         <table>
           <thead><tr>
@@ -880,7 +938,7 @@ _PAGE = """<!doctype html>
       </div>
     </div>
     <div>
-      <h2>Per backend &mdash; deployment traffic <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">&middot; per (backend, api_base) &mdash; the per-box view</span></h2>
+      <h2>Per backend &mdash; deployment traffic <span class="h2note">&middot; per (backend, api_base) &mdash; the per-box view</span></h2>
       <div class="tablewrap">
         <table>
           <thead><tr>
@@ -892,7 +950,9 @@ _PAGE = """<!doctype html>
       </div>
     </div>
   </div>
+</section>
 
+<section data-view="identity">
   <div class="cols">
     <div>
       <h2>Per key &mdash; who asked, and what it cost</h2>
@@ -907,7 +967,7 @@ _PAGE = """<!doctype html>
       </div>
     </div>
     <div>
-      <h2>Per user &mdash; across all their keys <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">&middot; goal 27</span></h2>
+      <h2>Per user &mdash; across all their keys</h2>
       <div class="tablewrap">
         <table>
           <thead><tr>
@@ -919,60 +979,105 @@ _PAGE = """<!doctype html>
       </div>
     </div>
   </div>
+</section>
 
+<section data-view="sessions">
   <h2>Sessions &mdash; sticky keys, pins &amp; the one escalation hop
-    <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">&middot; one row per stickiness key (goals 22/25/26 made visible)</span></h2>
+    <span class="h2note">&middot; one row per stickiness key &middot; titles are metadata-only (no prompt content)</span></h2>
   <div class="tablewrap">
     <table>
       <thead><tr>
-        <th>session key</th><th>source</th><th class="num">turns</th><th>pinned</th>
+        <th>session</th><th>source</th><th class="num">turns</th><th>pinned</th>
         <th class="num">pin&nbsp;hits</th><th>escalated</th><th>mode</th><th>backends served</th>
         <th class="num">tokens</th><th class="num">cost</th><th class="num">last&nbsp;seen</th>
       </tr></thead>
       <tbody id="sessions"><tr><td class="empty" colspan="11">no sticky sessions yet</td></tr></tbody>
     </table>
   </div>
+</section>
 
+<section data-view="requests">
   <h2>Requests &mdash; requested alias &rarr; backend that served it
-    <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">&middot; each row nests its own attempt trail (goal 16)</span>
-    <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400" id="overhead"></span>
-    <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400" id="cxdist"></span></h2>
+    <span class="h2note">&middot; each row nests its own attempt trail</span>
+    <span class="h2note" id="overhead"></span>
+    <span class="h2note" id="cxdist"></span></h2>
   <div class="tablewrap">
     <table>
       <thead><tr>
         <th>requested</th><th></th><th>served</th><th>route</th><th>policy</th><th>complexity</th><th>class</th>
         <th>key</th><th>user</th>
-        <th>provider</th><th class="num">delivered</th><th class="num">consumed</th><th class="num">cost</th>
+        <th class="num">delivered</th><th class="num">consumed</th><th class="num">cost</th><th class="num">age</th>
       </tr></thead>
       <tbody id="requests"><tr><td class="empty" colspan="13">no requests yet</td></tr></tbody>
     </table>
   </div>
 
   <h2>Attempt trail &mdash; every backend tried, and why a fallback fired
-    <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">&middot; ttft = time-to-first-token, streamed only (goal 18)</span></h2>
+    <span class="h2note">&middot; ttft = time-to-first-token, streamed only</span></h2>
   <div class="tablewrap">
     <table>
       <thead><tr>
         <th>group</th><th>backend</th><th>tier</th><th>status</th>
-        <th class="num">ttft</th><th class="num">latency</th><th class="num">tokens</th><th>error</th>
+        <th class="num">ttft</th><th class="num">latency</th><th class="num">tokens</th><th>error</th><th class="num">age</th>
       </tr></thead>
-      <tbody id="attempts"><tr><td class="empty" colspan="8">no attempts yet</td></tr></tbody>
+      <tbody id="attempts"><tr><td class="empty" colspan="9">no attempts yet</td></tr></tbody>
     </table>
   </div>
+</section>
+
+<section data-view="user">
+  <div class="crumb"><a href="#/identity">&larr; identity</a></div>
+  <div id="userdetail"><div class="empty">loading&hellip;</div></div>
+</section>
+
+<section data-view="session">
+  <div class="crumb"><a href="#/sessions">&larr; sessions</a></div>
+  <div id="sessiondetail"><div class="empty">loading&hellip;</div></div>
+</section>
+
 </div>
 
 <script>
-function esc(s){ return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+// goal 30: relative sink-arrival age. received_at is stamped when the record
+// REACHED the dashboard (records carry no wall clock of their own).
+function ago(ts){
+  if(ts==null) return '&mdash;';
+  const s = Math.max(0, Math.round(Date.now()/1000 - ts));
+  if(s < 90) return s+' s';
+  if(s < 5400) return Math.round(s/60)+' m';
+  return Math.round(s/3600)+' h';
+}
+function hhmm(ts){
+  if(ts==null) return '?';
+  const d = new Date(ts*1000);
+  return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
+}
+// goal 30: the METADATA-ONLY session title — records carry no prompt content
+// by design (data governance), so a session is named by who/when/what-shape:
+// "repo-a · 14:02 · agentic · 3 turns".
+function sessTitle(s){
+  const mix = s.complexity_mix || {};
+  let dom = null, max = 0;
+  for(const k of Object.keys(mix)){
+    if(k !== 'unclassified' && mix[k] > max){ dom = k; max = mix[k]; }
+  }
+  return (s.key_alias || 'unkeyed') + ' · ' + hhmm(s.first_received_at)
+    + (dom ? ' · ' + dom : '') + ' · ' + s.turns + ' turn' + (s.turns===1?'':'s');
+}
+function userHref(u){ return '#/user/'+encodeURIComponent(u); }
+function sessHref(k){ return '#/session/'+encodeURIComponent(k); }
 function idCell(v){
-  // Synthetic identity, or a muted dash when null (master key / no key store).
-  return v==null ? '<span class="muted">&mdash;</span>' : '<code>'+esc(v)+'</code>';
+  return v==null ? '<span class="muted">&mdash;</span>' : '<code class="trunc" title="'+esc(v)+'">'+esc(v)+'</code>';
+}
+// Identity cell that LINKS to the user drill-down (goal 30).
+function userCell(v){
+  if(v==null) return '<span class="muted">&mdash;</span>';
+  return '<a class="ent" href="'+userHref(v)+'"><code class="trunc" title="'+esc(v)+'">'+esc(v)+'</code></a>';
 }
 function attemptChip(a){
-  // One backend attempt in a request's nested trail. A failure shows the error
-  // code that triggered the fallback (the "why"); a success shows its tier.
   const failed = a.status==='failure';
   const tier = a.tier ? ' <span class="badge tier">'+esc(a.tier)+'</span>' : '';
-  // ttft (streamed only, goal 18) shown alongside completion latency: "12ms ttft / 40ms".
   const lat = a.latency_ms==null ? ''
     : ' <span class="muted">'+(a.ttft_ms==null?'':esc(a.ttft_ms)+'ms ttft / ')+esc(a.latency_ms)+'ms</span>';
   const mark = failed
@@ -981,31 +1086,32 @@ function attemptChip(a){
   return '<span class="attempt '+(failed?'failed':'ok')+'"><code>'
     + esc(a.backend||a.requested_group)+'</code>'+tier+mark+lat+'</span>';
 }
-function reqTrail(r){
-  // The attempt trail joined to THIS request by correlation_id (goal 16),
-  // rendered as a sub-row nested under the request. Empty when a request has no
-  // correlated attempts (older records / a stack without the pre-call stamp).
+function trailChips(r){
   const atts = r.attempts||[];
   if(!atts.length) return '';
-  const chips = atts.map(attemptChip).join('<span class="arrow"> &rarr; </span>');
-  const cid = r.correlation_id ? ' <span class="cid">('+esc(r.correlation_id)+')</span>' : '';
-  return '<tr class="trail"><td></td><td colspan="12">why'+cid+': '+chips+'</td></tr>';
+  return atts.map(attemptChip).join('<span class="arrow"> &rarr; </span>');
 }
-// Routing policy (goals 24/25/26, rendered fully since goal 27): the badge now
-// tells shadow opinion apart from LIVE routing. enforced:true means the policy
-// REWROTE the request (goal 26) — agree:false there is post-rewrite fallback
-// drift (the chain fired after the rewrite), not disagreement. Session-arm
-// blocks add pin/esc chips (goal 25). Arm, original ask, pin and the full
-// citable reason ride the hover title — auditable in place.
-function polCell(p){
-  if(!p) return '<span class="muted">&mdash;</span>';
+function reqTrail(r, span){
+  const chips = trailChips(r);
+  if(!chips) return '';
+  const cid = r.correlation_id ? ' <span class="cid">('+esc(r.correlation_id)+')</span>' : '';
+  return '<tr class="trail"><td></td><td colspan="'+span+'">why'+cid+': '+chips+'</td></tr>';
+}
+// Routing policy (goals 24/25/26): enforced (LIVE routing) rendered apart from
+// shadow opinion; pin/esc chips carry goal 25's session state. Full citable
+// reason on hover here — and as VISIBLE text on the session detail (goal 30).
+function polWhy(p){
   const bits = ['arm '+(p.arm||'?')];
   if(p.requested) bits.push('asked '+p.requested);
   bits.push('policy chose '+(p.chosen||'(none)'));
   if(p.pinned_backend) bits.push('pin '+p.pinned_backend);
   bits.push('registry '+(p.registry||'?'));
   if(p.reason) bits.push(p.reason);
-  const why = bits.join(' \\u00b7 ');
+  return bits.join(' · ');
+}
+function polCell(p){
+  if(!p) return '<span class="muted">&mdash;</span>';
+  const why = polWhy(p);
   const chips =
     (p.pin_hit ? ' <span class="badge tier" title="served from the sticky pin">pin</span>' : '')
     +(p.escalated ? ' <span class="badge fall" title="this session took its one upward hop'
@@ -1021,8 +1127,6 @@ function polCell(p){
     return '<span class="badge fall" title="'+esc(why)+'">chose '+esc(p.chosen)+'</span>'+chips;
   return '<span class="badge no" title="'+esc(why)+'">no verdict</span>'+chips;
 }
-// Shadow session classification (goal 22): session-turn vs one-shot, with the
-// stickiness key + its source on hover — the hybrid-granularity telemetry.
 function sessCell(s){
   if(!s || !s.request_class) return '<span class="muted">&mdash;</span>';
   const isSession = s.request_class==='session-turn';
@@ -1030,55 +1134,59 @@ function sessCell(s){
   const why = s.stickiness_key
     ? ('key '+s.stickiness_key+' ('+(s.key_source||'?')+')')
     : 'no stickiness key';
-  return '<span class="badge '+cls+'" title="'+esc(why)+'">'+esc(s.request_class)+'</span>';
+  const badge = '<span class="badge '+cls+'" title="'+esc(why)+'">'+esc(s.request_class)+'</span>';
+  // A session-turn links straight into its session's drill-down (goal 30).
+  return s.stickiness_key ? '<a class="ent" href="'+sessHref(s.stickiness_key)+'">'+badge+'</a>' : badge;
 }
-// Shadow complexity (goal 21): the bucket as a badge, the full feature vector
-// as a hover title — every classification auditable in place, never a mystery.
 const CX_CLASS = {trivial:'no', toolful:'tier', heavy:'fail', agentic:'fall'};
+function cxWhy(cx){
+  return '~'+cx.approx_prompt_tokens+' tok / '+cx.turns+' turns / '+cx.tools+' tools';
+}
 function cxCell(cx){
   if(!cx || !cx.bucket) return '<span class="muted">&mdash;</span>';
   const cls = CX_CLASS[cx.bucket] || 'no';
-  const why = '~'+cx.approx_prompt_tokens+' tok / '+cx.turns+' turns / '+cx.tools+' tools';
-  return '<span class="badge '+cls+'" title="'+esc(why)+'">'+esc(cx.bucket)+'</span>';
+  return '<span class="badge '+cls+'" title="'+esc(cxWhy(cx))+'">'+esc(cx.bucket)+'</span>';
 }
-function reqRow(r){
+function reqCells(r){
   const badge = r.fallback
     ? '<span class="badge fall">fallback</span>'
     : '<span class="badge direct">direct</span>';
   const del = r.tokens_delivered==null ? '&mdash;' : esc(r.tokens_delivered);
-  // consumed > delivered means backend burn the client never saw (goal 20) —
-  // flag it, don't bury it in a same-looking number.
   const over = r.tokens_consumed!=null && r.tokens_consumed > (r.tokens_delivered||0);
   const con = r.tokens_consumed==null ? '&mdash;'
     : (over ? '<span class="badge fall">'+esc(r.tokens_consumed)+'</span>' : esc(r.tokens_consumed));
   const cost = r.response_cost==null ? '&mdash;' : ('$'+Number(r.response_cost).toFixed(6));
+  return { badge, del, con, cost };
+}
+function reqRow(r){
+  const c = reqCells(r);
   return '<tr>'
     + '<td><code>'+esc(r.requested_model)+'</code></td>'
     + '<td class="arrow">&rarr;</td>'
     + '<td><code>'+esc(r.served_model)+'</code></td>'
-    + '<td>'+badge+'</td>'
+    + '<td>'+c.badge+'</td>'
     + '<td>'+polCell(r.policy)+'</td>'
     + '<td>'+cxCell(r.complexity)+'</td>'
     + '<td>'+sessCell(r.session)+'</td>'
     + '<td>'+idCell(r.key_alias)+'</td>'
-    + '<td>'+idCell(r.user_id)+'</td>'
-    + '<td>'+esc(r.provider)+'</td>'
-    + '<td class="num">'+del+'</td>'
-    + '<td class="num">'+con+'</td>'
-    + '<td class="num">'+cost+'</td>'
+    + '<td>'+userCell(r.user_id)+'</td>'
+    + '<td class="num">'+c.del+'</td>'
+    + '<td class="num">'+c.con+'</td>'
+    + '<td class="num">'+c.cost+'</td>'
+    + '<td class="num muted">'+ago(r.received_at)+'</td>'
     + '</tr>'
-    + reqTrail(r);  // goal 16: nest this request's attempt trail beneath it
+    + reqTrail(r, 12);
 }
 function keyRow(k){
   const alias = k.key_alias==null
     ? '<span class="muted">master key / no key</span>'
-    : '<code>'+esc(k.key_alias)+'</code>';
+    : '<code class="trunc" title="'+esc(k.key_alias)+'">'+esc(k.key_alias)+'</code>';
   const fb = k.fallbacks
     ? '<span class="badge fall">'+esc(k.fallbacks)+'</span>' : '0';
   const cost = (k.cost==null) ? '&mdash;' : ('$'+Number(k.cost).toFixed(6));
   return '<tr>'
     + '<td>'+alias+'</td>'
-    + '<td>'+idCell(k.user_id)+'</td>'
+    + '<td>'+userCell(k.user_id)+'</td>'
     + '<td>'+idCell(k.team_id)+'</td>'
     + '<td class="num">'+esc(k.requests)+'</td>'
     + '<td class="num">'+fb+'</td>'
@@ -1090,7 +1198,6 @@ function attRow(a){
   const t = a.tier ? '<span class="badge tier">'+esc(a.tier)+'</span>' : '&mdash;';
   const failed = a.status==='failure';
   const st = failed ? '<span class="badge fail">failure</span>' : esc(a.status);
-  // ttft is present only on streamed attempts (goal 18); a dash for non-streamed.
   const ttft = a.ttft_ms==null ? '&mdash;' : (esc(a.ttft_ms)+' ms');
   const lat = a.latency_ms==null ? '&mdash;' : (esc(a.latency_ms)+' ms');
   const tok = (a.tokens&&a.tokens.total!=null) ? esc(a.tokens.total) : '&mdash;';
@@ -1104,11 +1211,10 @@ function attRow(a){
     + '<td class="num">'+lat+'</td>'
     + '<td class="num">'+tok+'</td>'
     + '<td>'+err+'</td>'
+    + '<td class="num muted">'+ago(a.received_at)+'</td>'
     + '</tr>';
 }
-// goal 27: the per-dimension rollup rows.
 function modelRow(m){
-  // consumed > delivered on a model = backend burn its clients never saw.
   const over = m.tokens_consumed > m.tokens_delivered;
   const con = over
     ? '<span class="badge fall">'+esc(m.tokens_consumed)+'</span>'
@@ -1126,12 +1232,10 @@ function modelRow(m){
     + '</tr>';
 }
 function userRow(u){
-  const user = u.user_id==null
-    ? '<span class="muted">no user</span>' : '<code>'+esc(u.user_id)+'</code>';
   const fb = u.fallbacks
     ? '<span class="badge fall">'+esc(u.fallbacks)+'</span>' : '0';
   return '<tr>'
-    + '<td>'+user+'</td>'
+    + '<td>'+(u.user_id==null ? '<span class="muted">no user</span>' : userCell(u.user_id))+'</td>'
     + '<td class="num">'+esc(u.keys)+'</td>'
     + '<td class="num">'+esc(u.requests)+'</td>'
     + '<td class="num">'+fb+'</td>'
@@ -1146,7 +1250,7 @@ function backendRow(b){
   const lat = b.latency_ms_avg==null ? '&mdash;' : esc(b.latency_ms_avg)+' ms';
   return '<tr>'
     + '<td><code>'+esc(b.backend)+'</code></td>'
-    + '<td class="muted">'+esc(b.api_base||'')+'</td>'
+    + '<td class="muted"><span class="trunc" title="'+esc(b.api_base||'')+'">'+esc(b.api_base||'')+'</span></td>'
     + '<td>'+tier+'</td>'
     + '<td class="num">'+esc(b.attempts)+'</td>'
     + '<td class="num">'+fails+'</td>'
@@ -1154,27 +1258,29 @@ function backendRow(b){
     + '<td class="num">'+lat+'</td>'
     + '</tr>';
 }
-function sessionRow(s){
+function sessionStateCells(s){
   const pinned = s.pinned_backend
     ? '<code>'+esc(s.pinned_backend)+'</code>' : '<span class="muted">&mdash;</span>';
   const escd = s.escalated
     ? '<span class="badge fall">esc</span>' : '<span class="badge no">no</span>';
   const mode = s.enforced
     ? '<span class="badge yes">enforced</span>' : '<span class="badge no">shadow</span>';
-  const seen = s.last_received_at==null ? '&mdash;'
-    : Math.max(0, Math.round(Date.now()/1000 - s.last_received_at))+' s ago';
+  return { pinned, escd, mode };
+}
+function sessionRow(s){
+  const c = sessionStateCells(s);
   return '<tr>'
-    + '<td><code>'+esc(s.stickiness_key)+'</code></td>'
+    + '<td><a class="ent" href="'+sessHref(s.stickiness_key)+'" title="'+esc(s.stickiness_key)+'">'+esc(sessTitle(s))+'</a></td>'
     + '<td class="muted">'+esc(s.key_source||'&mdash;')+'</td>'
     + '<td class="num">'+esc(s.turns)+'</td>'
-    + '<td>'+pinned+'</td>'
+    + '<td>'+c.pinned+'</td>'
     + '<td class="num">'+esc(s.pin_hits)+'</td>'
-    + '<td>'+escd+'</td>'
-    + '<td>'+mode+'</td>'
+    + '<td>'+c.escd+'</td>'
+    + '<td>'+c.mode+'</td>'
     + '<td>'+(s.backends||[]).map(b=>'<code>'+esc(b)+'</code>').join(' ')+'</td>'
     + '<td class="num">'+esc(s.tokens)+'</td>'
     + '<td class="num">$'+Number(s.cost||0).toFixed(6)+'</td>'
-    + '<td class="num">'+seen+'</td>'
+    + '<td class="num">'+ago(s.last_received_at)+'</td>'
     + '</tr>';
 }
 function healthBadge(inst){
@@ -1211,103 +1317,237 @@ function fleetInstRow(i){
     + '<td class="num">'+age+'</td>'
     + '</tr>';
 }
-async function refreshFleet(){
-  const fs = document.getElementById('fleetstatus');
-  try {
-    const res = await fetch('api/fleet', {cache:'no-store'});
-    const data = await res.json();
-    if(!data.available){
-      fs.textContent = '\\u2014 fleet unavailable ('+esc(data.error||'no control-plane')+')';
-      document.getElementById('fleetmodels').innerHTML =
-        '<tr><td class="empty" colspan="6">control-plane not reachable</td></tr>';
-      document.getElementById('fleetinstances').innerHTML =
-        '<tr><td class="empty" colspan="6">&mdash;</td></tr>';
-      return;
-    }
-    const models = data.models||[], insts = data.instances||[];
-    fs.textContent = '';
-    document.getElementById('fleetmodels').innerHTML = models.length
-      ? models.map(fleetModelRow).join('')
-      : '<tr><td class="empty" colspan="6">no models registered</td></tr>';
-    document.getElementById('fleetinstances').innerHTML = insts.length
-      ? insts.map(fleetInstRow).join('')
-      : '<tr><td class="empty" colspan="6">no workbenches subscribed</td></tr>';
-  } catch(e) {
-    fs.textContent = '\\u2014 fleet endpoint error';
-  }
+
+// --- the strips (shared by overview + requests) ------------------------------
+function overheadStrip(data){
+  const ov = data.overhead;
+  if(!ov || !ov.requests && !ov.unattributed_requests) return '';
+  return '&Sigma; delivered '+esc(ov.tokens_delivered)
+    +' / consumed '+esc(ov.tokens_consumed)
+    +(ov.overhead_ratio!=null ? ' (ratio '+esc(ov.overhead_ratio)+')' : '')
+    +(ov.unattributed_requests ? ' &middot; '+esc(ov.unattributed_requests)+' req / '
+      +esc(ov.unattributed_attempt_tokens)+' tok unattributed (streamed/aborted &mdash; NOT in these tables)'
+      : (ov.unattributed_attempt_tokens ? ' &middot; +'+esc(ov.unattributed_attempt_tokens)+' unattributed (streamed/aborted)' : ''));
 }
-async function refresh(){
-  try {
-    const res = await fetch('api/records', {cache:'no-store'});
-    const data = await res.json();
-    const reqs = data.requests||[], atts = data.attempts||[], keys = data.keys||[];
-    // goal 27: the per-dimension rollups.
-    const models = data.models||[], users = data.users||[],
-          sessions = data.sessions||[], backends = data.backends||[];
+function mixStrip(data){
+  const cx = data.complexity_buckets || {};
+  const mix = Object.keys(cx).sort().map(k=>esc(k)+' '+esc(cx[k])).join(' / ');
+  const rc = data.request_classes || {};
+  const cmix = Object.keys(rc).sort().map(k=>esc(k)+' '+esc(rc[k])).join(' / ');
+  const pa = data.policy_agreement;
+  const enf = (pa && pa.enforced && pa.enforced.count)
+    ? ', '+esc(pa.enforced.count)+' enforced'
+      +(pa.enforced.disagree ? ' ('+esc(pa.enforced.disagree)+' drift)' : '')
+    : '';
+  const pmix = (pa && pa.evaluated)
+    ? ' &middot; policy: '+esc(pa.agree)+'/'+esc(pa.evaluated)+' agree'
+      +(pa.agreement_rate!=null ? ' ('+esc(pa.agreement_rate)+')' : '')
+      +(pa.unevaluated ? ', '+esc(pa.unevaluated)+' unevaluated' : '')
+      + enf
+    : '';
+  return (mix ? 'mix: '+mix : '') + (cmix ? ' &middot; class: '+cmix : '') + pmix;
+}
+
+// --- detail views (goal 30) ---------------------------------------------------
+function copySpan(v){
+  return '<span class="copy" data-copy="'+esc(v)+'" title="click to copy">'+esc(v)+'</span>';
+}
+// One turn of a session, with its trail AND the visible "why" — the policy's
+// full reason and the complexity features as text, not hover-only (goal 30).
+function turnRows(r){
+  const c = reqCells(r);
+  let why = [];
+  if(r.policy) why.push('policy: '+polWhy(r.policy));
+  if(r.complexity && r.complexity.bucket) why.push('complexity: '+r.complexity.bucket+' ('+cxWhy(r.complexity)+')');
+  const chips = trailChips(r);
+  const whyRow = (why.length || chips)
+    ? '<tr class="why"><td></td><td colspan="9">'
+      + (chips ? 'trail: '+chips+'<br>' : '')
+      + esc(why.join(' · '))
+      + '</td></tr>'
+    : '';
+  return '<tr>'
+    + '<td class="num muted">'+ago(r.received_at)+'</td>'
+    + '<td><code>'+esc(r.requested_model)+'</code></td>'
+    + '<td class="arrow">&rarr;</td>'
+    + '<td><code>'+esc(r.served_model)+'</code></td>'
+    + '<td>'+c.badge+'</td>'
+    + '<td>'+polCell(r.policy)+'</td>'
+    + '<td class="num">'+c.del+'</td>'
+    + '<td class="num">'+c.con+'</td>'
+    + '<td class="num">'+c.cost+'</td>'
+    + '<td></td>'
+    + '</tr>' + whyRow;
+}
+function renderSessionDetail(key){
+  const box = document.getElementById('sessiondetail');
+  const sessions = DATA.sessions||[];
+  const s = sessions.find(x=>x.stickiness_key===key);
+  const turns = (DATA.requests||[]).filter(r=>r.session && r.session.stickiness_key===key);
+  if(!s && !turns.length){
+    box.innerHTML = '<h2>Session</h2><div class="empty">no records for session key <code>'+esc(key)+'</code> (expired from the sink, or never seen)</div>';
+    return;
+  }
+  const state = s ? sessionStateCells(s) : null;
+  let head = '<h2>'+(s ? esc(sessTitle(s)) : 'Session')+'</h2>';
+  head += '<div class="detailmeta muted">key '+copySpan(key)
+    + (s && s.key_source ? ' &middot; source '+esc(s.key_source) : '')
+    + (s && s.user_id ? ' &middot; user <a class="ent" href="'+userHref(s.user_id)+'">'+esc(s.user_id)+'</a>' : '')
+    + (s && s.key_alias ? ' &middot; key alias <code>'+esc(s.key_alias)+'</code>' : '')
+    + '</div>';
+  if(state){
+    head += '<div class="detailmeta">pinned '+state.pinned
+      + ' &middot; pin hits '+esc(s.pin_hits)
+      + ' &middot; escalated '+state.escd
+      + ' &middot; mode '+state.mode
+      + ' &middot; backends '+(s.backends||[]).map(b=>'<code>'+esc(b)+'</code>').join(' ')
+      + ' &middot; '+esc(s.tokens)+' tok &middot; $'+Number(s.cost||0).toFixed(6)
+      + '</div>';
+  }
+  const rows = turns.map(turnRows).join('');
+  box.innerHTML = head
+    + '<div class="tablewrap"><table>'
+    + '<thead><tr><th class="num">age</th><th>requested</th><th></th><th>served</th><th>route</th><th>policy</th>'
+    + '<th class="num">delivered</th><th class="num">consumed</th><th class="num">cost</th><th></th></tr></thead>'
+    + '<tbody>'+(rows || '<tr><td class="empty" colspan="10">no turns visible (records may have expired from the sink)</td></tr>')+'</tbody>'
+    + '</table></div>';
+}
+function renderUserDetail(uid){
+  const box = document.getElementById('userdetail');
+  const reqs = (DATA.requests||[]).filter(r=>r.user_id===uid);
+  const keys = (DATA.keys||[]).filter(k=>k.user_id===uid);
+  const sessions = (DATA.sessions||[]).filter(s=>s.user_id===uid);
+  const u = (DATA.users||[]).find(x=>x.user_id===uid);
+  let head = '<h2>User '+copySpan(uid)+'</h2>';
+  if(u){
+    head += '<div class="detailmeta muted">'+esc(u.requests)+' requests across '+esc(u.keys)
+      + ' key'+(u.keys===1?'':'s')+' &middot; '+esc(u.fallbacks)+' fallbacks &middot; '
+      + esc(u.tokens)+' tok &middot; $'+Number(u.cost||0).toFixed(6)+'</div>';
+  }
+  let html = head;
+  html += '<h2>Keys</h2><div class="tablewrap"><table>'
+    + '<thead><tr><th>key</th><th>user</th><th>team</th><th class="num">requests</th><th class="num">fallbacks</th><th class="num">tokens</th><th class="num">cost</th></tr></thead>'
+    + '<tbody>'+(keys.length ? keys.map(keyRow).join('') : '<tr><td class="empty" colspan="7">no keyed traffic</td></tr>')+'</tbody></table></div>';
+  html += '<h2>Sessions</h2><div class="tablewrap"><table>'
+    + '<thead><tr><th>session</th><th>source</th><th class="num">turns</th><th>pinned</th><th class="num">pin&nbsp;hits</th><th>escalated</th><th>mode</th><th>backends served</th><th class="num">tokens</th><th class="num">cost</th><th class="num">last&nbsp;seen</th></tr></thead>'
+    + '<tbody>'+(sessions.length ? sessions.map(sessionRow).join('') : '<tr><td class="empty" colspan="11">no sticky sessions</td></tr>')+'</tbody></table></div>';
+  html += '<h2>Requests</h2><div class="tablewrap"><table>'
+    + '<thead><tr><th>requested</th><th></th><th>served</th><th>route</th><th>policy</th><th>complexity</th><th>class</th><th>key</th><th>user</th><th class="num">delivered</th><th class="num">consumed</th><th class="num">cost</th><th class="num">age</th></tr></thead>'
+    + '<tbody>'+(reqs.length ? reqs.map(reqRow).join('') : '<tr><td class="empty" colspan="13">no requests</td></tr>')+'</tbody></table></div>';
+  box.innerHTML = html;
+}
+
+// --- router + render loop (goal 30) -------------------------------------------
+let DATA = {}, FLEET = {};
+function parseRoute(){
+  const h = location.hash || '#/overview';
+  let m = h.match(/^#\/(overview|traffic|identity|sessions|requests)$/);
+  if(m) return { view: m[1], arg: null };
+  m = h.match(/^#\/user\/(.+)$/);
+  if(m) return { view: 'user', arg: decodeURIComponent(m[1]) };
+  m = h.match(/^#\/session\/(.+)$/);
+  if(m) return { view: 'session', arg: decodeURIComponent(m[1]) };
+  return { view: 'overview', arg: null };
+}
+function renderView(){
+  const r = parseRoute();
+  document.querySelectorAll('section[data-view]').forEach(s =>
+    s.classList.toggle('on', s.dataset.view === r.view));
+  document.querySelectorAll('#nav a').forEach(a =>
+    a.classList.toggle('active', a.dataset.route === r.view));
+  const data = DATA;
+  if(r.view === 'overview'){
+    const oh = overheadStrip(data), mx = mixStrip(data);
+    document.getElementById('ovstrips').innerHTML =
+      (oh ? oh + '<br>' : '') + mx;
+    renderFleet();
+  } else if(r.view === 'traffic'){
+    const models = data.models||[], backends = data.backends||[];
     document.getElementById('modeltraffic').innerHTML = models.length
       ? models.map(modelRow).join('')
       : '<tr><td class="empty" colspan="7">no traffic yet</td></tr>';
-    document.getElementById('users').innerHTML = users.length
-      ? users.map(userRow).join('')
-      : '<tr><td class="empty" colspan="6">no traffic yet</td></tr>';
     document.getElementById('backends').innerHTML = backends.length
       ? backends.map(backendRow).join('')
       : '<tr><td class="empty" colspan="7">no attempts yet</td></tr>';
-    document.getElementById('sessions').innerHTML = sessions.length
-      ? sessions.map(sessionRow).join('')
-      : '<tr><td class="empty" colspan="11">no sticky sessions yet</td></tr>';
+  } else if(r.view === 'identity'){
+    const keys = data.keys||[], users = data.users||[];
     document.getElementById('keys').innerHTML = keys.length
       ? keys.map(keyRow).join('')
       : '<tr><td class="empty" colspan="7">no keyed traffic yet</td></tr>';
+    document.getElementById('users').innerHTML = users.length
+      ? users.map(userRow).join('')
+      : '<tr><td class="empty" colspan="6">no traffic yet</td></tr>';
+  } else if(r.view === 'sessions'){
+    const sessions = data.sessions||[];
+    document.getElementById('sessions').innerHTML = sessions.length
+      ? sessions.map(sessionRow).join('')
+      : '<tr><td class="empty" colspan="11">no sticky sessions yet</td></tr>';
+  } else if(r.view === 'requests'){
+    const reqs = data.requests||[], atts = data.attempts||[];
     document.getElementById('requests').innerHTML = reqs.length
       ? reqs.map(reqRow).join('')
       : '<tr><td class="empty" colspan="13">no requests yet</td></tr>';
     document.getElementById('attempts').innerHTML = atts.length
       ? atts.map(attRow).join('')
-      : '<tr><td class="empty" colspan="8">no attempts yet</td></tr>';
-    // goal 20: the delivered-vs-consumed rollup, at a glance (the Fugu lesson).
-    const ov = data.overhead;
-    document.getElementById('overhead').innerHTML = !ov ? ''
-      : '&middot; &Sigma; delivered '+esc(ov.tokens_delivered)
-        +' / consumed '+esc(ov.tokens_consumed)
-        +(ov.overhead_ratio!=null ? ' (ratio '+esc(ov.overhead_ratio)+')' : '')
-        +(ov.unattributed_requests ? ' &middot; '+esc(ov.unattributed_requests)+' req / '
-          +esc(ov.unattributed_attempt_tokens)+' tok unattributed (streamed/aborted — NOT in these tables)'
-          : (ov.unattributed_attempt_tokens ? ' &middot; +'+esc(ov.unattributed_attempt_tokens)+' unattributed (streamed/aborted)' : ''));
-    // goal 21: the shadow-complexity traffic mix, at a glance.
-    const cx = data.complexity_buckets || {};
-    const mix = Object.keys(cx).sort().map(k=>esc(k)+' '+esc(cx[k])).join(' / ');
-    // goal 22: the session-turn vs one-shot mix rides the same strip.
-    const rc = data.request_classes || {};
-    const cmix = Object.keys(rc).sort().map(k=>esc(k)+' '+esc(rc[k])).join(' / ');
-    // goal 24: shadow-policy agreement at a glance — chosen-vs-actual across
-    // every evaluated request (the number goal 26's enforcement flip is judged
-    // against).
-    const pa = data.policy_agreement;
-    // goal 27: enforced requests counted apart from shadow opinion — drift
-    // under enforcement = the fallback chain fired AFTER the rewrite.
-    const enf = (pa && pa.enforced && pa.enforced.count)
-      ? ', '+esc(pa.enforced.count)+' enforced'
-        +(pa.enforced.disagree ? ' ('+esc(pa.enforced.disagree)+' drift)' : '')
-      : '';
-    const pmix = (pa && pa.evaluated)
-      ? ' &middot; policy: '+esc(pa.agree)+'/'+esc(pa.evaluated)+' agree'
-        +(pa.agreement_rate!=null ? ' ('+esc(pa.agreement_rate)+')' : '')
-        +(pa.unevaluated ? ', '+esc(pa.unevaluated)+' unevaluated' : '')
-        + enf
-      : '';
-    document.getElementById('cxdist').innerHTML =
-      (mix ? '&middot; mix: '+mix : '') + (cmix ? ' &middot; class: '+cmix : '') + pmix;
-    const ov2 = data.overhead||{};
+      : '<tr><td class="empty" colspan="9">no attempts yet</td></tr>';
+    const oh = overheadStrip(data);
+    document.getElementById('overhead').innerHTML = oh ? '&middot; '+oh : '';
+    const mx = mixStrip(data);
+    document.getElementById('cxdist').innerHTML = mx ? '&middot; '+mx : '';
+  } else if(r.view === 'user'){
+    renderUserDetail(r.arg);
+  } else if(r.view === 'session'){
+    renderSessionDetail(r.arg);
+  }
+}
+function renderFleet(){
+  const fs = document.getElementById('fleetstatus');
+  const data = FLEET;
+  if(!data.available){
+    fs.textContent = '— fleet unavailable ('+(data.error||'no control-plane')+')';
+    document.getElementById('fleetmodels').innerHTML =
+      '<tr><td class="empty" colspan="6">control-plane not reachable</td></tr>';
+    document.getElementById('fleetinstances').innerHTML =
+      '<tr><td class="empty" colspan="6">&mdash;</td></tr>';
+    return;
+  }
+  const models = data.models||[], insts = data.instances||[];
+  fs.textContent = '';
+  document.getElementById('fleetmodels').innerHTML = models.length
+    ? models.map(fleetModelRow).join('')
+    : '<tr><td class="empty" colspan="6">no models registered</td></tr>';
+  document.getElementById('fleetinstances').innerHTML = insts.length
+    ? insts.map(fleetInstRow).join('')
+    : '<tr><td class="empty" colspan="6">no workbenches subscribed</td></tr>';
+}
+async function tick(){
+  try {
+    const res = await fetch('api/records', {cache:'no-store'});
+    DATA = await res.json();
+    const ov = DATA.overhead||{};
     document.getElementById('status').textContent =
-      reqs.length+' requests \\u00b7 '+atts.length+' attempts'
-      +(ov2.unattributed_requests ? ' \\u00b7 +'+ov2.unattributed_requests+' unattributed' : '')
-      +' \\u00b7 '+(data.count||0)+' records';
+      (DATA.requests||[]).length+' requests · '+(DATA.attempts||[]).length+' attempts'
+      +(ov.unattributed_requests ? ' · +'+ov.unattributed_requests+' unattributed' : '')
+      +' · '+(DATA.count||0)+' records';
   } catch(e) {
     document.getElementById('status').textContent = 'sink unreachable';
   }
+  try {
+    const res = await fetch('api/fleet', {cache:'no-store'});
+    FLEET = await res.json();
+  } catch(e) {
+    FLEET = {available:false, error:'fleet endpoint error'};
+  }
+  renderView();
 }
-function tick(){ refresh(); refreshFleet(); }
+window.addEventListener('hashchange', renderView);
+document.addEventListener('click', e => {
+  const c = e.target.closest('[data-copy]');
+  if(!c) return;
+  if(navigator.clipboard) navigator.clipboard.writeText(c.dataset.copy);
+  c.classList.add('copied');
+  setTimeout(()=>c.classList.remove('copied'), 600);
+});
 tick();
 setInterval(tick, 2000);
 </script>
@@ -1334,6 +1574,10 @@ class Handler(BaseHTTPRequestHandler):
         body = text.encode()
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        # Goal 30: never let a browser cache the page shell — a dashboard
+        # upgrade must show on the next load, not after a hard refresh
+        # (observed live: a stale pre-v4 page served from browser cache).
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1387,11 +1631,10 @@ class Handler(BaseHTTPRequestHandler):
         # even when the control-plane is down (available:false in the body).
         if self.path.startswith("/api/fleet"):
             return self._json(200, _fetch_fleet())
-        if (
-            self.path == "/"
-            or self.path.startswith("/index")
-            or self.path.startswith("/dashboard")
-        ):
+        # Query strings tolerated (e.g. a cache-busting /?x) — route on the
+        # bare path (goal 30; observed live: GET /?v4 404'd).
+        path = self.path.split("?", 1)[0]
+        if path == "/" or path.startswith("/index") or path.startswith("/dashboard"):
             return self._html(200, _PAGE)
         return self._json(404, {"error": "not found: " + self.path})
 
