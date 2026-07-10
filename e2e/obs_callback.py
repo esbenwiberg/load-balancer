@@ -17,11 +17,13 @@ It emits two record shapes, keyed by `event`:
                 OMIT it. By construction ttft_ms <= latency_ms. See _ttft_ms /
                 _latency_ms below and docs/09-observability.md.
 
-                ⚠️ LiteLLM quirk (verified against v1.83.14): on a proxy
-                fallback the WINNING deployment does NOT fire a success event —
-                only the failed primary attempt logs here. The winner is
-                captured by the `delivered` record below instead. See
-                docs/09-observability.md.
+                ⚠️ LiteLLM quirk (verified against v1.83.14): on a NON-STREAMED
+                proxy fallback the WINNING deployment does NOT fire a success
+                event — only the failed primary attempt logs here; the winner
+                is captured by the `delivered` record below instead. A consumed
+                STREAM's winner always fires its success event (the goal-29
+                research — that event is what builds the streamed delivered
+                record). See docs/09-observability.md.
 
   * delivered — one per CLIENT REQUEST: the final response handed back. Carries
                 the alias the client ASKED for vs the backend that actually
@@ -34,6 +36,14 @@ It emits two record shapes, keyed by `event`:
                 alias and the user/team it was minted for (goal 11b). All three
                 are null under the master key / no key store, so the bare-pytest
                 and cli-auth profiles are unaffected.
+
+                STREAMED responses included (goal 29): a stream the client
+                consumed to the end yields a delivered record too, built from
+                the post-stream success event rather than the post-call hook
+                (which structurally never runs for streams on this pin) and
+                marked `stream: true`. Requested-vs-served, identity and the
+                session tag come from a pre-call context stash keyed by the
+                goal-16 correlation id. See _delivered_stream_record.
 
 TRACE CORRELATION — joining a request to its attempt trail (goal 16):
 
@@ -144,10 +154,9 @@ The block crosses hook boundaries via the goal-16 correlation id in a bounded
 module-level map (_POLICY_BLOCKS) — the id is already proven to reach every
 surface (delivered via data, attempts via slo.trace_id), unlike the metadata
 dict whose shape varies across the three inbound protocols. The delivered
-record carries the authoritative actual/agree (actual = served_model);
-attempt records carry the block best-effort (actual = the attempt's backend on
-success — the only carrier for streamed traffic, which fires no delivered
-record on this pin). See _policy_stateless + docs/09.
+record carries the authoritative actual/agree (actual = served_model) — since
+goal 29 for streamed requests too; attempt records carry the block best-effort
+(actual = the attempt's backend on success). See _policy_stateless + docs/09.
 
 Sinks (independent, both optional):
 
@@ -1067,12 +1076,67 @@ async def _registry_snapshot():
 # The computed block, keyed by the goal-16 correlation id, so the delivered
 # hook and the attempt events (which see the same id — that is goal 16's whole
 # point) can stamp it onto their records. Bounded FIFO: entries are never
-# popped on delivery (streamed requests deliver no `delivered` record and
-# attempts log late), they just age out. Lock because the sync log_* variants
-# may run off the event loop's thread.
+# popped on delivery (attempts log late), they just age out. Lock because the
+# sync log_* variants may run off the event loop's thread.
 _POLICY_BLOCKS: OrderedDict = OrderedDict()
 _POLICY_BLOCKS_CAP = 4096
 _POLICY_LOCK = threading.Lock()
+
+# --- STREAMED delivered records (goal 29) ------------------------------------
+# Request context stashed at PRE-CALL time, keyed by the goal-16 correlation
+# id, so the streamed delivered-equivalent record (built in the success EVENT,
+# where the proxy's `data` dict is out of reach) can carry what only ingress
+# knows: the model the client's request was routed FOR (post-enforcement,
+# matching the non-streamed delivered record's requested_model semantics), the
+# caller's identity read off UserAPIKeyAuth (byte-identical semantics to the
+# non-streamed path — no reliance on litellm's metadata sentinels), and the
+# session tag derived via _request_headers (which reads ALL THREE inbound
+# protocols' metadata shapes; the event-time header map is chat-only on this
+# pin). Same bounded-FIFO discipline as _POLICY_BLOCKS, same lock (both are
+# tiny critical sections touched by the same hooks). Entries age out rather
+# than being popped: attempts may log after delivery.
+_REQUEST_CTX: OrderedDict = OrderedDict()
+_REQUEST_CTX_CAP = 4096
+
+# Correlation ids a delivered(-equivalent) record was already emitted for —
+# the double-emission guard. On the pinned v1.83.14 the two carriers are
+# mutually exclusive by construction (async_post_call_success_hook never runs
+# for streams, success events carry stream:true only for streams), so this is
+# pure insurance: if a litellm upgrade ever fires both for one request, the
+# dashboard must not grow duplicate request rows. Bounded like the maps above.
+_DELIVERED_CIDS: OrderedDict = OrderedDict()
+_DELIVERED_CIDS_CAP = 4096
+
+
+def _ctx_remember(cid, ctx) -> None:
+    if not cid or not isinstance(ctx, dict):
+        return
+    with _POLICY_LOCK:
+        _REQUEST_CTX[cid] = ctx
+        while len(_REQUEST_CTX) > _REQUEST_CTX_CAP:
+            _REQUEST_CTX.popitem(last=False)
+
+
+def _ctx_recall(cid):
+    if not cid:
+        return None
+    with _POLICY_LOCK:
+        return _REQUEST_CTX.get(cid)
+
+
+def _delivered_mark_once(cid) -> bool:
+    """True iff no delivered record was emitted for `cid` yet — and mark it.
+    A None cid cannot be deduped; let it through (never drop a record over a
+    missing join key)."""
+    if not cid:
+        return True
+    with _POLICY_LOCK:
+        if cid in _DELIVERED_CIDS:
+            return False
+        _DELIVERED_CIDS[cid] = True
+        while len(_DELIVERED_CIDS) > _DELIVERED_CIDS_CAP:
+            _DELIVERED_CIDS.popitem(last=False)
+        return True
 
 
 def _policy_remember(cid, block) -> None:
@@ -1143,9 +1207,9 @@ def _llm_call_record(kwargs, fallback_status: str) -> dict:
         record["ttft_ms"] = ttft
     # SHADOW complexity (goal 21) — best-effort on the attempt trail: the raw
     # messages/tools ride the logging kwargs on this pinned litellm; when absent
-    # the tag is simply omitted. Attempt-level stamping matters because STREAMED
-    # requests fire no `delivered` record on this pin (docs/09) — the attempt
-    # trail is their only carrier.
+    # the tag is simply omitted. Attempt-level stamping keeps every attempt
+    # auditable alone, and covered streamed traffic until goal 29 gave streams
+    # a delivered record of their own.
     cx = _complexity(
         kwargs.get("messages") or slo.get("messages"),
         (kwargs.get("optional_params") or {}).get("tools"),
@@ -1153,8 +1217,7 @@ def _llm_call_record(kwargs, fallback_status: str) -> dict:
     if cx is not None:
         record["complexity"] = cx
     # SHADOW session classification (goal 22) — attempt-side stamping for the
-    # same reason as complexity: streamed requests fire no `delivered` record
-    # on this pin, so the attempt trail is their only carrier. Headers verified
+    # same reason as complexity (per-attempt auditability). Headers verified
     # to reach litellm_params.metadata.headers on v1.83.14 (see _session).
     sess = _session(
         ((kwargs.get("litellm_params") or {}).get("metadata") or {}).get("headers"),
@@ -1163,14 +1226,107 @@ def _llm_call_record(kwargs, fallback_status: str) -> dict:
     if sess is not None:
         record["session"] = sess
     # SHADOW policy (goal 24) — attempt-side stamping, best-effort, for the
-    # same reason as complexity/session: streamed requests fire no `delivered`
-    # record on this pin, so a streamed request's success attempt is its only
-    # policy carrier. actual = this attempt's backend on success; a FAILED
-    # attempt served nothing, so it carries the decision with actual/agree null.
+    # same reason as complexity/session (per-attempt auditability; the
+    # authoritative verdict is the delivered record's — streams included since
+    # goal 29). actual = this attempt's backend on success; a FAILED attempt
+    # served nothing, so it carries the decision with actual/agree null.
     block = _policy_recall(slo.get("trace_id"))
     if block is not None:
         actual = slo.get("model_group") if slo.get("status") == "success" else None
         record["shadow_policy"] = _policy_with_outcome(block, actual)
+    return record
+
+
+def _delivered_stream_record(kwargs):
+    """A `delivered` record for a STREAMED response (goal 29), built from the
+    post-stream success event — or None when this event is not one (not
+    streamed / not a success / already delivered).
+
+    WHY THIS HOOK (the research the goal demanded, verified live on the pinned
+    v1.83.14 — see docs/09): async_post_call_success_hook structurally never
+    runs for streams (every streaming route early-returns through an SSE
+    generator before the proxy calls it), and the per-chunk
+    async_post_call_streaming_hook carries neither the request dict nor a join
+    key. But CustomStreamWrapper fires the SUCCESS EVENT when the client's
+    stream is exhausted, with the full StandardLoggingPayload — stream:true,
+    the assembled token usage, cost, api_base — and, crucially, it fires for
+    the FALLBACK WINNER too, carrying the SAME pre-call trace_id (probed on
+    all three inbound surfaces: chat, Anthropic-messages, Responses-bridge).
+    The old "fallback winner fires no success event" quirk is a NON-streamed
+    behavior. So the logging hook is a complete carrier for every stream a
+    client actually finished — and it keeps this record OFF the request path
+    (the iterator hook was rejected for exactly that reason: a bug there
+    breaks live streams; a bug here loses a record).
+
+    What the event alone cannot say is what the client was routed FOR: the
+    winner's model_group IS the winner (a fallback would look direct). The
+    pre-call context map fills that in — requested_model stashed post-
+    enforcement, so `fallback` keeps meaning "the availability chain fired",
+    exactly the non-streamed semantics. On a context miss (cap eviction /
+    stamping hiccup) requested_model degrades to the served group — fallback
+    then reads false, the same honest degrade the non-streamed record has
+    when data["model"] is absent.
+
+    A stream the client ABORTED (or that died mid-stream) fires the failure
+    event, not this — such traffic stays visible via its attempt trail and
+    the dashboard's unattributed counts, deliberately: nothing was delivered."""
+    slo = kwargs.get("standard_logging_object") or {}
+    if not slo.get("stream") or slo.get("status") != "success":
+        return None
+    cid = slo.get("trace_id")
+    if not _delivered_mark_once(cid):
+        return None
+    ctx = _ctx_recall(cid) or {}
+    served = slo.get("model_group")
+    requested = ctx.get("requested_model") or served
+    record = {
+        "event": "delivered",
+        # Marks the delivered record as stream-sourced (goal 29) — non-streamed
+        # records omit the key. Auditability: says WHICH carrier built it.
+        "stream": True,
+        "requested_model": requested,
+        "served_model": served,
+        "served_model_id": (slo.get("model_id") or "")[:12] or None,
+        "api_base": slo.get("api_base"),
+        "provider": slo.get("custom_llm_provider"),
+        "response_cost": slo.get("response_cost"),
+        "tokens": {
+            "prompt": slo.get("prompt_tokens"),
+            "completion": slo.get("completion_tokens"),
+            "total": slo.get("total_tokens"),
+        },
+        "fallback": bool(requested and served and requested != served),
+        "correlation_id": cid,
+        "litellm_call_id": slo.get("litellm_call_id"),
+    }
+    # WHO asked (goal 15): the identity stashed pre-call off UserAPIKeyAuth —
+    # the same source the non-streamed record reads, so master-key/no-key
+    # traffic carries the same nulls (litellm's own metadata would leak
+    # "default_user_id" sentinels here).
+    identity = ctx.get("identity")
+    record.update(
+        identity
+        if isinstance(identity, dict)
+        else {"key_alias": None, "user_id": None, "team_id": None}
+    )
+    cx = _complexity(
+        kwargs.get("messages") or slo.get("messages"),
+        (kwargs.get("optional_params") or {}).get("tools"),
+    )
+    if cx is not None:
+        record["complexity"] = cx
+    # Session tag: prefer the pre-call stash (derived via _request_headers,
+    # which reads all three protocols' metadata shapes) over an event-time
+    # re-derivation (whose header map is chat-only on this pin).
+    sess = ctx.get("session") or _session(
+        ((kwargs.get("litellm_params") or {}).get("metadata") or {}).get("headers"),
+        kwargs.get("messages") or slo.get("messages"),
+    )
+    if sess is not None:
+        record["session"] = sess
+    block = _policy_recall(cid)
+    if block is not None:
+        record["shadow_policy"] = _policy_with_outcome(block, served)
     return record
 
 
@@ -1259,11 +1415,41 @@ class RoutingRecorder(CustomLogger):
                     _policy_remember(data[_CORRELATION_KEY], block)
         except Exception:  # pragma: no cover - defensive
             pass
+        # STREAMED delivered records (goal 29): stash what only ingress knows —
+        # keyed by the correlation id, read back post-stream by the success
+        # event. requested_model is read AFTER the enforcement branch above so
+        # it names the model the request was routed FOR (the non-streamed
+        # record's exact semantics — its requested_model is data["model"] read
+        # post-rewrite; the client's original ask lives on the policy block).
+        # Unconditional (unlike the policy block, which needs candidates): a
+        # bare gateway with no router still delivers streams.
+        try:
+            if isinstance(data, dict) and data.get(_CORRELATION_KEY):
+                _ctx_remember(
+                    data[_CORRELATION_KEY],
+                    {
+                        "requested_model": data.get("model"),
+                        "identity": _identity(user_api_key_dict),
+                        "session": _session(
+                            _request_headers(data), data.get("messages")
+                        ),
+                    },
+                )
+        except Exception:  # pragma: no cover - defensive
+            pass
         return data
 
     # --- per-attempt trail (success + failure) -----------------------------
+    # A STREAMED success event additionally yields the request's `delivered`
+    # record (goal 29) — the post-stream success event is the only complete
+    # per-request carrier for streams on this pin (async_post_call_success_hook
+    # never runs for them; see _delivered_stream_record). Non-streamed events
+    # return None there and emit nothing extra.
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
         _emit(_llm_call_record(kwargs, "success"))
+        delivered = _delivered_stream_record(kwargs)
+        if delivered is not None:
+            _emit(delivered)
 
     async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
         _emit(_llm_call_record(kwargs, "failure"))
@@ -1272,6 +1458,9 @@ class RoutingRecorder(CustomLogger):
     # silently dropped if LiteLLM changes which it calls.
     def log_success_event(self, kwargs, response_obj, start_time, end_time):
         _emit(_llm_call_record(kwargs, "success"))
+        delivered = _delivered_stream_record(kwargs)
+        if delivered is not None:
+            _emit(delivered)
 
     def log_failure_event(self, kwargs, response_obj, start_time, end_time):
         _emit(_llm_call_record(kwargs, "failure"))
@@ -1335,6 +1524,15 @@ class RoutingRecorder(CustomLogger):
         block = _policy_recall(data.get(_CORRELATION_KEY))
         if block is not None:
             record["shadow_policy"] = _policy_with_outcome(block, served)
+        # Double-emission guard (goal 29): claim this request's correlation id
+        # so the streamed carrier cannot also deliver it — and skip if that
+        # carrier claimed it first. On the pinned v1.83.14 the carriers are
+        # mutually exclusive (this hook never runs for streams), so on this
+        # pin the claim always succeeds and behavior is unchanged; the guard
+        # is insurance so a litellm upgrade that starts firing both can only
+        # ever yield ONE delivered record per request, whichever lands first.
+        if not _delivered_mark_once(data.get(_CORRELATION_KEY)):
+            return
         _emit(record)
 
 
