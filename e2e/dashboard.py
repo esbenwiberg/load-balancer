@@ -525,17 +525,49 @@ def _session_rollup(requests: list) -> list:
     return rows
 
 
-def _backend_rollup(records: list) -> list:
+def _api_base_join(fleet: dict) -> dict:
+    """Goal 28: fold the fleet's per-instance rows into the api_base →
+    workbench_id join map `_backend_rollup` uses to name workbenches on the
+    backend-traffic table.
+
+    Rules, chosen to never LIE on the dashboard:
+      * exact match after a trailing-slash strip — no URL canonicalization
+        heuristics (scheme/host/port guessing invents joins that aren't there).
+      * an api_base claimed by MORE THAN ONE workbench is ambiguous → dropped
+        from the map (rendering one of the claimants would be a guess).
+      * fleet unavailable / instances without api_base → empty/partial map;
+        every consumer degrades to workbench=None, exactly like pre-goal-28.
+    """
+    joined: dict = {}
+    ambiguous = set()
+    for inst in (fleet or {}).get("instances") or []:
+        base = inst.get("api_base")
+        wid = inst.get("workbench_id")
+        if not isinstance(base, str) or not base.strip() or not wid:
+            continue
+        base = base.rstrip("/")
+        if base in joined and joined[base] != wid:
+            ambiguous.add(base)
+            continue
+        joined[base] = wid
+    for base in ambiguous:
+        joined.pop(base, None)
+    return joined
+
+
+def _backend_rollup(records: list, api_base_join: dict = None) -> list:
     """Per-BACKEND traffic (goal 27): attempt-trail traffic folded per concrete
     deployment — (backend, api_base) — with its tier, attempt/failure counts,
-    tokens, and mean completion latency. This is the closest HONEST per-
-    workbench traffic attribution today's data supports: the control-plane
-    registry keys workbenches by workbench_id but carries no api_base, so a
-    hard attempts→workbench join does not exist yet (queued as a follow-up
-    goal — heartbeat gains api_base). In the dev/e2e stacks each workbench IS
-    a distinct api_base, so this table already reads per-box. Busiest first."""
+    tokens, and mean completion latency. Busiest first.
+
+    Goal 28 makes this the per-WORKBENCH view when the registry allows: each
+    row gains `workbench_id`, joined attempt api_base → workbench via
+    `api_base_join` (built by `_api_base_join` from the control-plane's
+    heartbeat-declared api_base). No map / no match → workbench_id None and
+    the table reads exactly as it did before — the join only ever ADDS a name."""
     agg: dict = {}
     order = []
+    join = api_base_join or {}
     for r in records:
         if r.get("event") != "llm_call":
             continue
@@ -545,6 +577,7 @@ def _backend_rollup(records: list) -> list:
             e = {
                 "backend": r.get("backend"),
                 "api_base": r.get("api_base"),
+                "workbench_id": join.get((r.get("api_base") or "").rstrip("/")),
                 "tier": r.get("tier"),
                 "attempts": 0,
                 "failures": 0,
@@ -944,14 +977,14 @@ _PAGE = r"""<!doctype html>
       </div>
     </div>
     <div>
-      <h2>Per backend &mdash; deployment traffic <span class="h2note">&middot; per (backend, api_base) &mdash; the per-box view</span></h2>
+      <h2>Per backend &mdash; deployment traffic <span class="h2note">&middot; per (backend, api_base) &mdash; the per-box view; workbench joined from the fleet registry</span></h2>
       <div class="tablewrap">
         <table>
           <thead><tr>
-            <th>backend</th><th>api base</th><th>tier</th><th class="num">attempts</th>
+            <th>backend</th><th>workbench</th><th>api base</th><th>tier</th><th class="num">attempts</th>
             <th class="num">failures</th><th class="num">tokens</th><th class="num">avg&nbsp;latency</th>
           </tr></thead>
-          <tbody id="backends"><tr><td class="empty" colspan="7">no attempts yet</td></tr></tbody>
+          <tbody id="backends"><tr><td class="empty" colspan="8">no attempts yet</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -1254,8 +1287,11 @@ function backendRow(b){
     ? '<span class="badge fail">'+esc(b.failures)+'</span>' : '0';
   const tier = b.tier ? '<span class="badge tier">'+esc(b.tier)+'</span>' : '&mdash;';
   const lat = b.latency_ms_avg==null ? '&mdash;' : esc(b.latency_ms_avg)+' ms';
+  const wb = b.workbench_id
+    ? '<code>'+esc(b.workbench_id)+'</code>' : '<span class="muted">&mdash;</span>';
   return '<tr>'
     + '<td><code>'+esc(b.backend)+'</code></td>'
+    + '<td>'+wb+'</td>'
     + '<td class="muted"><span class="trunc" title="'+esc(b.api_base||'')+'">'+esc(b.api_base||'')+'</span></td>'
     + '<td>'+tier+'</td>'
     + '<td class="num">'+esc(b.attempts)+'</td>'
@@ -1474,7 +1510,7 @@ function renderView(){
       : '<tr><td class="empty" colspan="7">no traffic yet</td></tr>';
     document.getElementById('backends').innerHTML = backends.length
       ? backends.map(backendRow).join('')
-      : '<tr><td class="empty" colspan="7">no attempts yet</td></tr>';
+      : '<tr><td class="empty" colspan="8">no attempts yet</td></tr>';
   } else if(r.view === 'identity'){
     const keys = data.keys||[], users = data.users||[];
     document.getElementById('keys').innerHTML = keys.length
@@ -1603,6 +1639,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/records"):
             recs = RECORDS.all()
             requests = _requests_view(recs)
+            # Goal 28: one fleet read per payload so the backend rollup can
+            # name workbenches. _fetch_fleet never raises and is capped at
+            # _FLEET_TIMEOUT_S (same exposure /api/fleet already accepts);
+            # control-plane down/unconfigured → empty join → null workbench.
+            fleet_join = _api_base_join(_fetch_fleet())
             return self._json(
                 200,
                 {
@@ -1628,7 +1669,7 @@ class Handler(BaseHTTPRequestHandler):
                     "models": _model_rollup(requests),
                     "users": _user_rollup(requests),
                     "sessions": _session_rollup(requests),
-                    "backends": _backend_rollup(recs),
+                    "backends": _backend_rollup(recs, fleet_join),
                     "records": recs,
                 },
             )

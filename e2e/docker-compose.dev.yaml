@@ -68,6 +68,9 @@ services:
       # its live in-flight count. workbench_id defaults to MOCKD_INSTANCE.
       HEARTBEAT_URL: "http://control-plane:9400"
       HEARTBEAT_MODELS: "qwen3-coder-a"
+      # Goal 28 — must spell the base URL exactly as litellm-config.dev.yaml
+      # does, so the dashboard's attempts→workbench join matches.
+      HEARTBEAT_API_BASE: "http://workbench-a:9100/v1"
     ports:
       - "9101:9100"        # host-published so you can drive /__control per-instance
     healthcheck:
@@ -87,6 +90,7 @@ services:
       MOCKD_DEBUG: "${MOCKD_DEBUG:-}"
       HEARTBEAT_URL: "http://control-plane:9400"
       HEARTBEAT_MODELS: "qwen3-coder-b"
+      HEARTBEAT_API_BASE: "http://workbench-b:9100/v1"
     ports:
       - "9102:9100"
     healthcheck:
@@ -107,6 +111,7 @@ services:
       # The always-up Foundry tier carries the three fallback aliases.
       HEARTBEAT_URL: "http://control-plane:9400"
       HEARTBEAT_MODELS: "claude-sonnet,claude-opus,gpt"
+      HEARTBEAT_API_BASE: "http://foundry:9100/v1"
     ports:
       - "9103:9100"
     healthcheck:

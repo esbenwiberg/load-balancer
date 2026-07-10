@@ -194,6 +194,72 @@ class TestRegistry(unittest.TestCase):
     def test_unknown_model_lookup_is_none(self):
         self.assertIsNone(self._model("nope"))
 
+    # --- api_base (goal 28): the attempts→workbench join key ----------------
+
+    def test_api_base_persists_and_surfaces_on_views(self):
+        self.reg.heartbeat("wb-a", [{"model": "m1", "api_base": "http://wb-a:8000/v1"}])
+        row = self.reg.registry()[0]
+        self.assertEqual(row["api_base"], "http://wb-a:8000/v1")
+        # ...and rides the /models per-instance drill-down unchanged.
+        inst = self._model("m1")["instances"][0]
+        self.assertEqual(inst["api_base"], "http://wb-a:8000/v1")
+
+    def test_api_base_absent_is_null(self):
+        self.reg.heartbeat("wb-a", [{"model": "m1"}])
+        self.assertIsNone(self.reg.registry()[0]["api_base"])
+
+    def test_api_base_junk_reads_as_absent(self):
+        # Non-string / empty values must not be stored as gibberish join keys.
+        self.reg.heartbeat("wb-a", [{"model": "m1", "api_base": 42}])
+        self.assertIsNone(self.reg.registry()[0]["api_base"])
+        self.reg.heartbeat("wb-a", [{"model": "m1", "api_base": "  "}])
+        self.assertIsNone(self.reg.registry()[0]["api_base"])
+
+    def test_api_base_is_full_snapshot_like_everything_else(self):
+        # A beat that omits api_base CLEARS a previously-declared one — same
+        # REPLACE semantics as warm/in_flight, no special-case stickiness.
+        self.reg.heartbeat("wb-a", [{"model": "m1", "api_base": "http://wb-a:8000/v1"}])
+        self.reg.heartbeat("wb-a", [{"model": "m1"}])
+        self.assertIsNone(self.reg.registry()[0]["api_base"])
+
+    def test_schema_migration_adds_api_base_to_old_db(self):
+        # A registry created before goal 28 (no api_base column) must open
+        # cleanly and gain the column in place — CONTROL_PLANE_DB is a durable
+        # file by default, so old schemas exist in the wild.
+        import sqlite3
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            db = sqlite3.connect(f.name)
+            db.execute(
+                """
+                CREATE TABLE registrations (
+                    workbench_id   TEXT    NOT NULL,
+                    model          TEXT    NOT NULL,
+                    warm           INTEGER NOT NULL DEFAULT 0,
+                    in_flight      INTEGER NOT NULL DEFAULT 0,
+                    agent_capable  INTEGER NOT NULL DEFAULT 0,
+                    reported_healthy INTEGER NOT NULL DEFAULT 1,
+                    last_seen_ms   INTEGER NOT NULL,
+                    PRIMARY KEY (workbench_id, model)
+                )
+                """
+            )
+            db.execute(
+                "INSERT INTO registrations VALUES ('wb-old', 'm1', 1, 0, 0, 1, 1000)"
+            )
+            db.commit()
+            db.close()
+
+            reg = Registry(db_path=f.name, ttl_ms=10_000, now_ms=FakeClock(2_000))
+            row = reg.registry()[0]
+            self.assertEqual(row["workbench_id"], "wb-old")  # old row survives
+            self.assertIsNone(row["api_base"])  # new column, null for old rows
+            reg.heartbeat(
+                "wb-old", [{"model": "m1", "api_base": "http://wb-old:8000/v1"}]
+            )
+            self.assertEqual(reg.registry()[0]["api_base"], "http://wb-old:8000/v1")
+
 
 class TestHttp(unittest.TestCase):
     """The wire adapter over a real server on an ephemeral port."""
@@ -305,6 +371,20 @@ class TestHttp(unittest.TestCase):
     def test_heartbeat_missing_workbench_400(self):
         code, _ = self._post("/heartbeat", {"models": [{"model": "m1"}]})
         self.assertEqual(code, 400)
+
+    def test_api_base_rides_the_models_drilldown(self):
+        # Goal 28 on the wire: a heartbeat declaring api_base must surface on
+        # the /models per-instance drill-down (what the dashboard reads).
+        self._post(
+            "/heartbeat",
+            {
+                "workbench_id": "wb-a",
+                "models": [{"model": "m1", "api_base": "http://wb-a:8000/v1"}],
+            },
+        )
+        code, body = self._get("/models/m1")
+        self.assertEqual(code, 200)
+        self.assertEqual(body["instances"][0]["api_base"], "http://wb-a:8000/v1")
 
 
 if __name__ == "__main__":

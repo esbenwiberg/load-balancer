@@ -54,6 +54,7 @@ _MODELS_PAYLOAD = {
                 {
                     "workbench_id": "wb-b",
                     "model": "qwen3-coder",
+                    "api_base": "http://wb-b:8000/v1",
                     "warm": False,
                     "in_flight": 0,
                     "healthy": False,
@@ -63,6 +64,7 @@ _MODELS_PAYLOAD = {
                 {
                     "workbench_id": "wb-a",
                     "model": "qwen3-coder",
+                    "api_base": "http://wb-a:8000/v1",
                     "warm": True,
                     "in_flight": 4,
                     "healthy": True,
@@ -131,6 +133,76 @@ class TestFetchFleet(unittest.TestCase):
         by_wb = {i["workbench_id"]: i for i in out["instances"]}
         self.assertTrue(by_wb["wb-a"]["healthy"])
         self.assertFalse(by_wb["wb-b"]["healthy"])
+        # goal 28: the heartbeat-declared api_base rides through untouched.
+        self.assertEqual(by_wb["wb-a"]["api_base"], "http://wb-a:8000/v1")
+
+
+# --- api_base → workbench join (goal 28) --------------------------------------
+# The control-plane heartbeat now carries an optional api_base per (workbench,
+# model); _api_base_join folds the fleet's instances into the join map, and
+# _backend_rollup names workbenches with it. These cover the map's honesty
+# rules (ambiguity, trailing slash, absence) and the rollup's degrade path.
+
+
+class TestApiBaseJoin(unittest.TestCase):
+    def test_builds_map_from_fleet_instances(self):
+        fleet = {
+            "available": True,
+            "instances": [
+                {"workbench_id": "wb-a", "api_base": "http://wb-a:8000/v1"},
+                {"workbench_id": "wb-b", "api_base": "http://wb-b:8000/v1/"},
+            ],
+        }
+        join = dashboard._api_base_join(fleet)
+        self.assertEqual(join["http://wb-a:8000/v1"], "wb-a")
+        # trailing slash normalized away on the registry side too.
+        self.assertEqual(join["http://wb-b:8000/v1"], "wb-b")
+
+    def test_instances_without_api_base_are_skipped(self):
+        fleet = {
+            "available": True,
+            "instances": [
+                {"workbench_id": "wb-old", "api_base": None},
+                {"workbench_id": "wb-a", "api_base": "http://wb-a:8000/v1"},
+            ],
+        }
+        self.assertEqual(
+            dashboard._api_base_join(fleet), {"http://wb-a:8000/v1": "wb-a"}
+        )
+
+    def test_ambiguous_api_base_is_dropped_not_guessed(self):
+        # Two workbenches claiming one api_base: naming either would be a lie.
+        fleet = {
+            "available": True,
+            "instances": [
+                {"workbench_id": "wb-a", "api_base": "http://shared:8000/v1"},
+                {"workbench_id": "wb-b", "api_base": "http://shared:8000/v1"},
+                {"workbench_id": "wb-c", "api_base": "http://wb-c:8000/v1"},
+            ],
+        }
+        join = dashboard._api_base_join(fleet)
+        self.assertNotIn("http://shared:8000/v1", join)
+        self.assertEqual(join["http://wb-c:8000/v1"], "wb-c")
+
+    def test_same_workbench_many_models_is_not_ambiguous(self):
+        # One box serving three models = three instance rows with the SAME
+        # (api_base, workbench) — that's agreement, not a conflict.
+        fleet = {
+            "available": True,
+            "instances": [
+                {"workbench_id": "wb-a", "api_base": "http://wb-a:8000/v1"},
+                {"workbench_id": "wb-a", "api_base": "http://wb-a:8000/v1"},
+                {"workbench_id": "wb-a", "api_base": "http://wb-a:8000/v1"},
+            ],
+        }
+        self.assertEqual(
+            dashboard._api_base_join(fleet), {"http://wb-a:8000/v1": "wb-a"}
+        )
+
+    def test_unavailable_fleet_is_empty_map(self):
+        self.assertEqual(dashboard._api_base_join({"available": False}), {})
+        self.assertEqual(dashboard._api_base_join({}), {})
+        self.assertEqual(dashboard._api_base_join(None), {})
 
 
 # --- identity in routing records (goal 15) ----------------------------------
@@ -964,6 +1036,52 @@ class TestBackendRollup(unittest.TestCase):
     def test_no_latency_yields_null_average(self):
         rows = dashboard._backend_rollup([{"event": "llm_call", "backend": "x"}])
         self.assertIsNone(rows[0]["latency_ms_avg"])
+
+    # --- the workbench join (goal 28) ----------------------------------------
+
+    def test_join_names_the_workbench(self):
+        records = [
+            {"event": "llm_call", "backend": "qwen", "api_base": "http://wb-a:8000/v1"},
+            {"event": "llm_call", "backend": "gpt", "api_base": "http://other:9000/v1"},
+        ]
+        rows = dashboard._backend_rollup(
+            records, {"http://wb-a:8000/v1": "workbench-a"}
+        )
+        by_backend = {r["backend"]: r for r in rows}
+        self.assertEqual(by_backend["qwen"]["workbench_id"], "workbench-a")
+        # no registry entry for that api_base → degrade to None, row intact.
+        self.assertIsNone(by_backend["gpt"]["workbench_id"])
+
+    def test_join_tolerates_trailing_slash_on_the_attempt_side(self):
+        records = [
+            {"event": "llm_call", "backend": "qwen", "api_base": "http://wb-a:8000/v1/"}
+        ]
+        rows = dashboard._backend_rollup(
+            records, {"http://wb-a:8000/v1": "workbench-a"}
+        )
+        self.assertEqual(rows[0]["workbench_id"], "workbench-a")
+
+    def test_no_join_map_degrades_to_null_workbench(self):
+        # Pre-goal-28 behaviour preserved: no map (control-plane down or
+        # unconfigured) → every row still renders, workbench just unnamed.
+        rows = dashboard._backend_rollup(
+            [
+                {
+                    "event": "llm_call",
+                    "backend": "qwen",
+                    "api_base": "http://wb-a:8000/v1",
+                }
+            ]
+        )
+        self.assertIsNone(rows[0]["workbench_id"])
+        self.assertEqual(rows[0]["attempts"], 1)
+
+    def test_attempt_without_api_base_stays_unjoined(self):
+        rows = dashboard._backend_rollup(
+            [{"event": "llm_call", "backend": "qwen"}],
+            {"http://wb-a:8000/v1": "workbench-a"},
+        )
+        self.assertIsNone(rows[0]["workbench_id"])
 
 
 class TestUnattributedRequests(unittest.TestCase):
