@@ -71,6 +71,45 @@ key_source: tag|transcript|null} — the telemetry backing the decided HYBRID
 routing granularity (docs/03): sticky sessions vs freely-routed one-shots.
 Same shadow discipline as goal 21. See _session + docs/09.
 
+SHADOW ROUTING POLICY — the stateless arm (goal 24): the first BUILT brick of
+the hybrid router (docs/12 §4), still in shadow. async_pre_call_hook computes,
+BEFORE routing, what the stateless cheapest-capable policy WOULD have chosen —
+applying docs/12 §4's order verbatim:
+
+  1. governance — the key's model allowlist (LiteLLM's key-scoped `models`,
+     read off UserAPIKeyAuth) filters the candidate set;
+  2. agent_capable gate — toolful/agentic complexity buckets require an
+     agent_capable backend (registry verdict when the model is registered,
+     config model_info otherwise);
+  3. health — control-plane derived `healthy` (docs/10 D3) excludes registered-
+     but-unhealthy backends; models the registry has never seen pass on config
+     (Foundry backends never heartbeat — only workbenches do);
+  4. cheaper tier first (local < foundry), tie-break lowest in_flight
+     (control-plane), then name — fully deterministic.
+
+The decision rides the routing record as `shadow_policy: {arm: "stateless",
+candidate_set, chosen, reason, registry, actual, agree}` — chosen (what the
+policy would do) next to actual (what really happened), so its choices are
+auditable against reality before anything enforces. ZERO routing influence:
+the hook never touches data["model"], never buffers a stream; a policy error
+degrades to "no block", never a failed request.
+
+When the control-plane registry is ABSENT (no CONTROL_PLANE_URL / unreachable
+with no recent snapshot) or STALE (unreachable and the last snapshot outlived
+POLICY_REGISTRY_STALE_S), the policy degrades to config-only candidates and the
+block's `registry` field says so ("absent"/"stale" vs "live"). Registry reads
+are TTL-cached (POLICY_REGISTRY_CACHE_S; the e2e stack sets 0 for determinism)
+with a short timeout so a hung control-plane costs bounded pre-call latency.
+
+The block crosses hook boundaries via the goal-16 correlation id in a bounded
+module-level map (_POLICY_BLOCKS) — the id is already proven to reach every
+surface (delivered via data, attempts via slo.trace_id), unlike the metadata
+dict whose shape varies across the three inbound protocols. The delivered
+record carries the authoritative actual/agree (actual = served_model);
+attempt records carry the block best-effort (actual = the attempt's backend on
+success — the only carrier for streamed traffic, which fires no delivered
+record on this pin). See _policy_stateless + docs/09.
+
 Sinks (independent, both optional):
 
   * stdout  — ALWAYS. One JSON object per line, prefixed `ROUTING_RECORD `.
@@ -96,7 +135,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
+import time
 import uuid
+from collections import OrderedDict
 
 from litellm.integrations.custom_logger import CustomLogger
 
@@ -395,6 +437,257 @@ def _session(headers, messages):
     }
 
 
+# --- SHADOW routing policy — the stateless arm (goal 24) ---------------------
+# docs/12 §4 as code, in shadow. _policy_stateless is a PURE function (offline
+# fast-tier tests pin every filter + the order); everything around it is the
+# plumbing that feeds it and carries its block onto the records.
+
+# Tier cost order for step 4 — cheaper first. Unknown tiers sort LAST (a
+# backend that never declared its tier can still be chosen, but never beats a
+# declared one).
+_TIER_RANK = {"local": 0, "foundry": 1}
+# LiteLLM key-allowlist wildcards: a key carrying either grants all models, so
+# governance must NOT treat them as a one-model allowlist.
+_ALLOWLIST_WILDCARDS = ("all-proxy-models", "*")
+# Complexity buckets that demand an agent_capable backend (docs/12 §4 step 2).
+_AGENT_BUCKETS = ("toolful", "agentic")
+
+
+def _policy_stateless(candidates, key_models, bucket, registry_models, registry_state):
+    """The stateless cheapest-capable policy (docs/12 §4), applied VERBATIM in
+    the spec's order — governance → agent_capable gate → health → cheapest
+    tier, tie-break lowest in_flight. Pure + deterministic: same inputs, same
+    block, and the reason names what each step did so every decision is
+    auditable from the record alone (the anti-Fugu constraint).
+
+    Inputs:
+      candidates      — [{model, tier, agent_capable}] from the gateway CONFIG
+                        (one entry per alias; see _config_candidates)
+      key_models      — the calling key's model allowlist (UserAPIKeyAuth.models;
+                        empty/None/wildcard ⇒ unrestricted)
+      bucket          — the request's shadow complexity bucket (goal 21) or None
+      registry_models — {model: aggregate} from the control-plane /models, or
+                        None when degraded to config-only
+      registry_state  — "live" | "absent" | "stale" (how registry_models came
+                        to be; stamped on the block so degrade is on-record)
+
+    Returns the shadow policy block with actual/agree left None — they are
+    filled in when reality (the served backend) is known, post-response."""
+    steps = []
+    pool = [dict(c) for c in candidates if isinstance(c, dict) and c.get("model")]
+
+    # 1. governance — the key's allowlist bounds where this caller may EVER
+    # route (the "never leaves the building" rule, docs/12 §1).
+    allow = None
+    if isinstance(key_models, list):
+        names = [m for m in key_models if isinstance(m, str) and m]
+        if names and not any(w in names for w in _ALLOWLIST_WILDCARDS):
+            allow = set(names)
+    if allow is not None:
+        before = len(pool)
+        pool = [c for c in pool if c["model"] in allow]
+        steps.append("governance key-allowlist %d->%d" % (before, len(pool)))
+    else:
+        steps.append("governance: key unrestricted")
+
+    # 2. agent_capable gate — only toolful/agentic buckets demand it. The
+    # verdict comes from the registry when the model is registered (any healthy
+    # instance capable), else the config declaration (the conformance gate's
+    # declared-by-config story for mocks, earned for real models).
+    if bucket in _AGENT_BUCKETS:
+        before = len(pool)
+
+        def _capable(c):
+            reg = (registry_models or {}).get(c["model"])
+            if isinstance(reg, dict) and "agent_capable" in reg:
+                return bool(reg.get("agent_capable"))
+            return bool(c.get("agent_capable"))
+
+        pool = [c for c in pool if _capable(c)]
+        steps.append(
+            "agent_capable gate (bucket=%s) %d->%d" % (bucket, before, len(pool))
+        )
+    else:
+        steps.append("agent_capable gate not applied (bucket=%s)" % bucket)
+
+    # 3. health — control-plane derived (docs/10 D3: reported-healthy AND
+    # heartbeat-fresh). Applies only to models the registry KNOWS: workbenches
+    # heartbeat, Foundry backends don't, so an unregistered model passes on
+    # config rather than being exiled for never having heartbeat. When the
+    # registry is absent/stale this step degrades to a no-op — config-only
+    # candidates — and the block's `registry` field says so.
+    if registry_models is not None:
+        before = len(pool)
+
+        def _healthy(c):
+            reg = registry_models.get(c["model"])
+            if isinstance(reg, dict) and "healthy" in reg:
+                return (reg.get("healthy") or 0) >= 1
+            return True  # unregistered ⇒ config-declared, no live signal
+
+        pool = [c for c in pool if _healthy(c)]
+        steps.append("health via control-plane %d->%d" % (before, len(pool)))
+    else:
+        steps.append("health degraded to config-only (registry %s)" % registry_state)
+
+    # 4. cheapest capable — cheaper tier first, tie-break lowest in_flight
+    # (control-plane; unregistered models carry no load signal and count 0),
+    # then name so the order is total and the choice deterministic.
+    def _in_flight(c):
+        reg = (registry_models or {}).get(c["model"])
+        v = reg.get("in_flight") if isinstance(reg, dict) else None
+        return v if isinstance(v, (int, float)) else 0
+
+    pool.sort(
+        key=lambda c: (
+            _TIER_RANK.get(c.get("tier"), len(_TIER_RANK)),
+            _in_flight(c),
+            c["model"],
+        )
+    )
+    chosen = pool[0] if pool else None
+    if chosen is not None:
+        steps.append(
+            "chose %s (tier=%s, in_flight=%d)"
+            % (chosen["model"], chosen.get("tier"), _in_flight(chosen))
+        )
+    else:
+        steps.append("no capable candidate survived")
+    return {
+        "arm": "stateless",
+        "candidate_set": [c["model"] for c in pool],
+        "chosen": chosen["model"] if chosen else None,
+        "reason": "; ".join(steps),
+        # How the health signal was sourced — "live" or the degrade mode
+        # ("absent"/"stale" ⇒ config-only candidates). The completion
+        # condition's "the record says so".
+        "registry": registry_state,
+        # Filled post-response, when reality is known (see the hooks).
+        "actual": None,
+        "agree": None,
+    }
+
+
+def _config_candidates() -> list:
+    """The candidate universe: every alias the gateway is CONFIGURED to serve,
+    with its tier + agent_capable declaration, read from the proxy's live
+    router (the same model_list the config file fed it). Deduped by alias —
+    multiple deployments of one alias collapse into a single candidate that is
+    agent_capable/tiered if ANY deployment declares it. Empty on any hiccup
+    (no proxy, no router yet): the policy then has nothing to say and the
+    record simply omits the block — never a crash on the request path."""
+    try:
+        from litellm.proxy import proxy_server
+
+        deployments = (
+            proxy_server.llm_router and proxy_server.llm_router.model_list
+        ) or []
+    except Exception:  # pragma: no cover - defensive
+        return []
+    out: dict = {}
+    for d in deployments:
+        if not isinstance(d, dict):
+            continue
+        name = d.get("model_name")
+        if not name:
+            continue
+        info = d.get("model_info") or {}
+        entry = out.setdefault(
+            name, {"model": name, "tier": None, "agent_capable": False}
+        )
+        if entry["tier"] is None and info.get("backend_tier"):
+            entry["tier"] = info.get("backend_tier")
+        if info.get("agent_capable"):
+            entry["agent_capable"] = True
+    return list(out.values())
+
+
+# Control-plane registry access for step 3 — TTL-cached so the pre-call cost is
+# one bounded HTTP read per cache window, not per request. The e2e stack sets
+# POLICY_REGISTRY_CACHE_S=0 so every request sees the test's freshest
+# heartbeats (mockd-speed, determinism over amortization there).
+_REGISTRY_URL = os.environ.get("CONTROL_PLANE_URL", "").rstrip("/")
+_REGISTRY_CACHE_S = float(os.environ.get("POLICY_REGISTRY_CACHE_S", "2.0"))
+_REGISTRY_STALE_S = float(os.environ.get("POLICY_REGISTRY_STALE_S", "10.0"))
+_REGISTRY_TIMEOUT_S = float(os.environ.get("POLICY_REGISTRY_TIMEOUT_S", "0.5"))
+_REGISTRY_CACHE = {"at": 0.0, "models": None}  # monotonic time of last SUCCESS
+
+
+async def _registry_snapshot():
+    """(registry_models, state) for the policy's health step. state is "live"
+    (fresh data — from cache within TTL, a fetch, or riding a recent snapshot
+    through a blip), "stale" (unreachable and the last snapshot outlived
+    POLICY_REGISTRY_STALE_S) or "absent" (no URL configured / unreachable with
+    nothing cached). Degraded states return models=None ⇒ config-only.
+    Async + short-timeout so a hung control-plane costs at most
+    POLICY_REGISTRY_TIMEOUT_S of pre-call latency per cache window, and never
+    wedges the event loop."""
+    if not _REGISTRY_URL or httpx is None:
+        return None, "absent"
+    now = time.monotonic()
+    age = now - _REGISTRY_CACHE["at"]
+    if _REGISTRY_CACHE["models"] is not None and age <= _REGISTRY_CACHE_S:
+        return _REGISTRY_CACHE["models"], "live"
+    try:
+        async with httpx.AsyncClient(timeout=_REGISTRY_TIMEOUT_S) as client:
+            resp = await client.get(_REGISTRY_URL + "/models")
+            payload = resp.json()
+        models = {
+            m["model"]: m
+            for m in (payload.get("models") or [])
+            if isinstance(m, dict) and m.get("model")
+        }
+        _REGISTRY_CACHE["at"] = time.monotonic()
+        _REGISTRY_CACHE["models"] = models
+        return models, "live"
+    except Exception:
+        if _REGISTRY_CACHE["models"] is None:
+            return None, "absent"
+        if age <= _REGISTRY_STALE_S:
+            # A blip, not an outage: the last good snapshot is recent enough to
+            # still be a fair health signal — ride it.
+            return _REGISTRY_CACHE["models"], "live"
+        return None, "stale"
+
+
+# The computed block, keyed by the goal-16 correlation id, so the delivered
+# hook and the attempt events (which see the same id — that is goal 16's whole
+# point) can stamp it onto their records. Bounded FIFO: entries are never
+# popped on delivery (streamed requests deliver no `delivered` record and
+# attempts log late), they just age out. Lock because the sync log_* variants
+# may run off the event loop's thread.
+_POLICY_BLOCKS: OrderedDict = OrderedDict()
+_POLICY_BLOCKS_CAP = 4096
+_POLICY_LOCK = threading.Lock()
+
+
+def _policy_remember(cid, block) -> None:
+    if not cid or not isinstance(block, dict):
+        return
+    with _POLICY_LOCK:
+        _POLICY_BLOCKS[cid] = block
+        while len(_POLICY_BLOCKS) > _POLICY_BLOCKS_CAP:
+            _POLICY_BLOCKS.popitem(last=False)
+
+
+def _policy_recall(cid):
+    if not cid:
+        return None
+    with _POLICY_LOCK:
+        return _POLICY_BLOCKS.get(cid)
+
+
+def _policy_with_outcome(block, actual):
+    """The block plus reality: actual = the backend that (this record says)
+    served, agree = chosen == actual. None-safe on both sides — a block with no
+    survivor (chosen None) or a record with no served backend yields
+    agree: null, never a fake verdict."""
+    b = dict(block)
+    b["actual"] = actual
+    b["agree"] = (b.get("chosen") == actual) if (b.get("chosen") and actual) else None
+    return b
+
+
 def _llm_call_record(kwargs, fallback_status: str) -> dict:
     """Build an `llm_call` record from a success/failure event's kwargs."""
     slo = kwargs.get("standard_logging_object") or {}
@@ -455,6 +748,15 @@ def _llm_call_record(kwargs, fallback_status: str) -> dict:
     )
     if sess is not None:
         record["session"] = sess
+    # SHADOW policy (goal 24) — attempt-side stamping, best-effort, for the
+    # same reason as complexity/session: streamed requests fire no `delivered`
+    # record on this pin, so a streamed request's success attempt is its only
+    # policy carrier. actual = this attempt's backend on success; a FAILED
+    # attempt served nothing, so it carries the decision with actual/agree null.
+    block = _policy_recall(slo.get("trace_id"))
+    if block is not None:
+        actual = slo.get("model_group") if slo.get("status") == "success" else None
+        record["shadow_policy"] = _policy_with_outcome(block, actual)
     return record
 
 
@@ -476,6 +778,28 @@ class RoutingRecorder(CustomLogger):
         try:
             if isinstance(data, dict) and not data.get(_CORRELATION_KEY):
                 data[_CORRELATION_KEY] = "obs-" + uuid.uuid4().hex
+        except Exception:  # pragma: no cover - defensive
+            pass
+        # SHADOW routing policy (goal 24): compute, PRE-CALL, what the stateless
+        # cheapest-capable arm would choose — then do NOTHING with it except
+        # remember it for the records (keyed by the correlation id above, which
+        # every record of this request will carry). data["model"] is never
+        # touched, the stream is never buffered, and any error degrades to "no
+        # block" — the request path is sacred.
+        try:
+            if isinstance(data, dict) and data.get(_CORRELATION_KEY):
+                candidates = _config_candidates()
+                if candidates:
+                    cx = _complexity(data.get("messages"), data.get("tools"))
+                    registry_models, registry_state = await _registry_snapshot()
+                    block = _policy_stateless(
+                        candidates,
+                        getattr(user_api_key_dict, "models", None),
+                        (cx or {}).get("bucket"),
+                        registry_models,
+                        registry_state,
+                    )
+                    _policy_remember(data[_CORRELATION_KEY], block)
         except Exception:  # pragma: no cover - defensive
             pass
         return data
@@ -547,6 +871,13 @@ class RoutingRecorder(CustomLogger):
         )
         if sess is not None:
             record["session"] = sess
+        # SHADOW policy (goal 24): the authoritative chosen-vs-actual verdict.
+        # actual = the backend that really served (served_model — reliable even
+        # on the fallback path, which is why `delivered` exists at all);
+        # agree = the policy's chosen == reality. Still pure telemetry.
+        block = _policy_recall(data.get(_CORRELATION_KEY))
+        if block is not None:
+            record["shadow_policy"] = _policy_with_outcome(block, served)
         _emit(record)
 
 

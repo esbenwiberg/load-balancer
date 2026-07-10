@@ -64,9 +64,12 @@ engine fork is DECIDED (2026-07-09): LiteLLM custom policy layer** — archgw
 was renamed into Plano (early-stage, session affinity undocumented); re-look
 gate ≥ 2027-01 + documented affinity ([docs/03](docs/03-open-questions-and-risks.md)
 engine decision block, [docs/12 §7](docs/12-hybrid-router-spec.md)). That
-unblocks the **policy-layer build arc: goals 24 → 25 → 26** (shadow stateless
+unblocked the **policy-layer build arc: goals 24 → 25 → 26** (shadow stateless
 policy → shadow pins + escalation mechanics → enforcement flip behind a flag),
-all autonomy-friendly. The **escalation trigger** stays § Needs-a-human
+all autonomy-friendly. **Goal 24 is DONE** — the stateless arm runs in shadow
+(docs/09 "Shadow routing policy"), its chosen-vs-actual agreement is on the
+dashboard, and it is the first live consumer of the control-plane registry.
+Next up: **goal 25**. The **escalation trigger** stays § Needs-a-human
 (telemetry-gated); goal 25's stub client-signaled trigger builds the mechanics
 without pre-deciding it. Spark-infra-shaped work stays parked.
 
@@ -78,23 +81,8 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 ## § Autonomy-friendly (safe to run unattended)
 
 _The policy-layer build arc (engine decided 2026-07-09: LiteLLM custom policy
-layer). Order matters: 24 → 25 → 26 — each consumes the previous._
-
-### 24. Shadow routing policy — the stateless arm, zero influence — risk: low
-**Why:** the engine is decided ([docs/03](docs/03-open-questions-and-risks.md)
-engine decision block): we own the policy layer as LiteLLM hook code. The
-safest first brick is [docs/12 §4](docs/12-hybrid-router-spec.md)'s stateless
-cheapest-capable policy computed at ingress but SHADOW — the decision rides
-the routing record next to what actually happened, so its choices are
-auditable against reality before anything enforces. Same anti-Fugu
-constraints as goals 21/22: deterministic, inputs-on-record, zero routing
-influence, never buffer the stream. This is also the first *consumer* of the
-control-plane registry (R7) — the degrade story when the registry is absent
-must be explicit, not accidental.
-**Completion condition:**
-```
-routing records gain a shadow policy block {arm: "stateless", candidate_set, chosen, reason, actual, agree} computed pre-call in an owned hook applying docs/12 §4's order verbatim (key/tag governance allowlist → agent_capable gate for toolful/agentic complexity buckets → control-plane derived health → cheaper tier first, tie-break lowest in_flight) with zero routing influence and no stream buffering; when the control-plane registry is absent or stale the policy degrades to config-only candidates and the record says so; the dashboard surfaces chosen-vs-actual agreement per request plus an agreement rollup; e2e proves (a) records carry the block with a non-empty candidate_set, (b) a request addressed to an expensive alias while a cheaper capable backend is healthy yields agree:false with the cheaper backend named in chosen, (c) a key with a restricted model allowlist yields a candidate_set that excludes the restricted backend; the policy function has offline fast-tier tests; docs/09 documents the record shape; e2e/run.sh exits 0 surfaced; squash-merged with the merge confirmation surfaced; if blocked, stop after 30 turns and leave a draft PR
-```
+layer). Order matters: 24 → 25 → 26 — each consumes the previous. 24 is done;
+25 is next._
 
 ### 25. Shadow sticky pins + escalation mechanics (stub trigger) — risk: low
 **Why:** the session arm ([docs/12 §2/§3/§5](docs/12-hybrid-router-spec.md))
@@ -195,6 +183,27 @@ decision is made.
    its condition literally holds on `main` — if in doubt, re-check it, don't
    trust the checkmark.
 
+- ✅ 24. Shadow routing policy — the stateless arm, zero influence — routing
+  records carry `shadow_policy: {arm: "stateless", candidate_set, chosen,
+  reason, registry, actual, agree}` computed PRE-CALL in
+  `obs_callback.async_pre_call_hook`, applying docs/12 §4 verbatim (key
+  governance allowlist → agent_capable gate for toolful/agentic buckets →
+  control-plane derived health → cheaper tier first, tie-break lowest
+  in_flight, then name — total order). First live consumer of the goal-5
+  registry (TTL-cached read, e2e cache 0 for determinism); absent/stale
+  registry degrades to config-only candidates with `registry:
+  "absent"|"stale"` on the record. Block crosses hooks via the goal-16
+  correlation id (bounded map) — delivered carries the authoritative
+  actual/agree, attempts carry it best-effort (the streamed-traffic carrier).
+  Dashboard: per-request policy badge (chosen + reason + registry on hover) +
+  `policy_agreement` rollup {evaluated, agree, disagree, unevaluated,
+  agreement_rate}. Tests: 19 offline policy cases (order, filters, degrade,
+  determinism) + dashboard shaping + e2e (a) block with non-empty ranked
+  candidate_set, (b) claude-opus request while healthy qwen3-coder registered
+  ⇒ agree:false chosen:qwen3-coder AND served untouched (zero influence), (c)
+  governed key's candidate_set excludes out-of-allowlist backends. Docs:
+  docs/09 "Shadow routing policy". Tag-scoped governance deferred
+  (premium-gated on the pin, docs/12 R6). — PR #44 (2026-07)
 - ✅ 23. Hybrid-router design spec — [docs/12](docs/12-hybrid-router-spec.md):
   request classification (consumes goals 21+22 verbatim — promotion to routing
   input is semantic, not a rewrite), the decision table, sticky-pin semantics

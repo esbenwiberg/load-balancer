@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Unit tests for obs_callback's SHADOW complexity classifier (goal 21).
+Unit tests for obs_callback's SHADOW classifiers: complexity (goal 21), session
+(goal 22), and the stateless routing policy (goal 24).
 
 Stdlib `unittest` only — no pytest, no docker, no network, and NO litellm: the
 callback's only litellm dependency is the CustomLogger base class, so a stub
-module satisfies the import and the classifier under test (`_complexity`, a
-pure function over request features) runs offline. The e2e suite proves the
-live path — the gateway stamps the tag onto real routing records; these tests
-pin the decision tree itself: every bucket, every precedence rule, and the
-never-crash degradations.
+module satisfies the import and the functions under test (`_complexity`,
+`_session`, `_policy_stateless` — pure functions over request/config/registry
+features) run offline. The e2e suite proves the live paths — the gateway stamps
+the tags onto real routing records; these tests pin the decision logic itself:
+every bucket, every filter, every precedence rule, and the never-crash
+degradations.
 
 Run:  python3 obs_callback_test.py        (also pytest-discoverable)
 """
@@ -29,7 +31,12 @@ sys.modules.setdefault("litellm", types.ModuleType("litellm"))
 sys.modules.setdefault("litellm.integrations", types.ModuleType("litellm.integrations"))
 sys.modules.setdefault("litellm.integrations.custom_logger", _stub)
 
-from obs_callback import _complexity, _session  # noqa: E402  (needs the stub above)
+from obs_callback import (  # noqa: E402  (needs the stub above)
+    _complexity,
+    _policy_stateless,
+    _policy_with_outcome,
+    _session,
+)
 
 
 def _user(text):
@@ -253,6 +260,170 @@ class TestSessionDegradations(unittest.TestCase):
     def test_deterministic(self):
         msgs = [_user("same"), {"role": "assistant", "content": "same"}]
         self.assertEqual(_session(_SESSION_HDRS, msgs), _session(_SESSION_HDRS, msgs))
+
+
+# --- shadow routing policy — the stateless arm (goal 24) ---------------------
+# The e2e suite proves the live path (the block rides real routing records,
+# chosen-vs-actual against a real registry); these pin the POLICY FUNCTION
+# itself: docs/12 §4's order verbatim, every filter, the deterministic
+# tie-breaks, and the config-only degrade that must say so on the record.
+
+# The e2e config's shape: one cheap local workbench, three foundry backends.
+_CANDIDATES = [
+    {"model": "qwen3-coder", "tier": "local", "agent_capable": True},
+    {"model": "claude-sonnet", "tier": "foundry", "agent_capable": True},
+    {"model": "claude-opus", "tier": "foundry", "agent_capable": True},
+    {"model": "gpt", "tier": "foundry", "agent_capable": True},
+]
+
+
+def _reg(**models):
+    """Registry aggregates keyed by model, e.g. _reg(qwen3_coder={...}) — dashes
+    aren't identifier-safe, so keys use underscores and map back here."""
+    return {k.replace("_", "-"): v for k, v in models.items()}
+
+
+class TestPolicyOrder(unittest.TestCase):
+    def test_cheapest_capable_wins_local_before_foundry(self):
+        b = _policy_stateless(_CANDIDATES, [], "trivial", None, "absent")
+        self.assertEqual(b["chosen"], "qwen3-coder")
+        self.assertEqual(b["arm"], "stateless")
+        self.assertEqual(b["candidate_set"][0], "qwen3-coder")
+
+    def test_governance_allowlist_excludes_restricted_backends(self):
+        b = _policy_stateless(
+            _CANDIDATES, ["claude-sonnet", "gpt"], "trivial", None, "absent"
+        )
+        self.assertEqual(sorted(b["candidate_set"]), ["claude-sonnet", "gpt"])
+        self.assertNotIn("qwen3-coder", b["candidate_set"])
+        self.assertIn("governance key-allowlist 4->2", b["reason"])
+
+    def test_wildcard_allowlist_is_unrestricted(self):
+        for wl in ([], None, ["all-proxy-models"], ["*", "gpt"]):
+            b = _policy_stateless(_CANDIDATES, wl, "trivial", None, "absent")
+            self.assertEqual(len(b["candidate_set"]), 4, wl)
+
+    def test_agent_gate_applies_only_to_toolful_and_agentic(self):
+        cands = _CANDIDATES + [
+            {"model": "tiny", "tier": "local", "agent_capable": False}
+        ]
+        # trivial: the incapable-but-cheap backend may win (gate not applied)...
+        trivial = _policy_stateless(cands, [], "trivial", None, "absent")
+        self.assertIn("tiny", trivial["candidate_set"])
+        # ...toolful/agentic: it is gated out.
+        for bucket in ("toolful", "agentic"):
+            b = _policy_stateless(cands, [], bucket, None, "absent")
+            self.assertNotIn("tiny", b["candidate_set"], bucket)
+            self.assertEqual(b["chosen"], "qwen3-coder")
+
+    def test_registry_agent_verdict_overrides_config_declaration(self):
+        # The registry saw the model live (any healthy instance capable) — that
+        # verdict beats the config's static declaration, both directions.
+        reg = _reg(qwen3_coder={"healthy": 1, "agent_capable": False})
+        b = _policy_stateless(_CANDIDATES, [], "agentic", reg, "live")
+        self.assertNotIn("qwen3-coder", b["candidate_set"])
+
+    def test_unhealthy_registered_backend_is_excluded(self):
+        reg = _reg(qwen3_coder={"healthy": 0, "in_flight": 0})
+        b = _policy_stateless(_CANDIDATES, [], "trivial", reg, "live")
+        self.assertNotIn("qwen3-coder", b["candidate_set"])
+        self.assertEqual(b["chosen"], "claude-opus")  # cheapest surviving tier, by name
+        self.assertIn("health via control-plane 4->3", b["reason"])
+
+    def test_unregistered_backend_passes_health_on_config(self):
+        # Foundry backends never heartbeat — absence from the registry must not
+        # exile them (or the policy could only ever choose workbenches).
+        reg = _reg(qwen3_coder={"healthy": 1})
+        b = _policy_stateless(_CANDIDATES, [], "trivial", reg, "live")
+        self.assertEqual(len(b["candidate_set"]), 4)
+
+    def test_in_flight_tiebreak_within_tier(self):
+        cands = [
+            {"model": "wb-a", "tier": "local", "agent_capable": True},
+            {"model": "wb-b", "tier": "local", "agent_capable": True},
+        ]
+        reg = {
+            "wb-a": {"healthy": 1, "in_flight": 5},
+            "wb-b": {"healthy": 1, "in_flight": 2},
+        }
+        b = _policy_stateless(cands, [], "trivial", reg, "live")
+        self.assertEqual(b["chosen"], "wb-b")
+
+    def test_name_tiebreak_makes_order_total(self):
+        b = _policy_stateless(
+            _CANDIDATES, ["claude-sonnet", "claude-opus"], "trivial", None, "absent"
+        )
+        # Same tier, same (absent) load — alphabetical, deterministic.
+        self.assertEqual(b["candidate_set"], ["claude-opus", "claude-sonnet"])
+
+    def test_empty_survivor_set_yields_null_chosen_with_reason(self):
+        b = _policy_stateless(_CANDIDATES, ["no-such-model"], "trivial", None, "absent")
+        self.assertEqual(b["candidate_set"], [])
+        self.assertIsNone(b["chosen"])
+        self.assertIn("no capable candidate survived", b["reason"])
+
+    def test_deterministic(self):
+        args = (
+            _CANDIDATES,
+            ["gpt", "qwen3-coder"],
+            "toolful",
+            _reg(qwen3_coder={"healthy": 1, "in_flight": 3}),
+            "live",
+        )
+        self.assertEqual(_policy_stateless(*args), _policy_stateless(*args))
+
+
+class TestPolicyDegrade(unittest.TestCase):
+    def test_absent_registry_degrades_to_config_only_and_says_so(self):
+        b = _policy_stateless(_CANDIDATES, [], "trivial", None, "absent")
+        self.assertEqual(b["registry"], "absent")
+        self.assertEqual(len(b["candidate_set"]), 4)  # nothing health-filtered
+        self.assertIn("health degraded to config-only (registry absent)", b["reason"])
+
+    def test_stale_registry_degrades_to_config_only_and_says_so(self):
+        b = _policy_stateless(_CANDIDATES, [], "trivial", None, "stale")
+        self.assertEqual(b["registry"], "stale")
+        self.assertIn("health degraded to config-only (registry stale)", b["reason"])
+
+    def test_live_registry_is_stamped_live(self):
+        b = _policy_stateless(_CANDIDATES, [], "trivial", {}, "live")
+        self.assertEqual(b["registry"], "live")
+
+    def test_garbage_candidates_never_crash(self):
+        b = _policy_stateless(
+            [42, None, {"no_model": True}] + _CANDIDATES,
+            "not-a-list",
+            None,
+            None,
+            "absent",
+        )
+        self.assertEqual(b["chosen"], "qwen3-coder")
+
+
+class TestPolicyOutcome(unittest.TestCase):
+    def test_agreement_when_reality_matches(self):
+        block = _policy_stateless(_CANDIDATES, [], "trivial", None, "absent")
+        b = _policy_with_outcome(block, "qwen3-coder")
+        self.assertEqual(b["actual"], "qwen3-coder")
+        self.assertIs(b["agree"], True)
+
+    def test_disagreement_names_both_sides(self):
+        block = _policy_stateless(_CANDIDATES, [], "trivial", None, "absent")
+        b = _policy_with_outcome(block, "claude-opus")
+        self.assertIs(b["agree"], False)
+        self.assertEqual(b["chosen"], "qwen3-coder")
+        self.assertEqual(b["actual"], "claude-opus")
+
+    def test_no_verdict_without_reality_or_chosen(self):
+        block = _policy_stateless(_CANDIDATES, [], "trivial", None, "absent")
+        self.assertIsNone(_policy_with_outcome(block, None)["agree"])
+        empty = _policy_stateless(_CANDIDATES, ["no-such"], "trivial", None, "absent")
+        self.assertIsNone(_policy_with_outcome(empty, "gpt")["agree"])
+
+    def test_outcome_does_not_mutate_the_remembered_block(self):
+        block = _policy_stateless(_CANDIDATES, [], "trivial", None, "absent")
+        _policy_with_outcome(block, "gpt")
+        self.assertIsNone(block["actual"])  # delivered + attempts each stamp fresh
 
 
 if __name__ == "__main__":

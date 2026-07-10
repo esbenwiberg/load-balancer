@@ -570,5 +570,60 @@ class TestSessionShaping(unittest.TestCase):
         )
 
 
+# --- shadow routing policy: the agreement fold (goal 24) ---------------------
+# The policy function itself (docs/12 §4 order, filters, degrade) pins in
+# obs_callback_test.py; these cover the dashboard FOLD — the per-request
+# passthrough and the chosen-vs-actual agreement rollup, including the
+# honest-denominator conventions (no-block and no-verdict records counted,
+# never dropped; empty stream yields a null rate, not a fake 100%).
+
+
+def _policy_block(**kw):
+    block = {
+        "arm": "stateless",
+        "candidate_set": ["qwen3-coder", "claude-sonnet"],
+        "chosen": "qwen3-coder",
+        "reason": "governance: key unrestricted; chose qwen3-coder",
+        "registry": "live",
+        "actual": "qwen3-coder",
+        "agree": True,
+    }
+    block.update(kw)
+    return block
+
+
+class TestPolicyShaping(unittest.TestCase):
+    def test_request_row_carries_policy_block(self):
+        block = _policy_block(actual="claude-opus", agree=False)
+        row = dashboard._requests_view([_delivered(shadow_policy=block)])[0]
+        self.assertEqual(row["policy"], block)
+
+    def test_untagged_record_degrades_to_none(self):
+        self.assertIsNone(dashboard._requests_view([_delivered()])[0]["policy"])
+
+    def test_agreement_rollup_counts_verdicts(self):
+        records = [
+            _delivered(shadow_policy=_policy_block()),
+            _delivered(shadow_policy=_policy_block()),
+            _delivered(shadow_policy=_policy_block(actual="claude-opus", agree=False)),
+            _delivered(
+                shadow_policy=_policy_block(chosen=None, agree=None)
+            ),  # no verdict
+            _delivered(),  # no block (older stack) -> unevaluated, never dropped
+            {"event": "llm_call", "shadow_policy": _policy_block()},  # not delivered
+        ]
+        pa = dashboard._policy_agreement(records)
+        self.assertEqual(pa["evaluated"], 3)
+        self.assertEqual(pa["agree"], 2)
+        self.assertEqual(pa["disagree"], 1)
+        self.assertEqual(pa["unevaluated"], 2)
+        self.assertEqual(pa["agreement_rate"], round(2 / 3, 3))
+
+    def test_agreement_rollup_empty_is_calm(self):
+        pa = dashboard._policy_agreement([])
+        self.assertEqual(pa["evaluated"], 0)
+        self.assertIsNone(pa["agreement_rate"])
+
+
 if __name__ == "__main__":
     unittest.main()

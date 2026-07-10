@@ -2536,3 +2536,147 @@ def test_session_metadata_capture_through_gateway():
             )
         # every capture must carry the shape the dump documents
         assert isinstance(q.get("body"), dict), "captured request must record a body"
+
+
+# --- shadow routing policy — the stateless arm (goal 24) ---------------------
+# docs/12 §4 built as SHADOW: obs_callback's pre-call hook computes what the
+# stateless cheapest-capable policy WOULD choose (governance allowlist ->
+# agent_capable gate -> control-plane health -> cheaper tier, tie-break lowest
+# in_flight) and the decision rides the routing record next to what actually
+# happened. Zero routing influence — every assertion below also checks the
+# request was SERVED by exactly the backend it asked for. The policy function
+# itself pins offline in obs_callback_test.py; these prove the live path:
+# real registry heartbeats, real key allowlists, real records.
+
+
+def _policy_of(data, requested_model):
+    """The newest request row for `requested_model` that carries a policy
+    block, or None."""
+    for rq in data.get("requests", []):
+        if rq.get("requested_model") == requested_model and rq.get("policy"):
+            return rq
+    return None
+
+
+def test_routing_records_carry_shadow_policy_block():
+    """Condition (a): records carry the shadow policy block with a non-empty
+    candidate_set. A healthy, agent-capable workbench is registered; a plain
+    request addressed to it must yield chosen == actual == qwen3-coder,
+    agree:true, registry:live — and the block names its reasoning."""
+    _beat("wb-e2e-policy", "qwen3-coder", warm=True, agent_capable=True, healthy=True)
+
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": "qwen3-coder",
+            "messages": [{"role": "user", "content": "say hi"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+
+    data = _poll_dash(lambda d: _policy_of(d, "qwen3-coder") is not None)
+    row = _policy_of(data, "qwen3-coder")
+    assert row is not None, "no request row carried a shadow policy block: %r" % (
+        data.get("requests"),
+    )
+    pol = row["policy"]
+
+    # The block, whole: every field the condition names, plus the degrade flag.
+    assert pol["arm"] == "stateless", pol
+    assert pol["candidate_set"], "candidate_set must be non-empty: %r" % pol
+    assert pol["chosen"] == "qwen3-coder", pol
+    assert pol["actual"] == "qwen3-coder", pol
+    assert pol["agree"] is True, pol
+    assert pol["registry"] == "live", pol
+    assert "chose qwen3-coder" in pol["reason"], pol
+
+    # SHADOW means shadow: the request was served by what it asked for.
+    assert row["served_model"] == "qwen3-coder", row
+    assert not row.get("fallback"), row
+
+
+def test_shadow_policy_disagrees_when_cheaper_capable_backend_is_healthy():
+    """Condition (b): a request addressed to an EXPENSIVE alias (claude-opus,
+    foundry tier) while a cheaper capable backend (qwen3-coder, local tier) is
+    registered healthy must yield agree:false with the cheaper backend named in
+    chosen — while the request is still SERVED by claude-opus (zero influence).
+    This is the exact shape the future enforcement flip (goal 26) will act on,
+    proven auditable first. Also drives the dashboard's agreement rollup."""
+    _beat("wb-e2e-policy", "qwen3-coder", warm=True, agent_capable=True, healthy=True)
+
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": "claude-opus",
+            "messages": [{"role": "user", "content": "say hi"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+
+    data = _poll_dash(lambda d: _policy_of(d, "claude-opus") is not None)
+    row = _policy_of(data, "claude-opus")
+    assert row is not None, data.get("requests")
+    pol = row["policy"]
+
+    # The policy saw the cheaper capable backend and would have routed there.
+    assert pol["agree"] is False, pol
+    assert pol["chosen"] == "qwen3-coder", pol
+    assert pol["actual"] == "claude-opus", pol
+    assert pol["registry"] == "live", pol
+    # The cheaper backend leads the ranked candidate set (cheaper tier first).
+    assert pol["candidate_set"][0] == "qwen3-coder", pol
+
+    # ZERO INFLUENCE: reality was untouched — claude-opus served its own request.
+    assert row["served_model"] == "claude-opus", row
+    assert not row.get("fallback"), row
+
+    # The agreement rollup surfaces the disagreement (goal 24's dashboard half).
+    pa = data.get("policy_agreement") or {}
+    assert pa.get("disagree", 0) >= 1, pa
+    assert pa.get("evaluated", 0) >= 1, pa
+
+
+def test_shadow_policy_candidate_set_respects_key_allowlist():
+    """Condition (c): a key with a restricted model allowlist yields a
+    candidate_set that EXCLUDES the restricted backends — the governance filter
+    (docs/12 §4 step 1, the "never leaves the building" rule) is on-record per
+    request, not just enforced at auth time."""
+    # _unique: key aliases are globally unique in the Postgres key store, which
+    # outlives the test run — a fixed alias fails the second run against the
+    # same stack.
+    key, _ = _generate_key(
+        models=["claude-sonnet", "claude-opus"], key_alias=_unique("policy-governed")
+    )
+
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers={"Authorization": "Bearer " + key},
+        json={
+            "model": "claude-sonnet",
+            "messages": [{"role": "user", "content": "say hi"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+
+    data = _poll_dash(lambda d: _policy_of(d, "claude-sonnet") is not None)
+    row = _policy_of(data, "claude-sonnet")
+    assert row is not None, data.get("requests")
+    pol = row["policy"]
+
+    # Governance: the workbench (and gpt) are outside this key's world — the
+    # candidate set must not contain them, and must not be empty either.
+    assert pol["candidate_set"], pol
+    assert "qwen3-coder" not in pol["candidate_set"], pol
+    assert "gpt" not in pol["candidate_set"], pol
+    assert set(pol["candidate_set"]) <= {"claude-sonnet", "claude-opus"}, pol
+    assert "governance key-allowlist" in pol["reason"], pol
+
+    # Within the allowed (all-foundry) pool the tie-break is deterministic:
+    # claude-opus by name — and reality (claude-sonnet served) stays untouched.
+    assert row["served_model"] == "claude-sonnet", row
+    assert not row.get("fallback"), row

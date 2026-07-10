@@ -202,6 +202,11 @@ services:
       # /__observe central sink (mockd here are the BACKENDS), so the dashboard
       # is the sole webhook target; stdout ROUTING_RECORD lines still emit too.
       OBS_WEBHOOK_URL: "http://dashboard:9300/records"
+      # Shadow routing policy (goal 24): the dev stack has a live control-plane
+      # with real mockd heartbeats, so the policy's health step runs against
+      # genuine fleet state here. Default cache TTL (2s) — dev traffic is human-
+      # paced, amortizing the registry read is the right trade.
+      CONTROL_PLANE_URL: "http://control-plane:9400"
     command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]
