@@ -2822,3 +2822,311 @@ def test_shadow_escalation_flips_the_pin_upward_exactly_once():
     pol = _await_session_row(bystander, "claude-sonnet")["policy"]
     assert pol["pinned_backend"] == "qwen3-coder", pol
     assert pol["escalated"] is False, pol
+
+
+# --- ENFORCEMENT — the policy drives routing, behind a flag (goal 26) --------
+# These tests hit the ENFORCE-MODE gateway (a second container in the e2e
+# stack, ROUTER_POLICY=enforce, port 4001) — the default suite above keeps
+# hitting the shadow gateway, which is the completion condition's "existing
+# suite passes unchanged under the default", enforced by construction. Under
+# enforce the pre-call hook rewrites the requested model to the policy's
+# choice; mockd's served_model stamp in the RESPONSE BODY is the client-
+# visible proof of who actually served, and the policy block carries the
+# requested vs chosen vs served triple with enforced:true.
+
+GATEWAY_ENFORCE = os.environ.get("GATEWAY_ENFORCE_URL", "http://localhost:4001")
+
+
+def _enforce_request(model, content, tags=None, key=None, stream=False):
+    """One chat request against the ENFORCE gateway; returns the response."""
+    headers = {"Authorization": "Bearer " + (key or KEY)}
+    if tags:
+        headers["x-litellm-tags"] = tags
+    body = {"model": model, "messages": [{"role": "user", "content": content}]}
+    if stream:
+        body["stream"] = True
+    r = httpx.post(
+        GATEWAY_ENFORCE + "/v1/chat/completions",
+        headers=headers,
+        json=body,
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+    return r
+
+
+def _enforce_policy_of(data, requested, key=None):
+    """The newest request row whose policy block is an ENFORCED decision for
+    `requested` (the client's original ask — the block's stash, NOT the
+    record's post-rewrite requested_model), optionally pinned on `key`."""
+    for rq in data.get("requests", []):
+        pol = rq.get("policy") or {}
+        if not pol.get("enforced"):
+            continue
+        if pol.get("requested") != requested:
+            continue
+        if key is not None and pol.get("stickiness_key") != key:
+            continue
+        return rq
+    return None
+
+
+def _await_enforce_row(requested, key=None):
+    data = _poll_dash(lambda d: _enforce_policy_of(d, requested, key) is not None)
+    row = _enforce_policy_of(data, requested, key)
+    assert row is not None, "no enforced policy row for (%s, %s): %r" % (
+        requested,
+        key,
+        data.get("requests"),
+    )
+    return row
+
+
+def test_enforce_one_shot_served_by_cheapest_capable():
+    """Condition (a): a one-shot addressed to an EXPENSIVE alias (claude-opus)
+    is actually SERVED by the cheapest capable backend (the healthy local
+    workbench), with the decision cited on its record: enforced:true plus the
+    requested vs chosen vs served triple."""
+    _beat("wb-e2e-policy", "qwen3-coder", warm=True, agent_capable=True, healthy=True)
+
+    r = _enforce_request("claude-opus", "enforce one-shot")
+    body = r.json()
+    # The client-visible proof: the workbench answered, not claude-opus.
+    assert "served_model=qwen3-coder" in body["choices"][0]["message"]["content"], body
+    # Research finding, pinned: the client's response.model is RESTORED to the
+    # original ask on the direct path — enforcement is invisible there.
+    assert body.get("model") == "claude-opus", body
+
+    row = _await_enforce_row("claude-opus")
+    pol = row["policy"]
+    assert pol["enforced"] is True, pol
+    assert pol["requested"] == "claude-opus", pol  # the ask, stashed pre-rewrite
+    assert pol["chosen"] == "qwen3-coder", pol  # the decision
+    assert pol["actual"] == "qwen3-coder", pol  # reality
+    assert pol["agree"] is True, pol
+    assert "chose qwen3-coder" in pol["reason"], pol
+    # The record's top-level requested_model shows the POST-policy model under
+    # enforce (nothing downstream sees the original — the block carries it).
+    assert row["requested_model"] == "qwen3-coder", row
+    assert not row.get("fallback"), row
+
+
+def test_enforce_session_pin_and_stub_escalation_actually_serve():
+    """Condition (b) + the stub escalation under enforce: same-session-tag
+    requests are SERVED by the pinned backend regardless of the alias they
+    address; an escalate signal moves pin AND traffic upward, exactly once."""
+    _beat("wb-e2e-policy", "qwen3-coder", warm=True, agent_capable=True, healthy=True)
+    sid = _unique("enforce-pin")
+
+    # Turn 1 (addressed to gpt): pin miss -> pinned AND SERVED qwen3-coder.
+    r = _enforce_request("gpt", "turn 1", tags="session:" + sid)
+    assert "served_model=qwen3-coder" in r.json()["choices"][0]["message"]["content"]
+    pol = _await_enforce_row("gpt", key=sid)["policy"]
+    assert pol["pin_hit"] is False and pol["pinned_backend"] == "qwen3-coder", pol
+
+    # Turn 2 (addressed to claude-sonnet): the PIN serves, not the alias.
+    r = _enforce_request("claude-sonnet", "turn 2", tags="session:" + sid)
+    assert "served_model=qwen3-coder" in r.json()["choices"][0]["message"]["content"]
+    pol = _await_enforce_row("claude-sonnet", key=sid)["policy"]
+    assert pol["pin_hit"] is True and pol["actual"] == "qwen3-coder", pol
+
+    # Escalate (stub trigger): pin flips upward AND the traffic follows.
+    r = _enforce_request("gpt", "escalate now", tags="session:" + sid + ",escalate")
+    assert "served_model=claude-opus" in r.json()["choices"][0]["message"]["content"]
+    data = _poll_dash(
+        lambda d: (
+            ((_enforce_policy_of(d, "gpt", sid) or {}).get("policy", {}) or {}).get(
+                "escalated"
+            )
+            is True
+        )
+    )
+    pol = _enforce_policy_of(data, "gpt", sid)["policy"]
+    assert pol["escalated"] is True, pol
+    assert pol["escalated_from"] == "qwen3-coder", pol
+    assert pol["actual"] == "claude-opus", pol
+
+    # Post-escalation turn: the NEW pin serves; no downward edge.
+    r = _enforce_request("claude-sonnet", "after escalation", tags="session:" + sid)
+    assert "served_model=claude-opus" in r.json()["choices"][0]["message"]["content"]
+
+
+def test_enforce_fallback_composes_and_the_pin_does_not_move():
+    """Condition (c), the R4 proof in enforce mode: a forced 503 on the
+    policy-chosen backend still follows the fallback chain to a clean
+    response, AND the shadow pin does not move (docs/12 §6: a blip must not
+    burn the hop) — the next healthy turn is served by the pin again."""
+    _beat("wb-e2e-policy", "qwen3-coder", warm=True, agent_capable=True, healthy=True)
+    sid = _unique("enforce-blip")
+
+    # Pin the session on the workbench (healthy).
+    r = _enforce_request("claude-sonnet", "pin turn", tags="session:" + sid)
+    assert "served_model=qwen3-coder" in r.json()["choices"][0]["message"]["content"]
+    _await_enforce_row("claude-sonnet", key=sid)
+
+    # The chosen backend goes down. The request is rewritten to the pin
+    # (qwen3-coder), 503s, and follows qwen3-coder's OWN fallback chain
+    # (claude-sonnet first) to a clean 200 — R4, live.
+    _inject({"model": "qwen3-coder", "status": 503})
+    try:
+        r = _enforce_request("claude-opus", "blip turn", tags="session:" + sid)
+        content = r.json()["choices"][0]["message"]["content"]
+        assert "served_model=claude-sonnet" in content, content
+        row = _await_enforce_row("claude-opus", key=sid)
+        pol = row["policy"]
+        # The triple tells the whole story: asked opus, policy chose the pin,
+        # the chain served sonnet. agree:false + fallback:true = chain fired.
+        assert pol["chosen"] == "qwen3-coder", pol
+        assert pol["actual"] == "claude-sonnet", pol
+        assert pol["agree"] is False, pol
+        assert row.get("fallback") is True, row
+        # THE assertion this test exists for: the pin did NOT move.
+        assert pol["pinned_backend"] == "qwen3-coder", pol
+        assert pol["escalated"] is False, pol
+    finally:
+        httpx.post(MOCKD + "/__reset", timeout=TIMEOUT)
+
+    # Backend healthy again: the very next turn retries the PIN — the blip
+    # neither exiled the session nor burned its one hop.
+    r = _enforce_request("gpt", "recovery turn", tags="session:" + sid)
+    assert "served_model=qwen3-coder" in r.json()["choices"][0]["message"]["content"]
+
+
+def test_enforce_streaming_untouched_on_all_three_surfaces():
+    """Streaming under enforce, all three inbound surfaces: the rewrite
+    happens before the first backend byte, the stream flows from the CHOSEN
+    backend, and every surface ends with its proper terminator."""
+    _beat("wb-e2e-policy", "qwen3-coder", warm=True, agent_capable=True, healthy=True)
+
+    # chat/completions: deltas + [DONE]
+    text, done = "", False
+    with httpx.stream(
+        "POST",
+        GATEWAY_ENFORCE + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": "claude-opus",
+            "stream": True,
+            "messages": [{"role": "user", "content": "stream chat"}],
+        },
+        timeout=TIMEOUT,
+    ) as resp:
+        assert resp.status_code == 200
+        for line in resp.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            payload = line[len("data: ") :].strip()
+            if payload == "[DONE]":
+                done = True
+                continue
+            try:
+                ev = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            for ch in ev.get("choices", []):
+                text += (ch.get("delta") or {}).get("content") or ""
+    assert "served_model=qwen3-coder" in text, text
+    assert done, "chat stream did not terminate with [DONE]"
+
+    # /v1/messages (Claude Code's surface): content deltas + message_stop
+    text, stop = "", False
+    with httpx.stream(
+        "POST",
+        GATEWAY_ENFORCE + "/v1/messages",
+        headers={**AUTH, "anthropic-version": "2023-06-01"},
+        json={
+            "model": "claude-opus",
+            "max_tokens": 128,
+            "stream": True,
+            "messages": [{"role": "user", "content": "stream messages"}],
+        },
+        timeout=TIMEOUT,
+    ) as resp:
+        assert resp.status_code == 200
+        for line in resp.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            payload = line[len("data: ") :].strip()
+            try:
+                ev = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "content_block_delta":
+                text += ev.get("delta", {}).get("text", "")
+            elif ev.get("type") == "message_stop":
+                stop = True
+    assert "served_model=qwen3-coder" in text, text
+    assert stop, "messages stream did not emit message_stop"
+
+    # /v1/responses (Codex's surface): output deltas + response.completed
+    text, completed = "", False
+    with httpx.stream(
+        "POST",
+        GATEWAY_ENFORCE + "/v1/responses",
+        headers=AUTH,
+        json={
+            "model": "claude-opus",
+            "stream": True,
+            "input": [{"role": "user", "content": "stream responses"}],
+        },
+        timeout=TIMEOUT,
+    ) as resp:
+        assert resp.status_code == 200
+        for line in resp.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            payload = line[len("data: ") :].strip()
+            if payload == "[DONE]":
+                continue
+            try:
+                ev = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "response.output_text.delta":
+                text += ev.get("delta", "") or ""
+            elif ev.get("type") == "response.completed":
+                completed = True
+    assert "served_model=qwen3-coder" in text, text
+    assert completed, "responses stream did not emit response.completed"
+
+
+def test_enforce_governance_is_the_sole_guard():
+    """R6 research finding, pinned as coverage: LiteLLM does NOT re-check the
+    key allowlist after a rewrite, so the policy's governance filter is the
+    only thing keeping enforced traffic inside the key's world. A key
+    restricted to the Anthropic aliases must NEVER be routed to the (cheaper,
+    healthy, tempting) workbench — the candidate set excludes it, so the
+    enforced choice stays in-allowlist."""
+    _beat("wb-e2e-policy", "qwen3-coder", warm=True, agent_capable=True, healthy=True)
+    alias = _unique("enforce-governed")
+    key, _ = _generate_key(
+        models=["claude-sonnet", "claude-opus"],
+        key_alias=alias,
+    )
+
+    r = _enforce_request("claude-sonnet", "governed enforce", key=key)
+    content = r.json()["choices"][0]["message"]["content"]
+    # Served INSIDE the allowlist (claude-opus wins the in-pool tie-break) —
+    # and emphatically NOT by the out-of-allowlist workbench.
+    assert "served_model=qwen3-coder" not in content, content
+    assert "served_model=claude-opus" in content, content
+
+    # Find THIS request by the key's per-run-unique alias (goal-15 identity on
+    # the record) — requested_model alone would collide with the R4 test's
+    # session turns.
+    def _governed_row(data):
+        for rq in data.get("requests", []):
+            if rq.get("key_alias") == alias and (rq.get("policy") or {}).get(
+                "enforced"
+            ):
+                return rq
+        return None
+
+    data = _poll_dash(lambda d: _governed_row(d) is not None)
+    row = _governed_row(data)
+    assert row is not None, data.get("requests")
+    pol = row["policy"]
+    assert set(pol["candidate_set"]) <= {"claude-sonnet", "claude-opus"}, pol
+    assert pol["chosen"] == "claude-opus", pol
+    assert pol["actual"] == "claude-opus", pol
+    assert "governance key-allowlist" in pol["reason"], pol

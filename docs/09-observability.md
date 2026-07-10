@@ -744,6 +744,60 @@ no-op second signal, pin durability, bystander isolation) — every assertion
 paired with the zero-influence check that each request was served by exactly
 the model it addressed.
 
+## Enforcement — the policy drives routing, behind a flag (goal 26)
+
+**The knob.** `ROUTER_POLICY` — `shadow` (the default: everything above is
+pure telemetry, byte-for-byte the pre-goal-26 behavior; the full existing e2e
+suite runs against a default-mode gateway) or `enforce`: the owned pre-call
+hook **rewrites `data["model"]` to the policy's chosen backend**, for both
+arms — a one-shot goes to the cheapest capable candidate, a session-tagged
+request goes to its pin, an escalated session to its escalated pin. All
+verified mechanics (docs/12 §7 goal-26 research addendum): the hook's
+returned data is what routes, on all three surfaces, with streaming
+untouched.
+
+**Records under enforce.** The policy block gains `enforced: true` and
+`requested` — the client's original ask, **stashed before the rewrite**
+because nothing downstream can reconstruct it afterwards (the pipeline sees
+only the new model). The block thus carries the full triple: `requested`
+(what the client asked), `chosen` (what the policy decided), `actual` (what
+really served). Two semantics to know:
+
+- the record's top-level `requested_model` shows the **post-policy** model
+  under enforce (it reads `data["model"]`); the client-level ask lives on
+  the block. The `fallback` flag keeps meaning "the availability chain
+  fired" — under enforce that is `served != chosen`, surfaced as
+  `agree: false` + `fallback: true` together.
+- the **client's** `response.model` is restored by LiteLLM to the original
+  ask on the direct path (enforcement is invisible there) and shows the
+  winner on the fallback path — unchanged from today's fallback behavior.
+
+**Failure semantics, proven live (the docs/12 §6 story).** A forced 503 on
+the policy-chosen backend follows **that backend's own** fallback chain to a
+clean response (R4 — the fallback lookup keys off the rewritten group), and
+the pin does **not** move: the next healthy turn is served by the pinned
+backend again. A blip neither exiles a session nor burns its one escalation
+hop. A policy block with no survivor rewrites nothing — the request proceeds
+on the client's own ask, enforcement degrades to shadow for that request,
+never to a failure.
+
+**Governance under enforce — the policy is the SOLE guard.** LiteLLM checks
+the key's model allowlist only at auth time, against the requested model; a
+rewrite is never re-checked (verified on the pin). The policy's governance
+filter (candidates bounded by the key allowlist, docs/12 §4 step 1) is
+therefore the only thing keeping enforced traffic inside the key's world —
+pinned by `test_enforce_governance_is_the_sole_guard`, which proves a
+restricted key is never routed to the cheaper out-of-allowlist workbench.
+
+**E2e coverage.** The e2e stack runs a SECOND gateway container
+(`litellm-e2e-enforce`, port 4001, `ROUTER_POLICY=enforce`, its own pin
+store) so the existing suite keeps hitting the default-mode gateway
+unchanged — the "existing tests pass under the default" condition holds by
+construction. Dedicated tests: one-shot served by cheapest-capable with the
+triple on record; session pin + stub escalation actually serving; the
+503-fallback + pin-does-not-move + recovery story; streaming with proper
+terminators on chat//v1/messages//v1/responses; the governance guard.
+
 ## What this is *not* (yet)
 
 - **Not durable.** All sinks are ephemeral (stdout ring / mockd + dashboard

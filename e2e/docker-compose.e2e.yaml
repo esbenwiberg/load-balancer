@@ -152,5 +152,49 @@ services:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]
       interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 15s
+      # Boot includes prisma migrate + a schema-diff pass whose duration
+      # varies; the window was 15s+5x10s and flaked once litellm-enforce's
+      # depends_on made it BINDING (nothing consumed the health status
+      # before). Generous on purpose — run.sh's own curl loop is the real
+      # gate on readiness.
+      retries: 12
+      start_period: 60s
+
+  # --- ENFORCE-MODE gateway (goal 26) ---------------------------------------
+  # The SAME gateway (image, config, callback, sinks, control-plane) with ONE
+  # difference: ROUTER_POLICY=enforce — the policy layer drives routing instead
+  # of shadowing it. A second container rather than a knob-flip on the main
+  # gateway so the full existing suite keeps hitting the DEFAULT (shadow)
+  # gateway unchanged — the completion condition's "existing e2e passes
+  # unchanged under the default" is enforced by construction — while the
+  # dedicated enforce tests hit port 4001. Same Postgres (key store shared, so
+  # keys minted on either gateway work on both); depends_on the shadow gateway
+  # so prisma migrations are done before this one boots. Its pin store is its
+  # own container /tmp — enforce-mode pins never bleed into shadow tests.
+  litellm-enforce:
+    image: ghcr.io/berriai/litellm:v1.83.14-stable
+    container_name: litellm-e2e-enforce
+    depends_on:
+      litellm:
+        condition: service_healthy
+    ports:
+      - "4001:4000"
+    volumes:
+      - ./litellm-config.e2e.yaml:/app/config.yaml:ro
+      - ./obs_callback.py:/app/obs_callback.py:ro
+    environment:
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-e2e-master-test-key}"
+      DATABASE_URL: "postgresql://litellm:litellm@db:5432/litellm"
+      OBS_WEBHOOK_URL: "http://mockd:9100/__observe,http://dashboard:9300/records"
+      CONTROL_PLANE_URL: "http://control-plane:9400"
+      POLICY_REGISTRY_CACHE_S: "0"
+      # The one flag this container exists for.
+      ROUTER_POLICY: "enforce"
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      # Same generous window as the shadow gateway (see its healthcheck note).
+      retries: 12
+      start_period: 60s

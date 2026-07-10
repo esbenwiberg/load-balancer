@@ -123,6 +123,23 @@ Same shadow discipline throughout: zero routing influence, and the pin store
 is the SHADOW router's own state — it records what the policy WOULD have
 pinned, not what actually served. See _PinStore/_policy_session + docs/09.
 
+ENFORCEMENT (goal 26): the ROUTER_POLICY knob flips the policy from shadow to
+real. Default "shadow" = everything above unchanged, zero influence. Under
+"enforce" the pre-call hook REWRITES data["model"] to the policy's chosen
+backend (both arms, stub escalation included), stashing the client's original
+ask on the block FIRST — post-rewrite nothing downstream can reconstruct it
+(verified on the pin, docs/12 §7 goal-26 addendum). The block then carries
+{enforced: true, requested, chosen, actual, agree}: the full requested vs
+chosen vs served triple. The delivered record's top-level requested_model
+shows the POST-policy model under enforce (it reads data["model"]), and the
+`fallback` flag keeps meaning "the availability chain fired" (served !=
+routed-for model) — the client-level triple lives on the policy block.
+LiteLLM's availability-fallback composes with the rewrite (R4, verified: the
+CHOSEN model's chain applies) and the key allowlist is NOT re-checked after
+the rewrite, so the policy's governance filter is the sole guard — pinned by
+a dedicated e2e test. A block with no survivor rewrites nothing (degrade to
+the client's ask, never a failure). See _apply_enforcement + docs/09.
+
 The block crosses hook boundaries via the goal-16 correlation id in a bounded
 module-level map (_POLICY_BLOCKS) — the id is already proven to reach every
 surface (delivered via data, attempts via slo.trace_id), unlike the metadata
@@ -958,6 +975,47 @@ def _request_headers(data):
     return None
 
 
+# --- ENFORCEMENT — the policy drives routing, behind a flag (goal 26) --------
+# ROUTER_POLICY=shadow (the default: everything above stays pure telemetry,
+# byte-for-byte the pre-goal-26 behavior) | enforce (the owned pre-call hook
+# REWRITES the requested model to the policy's choice — docs/12 R1, verified
+# live on the pin in the goal-26 pre-build research, docs/12 §7 addendum).
+_ROUTER_POLICY = os.environ.get("ROUTER_POLICY", "shadow").strip().lower()
+
+
+def _apply_enforcement(block, data):
+    """Make the policy decision REAL: point data["model"] at the block's
+    chosen backend, for both arms (the session arm's chosen is the pin, the
+    escalated pin included). Mutates block + data in place.
+
+    Two research-mandated moves (docs/12 §7 goal-26 addendum):
+      * STASH THE ORIGINAL ASK FIRST — post-rewrite, nothing downstream can
+        reconstruct it (router, logging and records all see only the new
+        model; the client's own response.model is restored to the original on
+        the direct path). block["requested"] is the only durable carrier, so
+        records get the full requested vs chosen vs served triple.
+      * The policy's governance filter is the SOLE allowlist guard for the
+        rewrite target — LiteLLM checks the key's models only at auth time,
+        against the REQUESTED model, and never re-checks. The block's chosen
+        is always drawn from allowlist-filtered candidates (docs/12 §4 step
+        1), which is exactly why this function never needs its own check —
+        pinned by the dedicated governance e2e test.
+
+    A block with no survivor (chosen None) rewrites nothing: the request
+    proceeds on the client's own ask — enforcement degrades to shadow for
+    that request, never to a failure. After the rewrite, LiteLLM's
+    availability-fallback applies to the CHOSEN model's chain (R4, verified),
+    so `actual` may still differ from `chosen` — that is the chain firing,
+    visible as agree:false with fallback:true on the record."""
+    requested = data.get("model") if isinstance(data, dict) else None
+    block["enforced"] = True
+    block["requested"] = requested
+    chosen = block.get("chosen")
+    if chosen and requested and chosen != requested:
+        data["model"] = chosen
+    return block
+
+
 # Control-plane registry access for step 3 — TTL-cached so the pre-call cost is
 # one bounded HTTP read per cache window, not per request. The e2e stack sets
 # POLICY_REGISTRY_CACHE_S=0 so every request sees the test's freshest
@@ -1191,6 +1249,13 @@ class RoutingRecorder(CustomLogger):
                             registry_models,
                             registry_state,
                         )
+                    # ENFORCEMENT (goal 26): behind the flag, the decision
+                    # stops being shadow — the hook rewrites the model to the
+                    # policy's choice (original ask stashed on the block
+                    # first). Under the default ROUTER_POLICY=shadow this
+                    # branch never runs and data is untouched, as ever.
+                    if _ROUTER_POLICY == "enforce":
+                        _apply_enforcement(block, data)
                     _policy_remember(data[_CORRELATION_KEY], block)
         except Exception:  # pragma: no cover - defensive
             pass

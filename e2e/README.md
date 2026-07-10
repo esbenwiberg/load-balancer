@@ -297,6 +297,30 @@ through `:4000` and watch `in_flight` move. In the **e2e** stack no mockd beats
 `test_dashboard_data_endpoint_shows_fallback_route`, and
 `test_dashboard_page_renders` cover the data endpoint + page.
 
+### The enforce-mode gateway — `ROUTER_POLICY` (goal 26)
+
+The e2e stack runs **two** gateways off the same config, callback, Postgres
+and control-plane. `litellm-e2e` (`:4000`) is the default —
+`ROUTER_POLICY=shadow`, the policy is pure telemetry, and the entire
+pre-goal-26 suite runs against it unchanged. `litellm-e2e-enforce` (`:4001`)
+sets `ROUTER_POLICY=enforce`: the policy layer **drives** routing — the
+pre-call hook rewrites the requested model to the policy's choice (cheapest
+capable for one-shots, the pin for session-tagged traffic, the escalated pin
+after the stub `escalate` signal). Its pin store is its own container `/tmp`,
+so enforce pins never bleed into shadow assertions.
+
+The dedicated coverage (all in `test_e2e.py`, `test_enforce_*`):
+one-shot-to-expensive-alias actually served by the cheapest capable backend
+with the `enforced:true` + requested/chosen/served triple on the record;
+same-session-tag requests served by the pin; the stub escalation moving pin
+AND traffic upward; a forced 503 on the chosen backend following its fallback
+chain to a clean response with the pin NOT moving (and recovering on the next
+healthy turn); streaming with proper terminators on all three surfaces; and
+the governance guard — LiteLLM never re-checks the key allowlist after a
+rewrite (verified on the pin), so the test proves the policy's own
+governance filter keeps enforced traffic inside the key's world. Details in
+[docs/09 "Enforcement"](../docs/09-observability.md).
+
 ---
 
 ## Profile: dev — the standing self-validation fleet (goal 10)
