@@ -171,6 +171,26 @@ decision is made.
    its condition literally holds on `main` — if in doubt, re-check it, don't
    trust the checkmark.
 
+- ✅ 25. Shadow sticky pins + escalation mechanics (stub trigger) — the
+  session arm (docs/12 §2/§3/§5) in shadow: `_PinStore` + `_policy_session`
+  in obs_callback, dispatched pre-call by goal-22's stickiness key (tag >
+  transcript hash; keyless stays goal-24 stateless). First sight pins the
+  stateless arm's choice; hits carry `{arm: "session", stickiness_key,
+  pin_hit, pinned_backend, escalated}` with `registry: null` honesty (no
+  evaluation ran); an `escalate` entry on x-litellm-tags (STUB — the real
+  trigger stays § Needs-a-human) replaces the pin upward exactly once, no
+  downward edge, second signal a recorded no-op, impossible moves don't burn
+  the hop. Inactivity TTL knob POLICY_PIN_TTL_S (default 24h). **Build
+  discovery:** every profile runs `--num_workers 2`, so process-memory pins
+  flapped per worker — the store is a container-scoped SQLite file
+  (POLICY_PIN_DB, control-plane's own pattern; guarded SQL makes pin-once +
+  escalate-once atomic across workers; recreated container ⇒ fresh /tmp ⇒
+  safe re-pin). Postgres promotion still the replica-time §8.3 decision.
+  Tests: 20 new offline (state machine, TTL/restart via injected clock,
+  worker-sharing, cross-worker exactly-once) + 2 e2e (stickiness +
+  independence, escalation exactly-once + bystander isolation — every step
+  asserting zero routing influence). Docs: docs/09 "Shadow sticky pins",
+  docs/12 §3/§5 status + discovery. — PR #45 (2026-07)
 - ✅ 24. Shadow routing policy — the stateless arm, zero influence — routing
   records carry `shadow_policy: {arm: "stateless", candidate_set, chosen,
   reason, registry, actual, agree}` computed PRE-CALL in

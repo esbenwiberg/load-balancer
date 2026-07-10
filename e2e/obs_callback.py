@@ -106,8 +106,11 @@ request carries a stickiness key (goal 22's derivation: session tag >
 transcript hash), the shadow policy switches to docs/12 §2/§3/§5's session
 arm. First sight of a key PINS the stateless arm's choice in a gateway-local,
 TTL'd pin store (docs/12 §3 option (a) — the decided default for the
-single-gateway phase; lost on restart BY DESIGN, an unpinned session-turn just
-re-pins). Subsequent same-key requests carry the pin, bypassing re-evaluation:
+single-gateway phase; a container-scoped SQLite file, POLICY_PIN_DB, because
+every profile runs the proxy with --num_workers 2 and per-process memory
+would give each worker its own contradictory pins; lost on container restart
+BY DESIGN, an unpinned session-turn just re-pins). Subsequent same-key
+requests carry the pin, bypassing re-evaluation:
 `shadow_policy: {arm: "session", stickiness_key, pin_hit, pinned_backend,
 escalated, chosen, ...}`. An explicit `escalate` tag on the verified carrier
 (x-litellm-tags) fires docs/12 §5's state machine IN SHADOW: the pin is
@@ -154,6 +157,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
+import tempfile
 import threading
 import time
 import uuid
@@ -641,6 +646,11 @@ def _config_candidates() -> list:
 # spec's suggested default: 24h, config knob.
 _PIN_TTL_S = float(os.environ.get("POLICY_PIN_TTL_S", "86400"))
 _PIN_CAP = 4096
+# Where the pins live INSIDE the gateway container. Container-scoped tmp by
+# default: shared by every proxy worker, gone with the container.
+_PIN_DB = os.environ.get(
+    "POLICY_PIN_DB", os.path.join(tempfile.gettempdir(), "shadow_pins.db")
+)
 
 
 class _PinStore:
@@ -649,59 +659,127 @@ class _PinStore:
     flagged decision — docs/12 §8.3). Keyed by goal-22 stickiness_key; a pin
     is {backend, tier, escalated, pinned_at, last_seen}.
 
-    Restart story, BY DESIGN: this is process memory, so a restart loses every
-    pin. That is safe — an unpinned session-turn just re-pins on its next
-    request (docs/12 §3: "the cache-loss cost is the same as a restart
-    today"), and the exactly-once escalation guarantee is per-PIN, not
-    per-session-eternal: a re-pinned session gets its hop back, which is the
-    honest reading of losing the state. Bounded LRU-ish (cap + move_to_end on
-    write/touch) so a tag-spraying client can't grow gateway memory without
-    bound. Lock because the sync log_* variants may run off-loop."""
+    Backing: a CONTAINER-SCOPED SQLite file (POLICY_PIN_DB, default under
+    /tmp), NOT process memory — discovered the hard way: every profile runs
+    the proxy with --num_workers 2, and pins are the first CROSS-REQUEST
+    state, so per-process memory made same-session requests flap between
+    workers' independent stores (a multi-worker gateway is already "replicas"
+    in docs/12 §3(a)'s sense). The file keeps §3(a)'s intent — nothing leaves
+    the gateway container, no shared infra, no schema in the shared Postgres
+    (that promotion is the flagged replica-time decision) — while being one
+    store for all workers. Same pattern as the control-plane's SQLite. Writes
+    are guarded SQL, so pin-once and escalate-once hold ATOMICALLY across
+    workers, not just threads.
 
-    def __init__(self, ttl_s=None, cap=_PIN_CAP):
+    Restart story, BY DESIGN: a recreated container starts with a fresh /tmp,
+    so a restart loses every pin. That is safe — an unpinned session-turn
+    just re-pins on its next request (docs/12 §3: "the cache-loss cost is the
+    same as a restart today"), and the exactly-once escalation guarantee is
+    per-PIN, not per-session-eternal: a re-pinned session gets its hop back,
+    the honest reading of losing the state. Bounded (least-recently-seen
+    eviction past `cap`) so a tag-spraying client can't grow the store
+    without bound. Timestamps are caller-injected (time.monotonic() in the
+    hook — one kernel clock, consistent across workers; a fake clock in the
+    offline tests). Lock per process, busy_timeout across them."""
+
+    def __init__(self, ttl_s=None, cap=_PIN_CAP, path=None):
         self.ttl_s = _PIN_TTL_S if ttl_s is None else float(ttl_s)
         self.cap = cap
-        self._pins: OrderedDict = OrderedDict()
+        self.path = _PIN_DB if path is None else path
         self._lock = threading.Lock()
+        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=2000")
+        with self._lock, self._conn:
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS pins ("
+                " key TEXT PRIMARY KEY, backend TEXT, tier TEXT,"
+                " escalated INTEGER NOT NULL DEFAULT 0,"
+                " pinned_at REAL, last_seen REAL)"
+            )
+
+    @staticmethod
+    def _pin(row):
+        return {
+            "backend": row[0],
+            "tier": row[1],
+            "escalated": bool(row[2]),
+            "pinned_at": row[3],
+            "last_seen": row[4],
+        }
+
+    _SELECT = (
+        "SELECT backend, tier, escalated, pinned_at, last_seen FROM pins WHERE key=?"
+    )
 
     def get(self, key, now):
         """The live pin for `key`, or None. An expired pin is deleted and
         reported absent — expiry is not an error, the caller re-pins."""
-        with self._lock:
-            pin = self._pins.get(key)
-            if pin is None:
+        with self._lock, self._conn:
+            row = self._conn.execute(self._SELECT, (key,)).fetchone()
+            if row is None:
                 return None
-            if now - pin["last_seen"] > self.ttl_s:
-                del self._pins[key]
+            if now - row[4] > self.ttl_s:
+                self._conn.execute("DELETE FROM pins WHERE key=?", (key,))
                 return None
-            return dict(pin)
+            return self._pin(row)
 
-    def put(self, key, backend, tier, escalated, now):
-        with self._lock:
-            prior = self._pins.get(key)
-            self._pins[key] = {
-                "backend": backend,
-                "tier": tier,
-                "escalated": bool(escalated),
-                # An escalation REPLACES the pin but the session started when
-                # it was first pinned — keep the original birth time.
-                "pinned_at": prior["pinned_at"] if prior else now,
-                "last_seen": now,
-            }
-            self._pins.move_to_end(key)
-            while len(self._pins) > self.cap:
-                self._pins.popitem(last=False)
+    def pin(self, key, backend, tier, now):
+        """Record a FIRST-SIGHT pin. First writer wins across workers
+        (INSERT OR IGNORE): returns (the store's pin — ours or the concurrent
+        winner's, read back — , created?). An expired leftover never blocks a
+        fresh pin."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM pins WHERE key=? AND ? - last_seen > ?",
+                (key, now, self.ttl_s),
+            )
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO pins"
+                " (key, backend, tier, escalated, pinned_at, last_seen)"
+                " VALUES (?, ?, ?, 0, ?, ?)",
+                (key, backend, tier, now, now),
+            )
+            created = cur.rowcount == 1
+            if created:
+                # Bound the store — evict least-recently-seen overflow (the
+                # just-inserted row has the newest last_seen, so it survives).
+                self._conn.execute(
+                    "DELETE FROM pins WHERE key NOT IN"
+                    " (SELECT key FROM pins ORDER BY last_seen DESC LIMIT ?)",
+                    (self.cap,),
+                )
+            row = self._conn.execute(self._SELECT, (key,)).fetchone()
+            return (self._pin(row) if row else None, created)
+
+    def escalate(self, key, backend, tier, now):
+        """The upward flip, exactly once ATOMICALLY: only a not-yet-escalated
+        pin moves (guarded UPDATE), so two workers firing simultaneously
+        cannot both burn the hop. True iff THIS call flipped it."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE pins SET backend=?, tier=?, escalated=1, last_seen=?"
+                " WHERE key=? AND escalated=0",
+                (backend, tier, now, key),
+            )
+            return cur.rowcount == 1
 
     def touch(self, key, now):
         """Refresh the inactivity TTL on a pin hit."""
-        with self._lock:
-            pin = self._pins.get(key)
-            if pin is not None:
-                pin["last_seen"] = now
-                self._pins.move_to_end(key)
+        with self._lock, self._conn:
+            self._conn.execute("UPDATE pins SET last_seen=? WHERE key=?", (now, key))
 
 
-_PINS = _PinStore()
+# Created lazily so importing the module (offline tests, tooling) does not
+# touch the filesystem — only the hook's first session-arm request does.
+_PINS_INSTANCE: _PinStore | None = None
+
+
+def _pins():
+    global _PINS_INSTANCE
+    if _PINS_INSTANCE is None:
+        _PINS_INSTANCE = _PinStore()
+    return _PINS_INSTANCE
 
 
 def _tier_of(candidates, model):
@@ -760,12 +838,22 @@ def _policy_session(
             steps.append("pin miss: no capable candidate to pin [%s]" % base["reason"])
         else:
             tier = _tier_of(candidates, base["chosen"])
-            pins.put(key, base["chosen"], tier, False, now)
-            pin = {"backend": base["chosen"], "tier": tier, "escalated": False}
-            steps.append(
-                "pin miss: pinned %s (tier=%s) via stateless arm [%s]"
-                % (base["chosen"], tier, base["reason"])
-            )
+            pin, created = pins.pin(key, base["chosen"], tier, now)
+            if created:
+                steps.append(
+                    "pin miss: pinned %s (tier=%s) via stateless arm [%s]"
+                    % (base["chosen"], tier, base["reason"])
+                )
+            elif pin is not None:
+                # Lost a same-key race to another worker/request — the
+                # store's pin is the session's truth, ours is discarded.
+                pin_hit = True
+                steps.append(
+                    "pin miss -> concurrent pin won: %s (tier=%s)"
+                    % (pin["backend"], pin["tier"])
+                )
+            else:  # pragma: no cover - insert-then-vanish needs a 3-way race
+                steps.append("pin miss -> concurrent pin vanished")
     else:
         pins.touch(key, now)
         steps.append(
@@ -800,18 +888,29 @@ def _policy_session(
                 )
                 used_registry = registry_state
                 if base["chosen"]:
-                    escalated_from = pin["backend"]
                     tier = _tier_of(candidates, base["chosen"])
-                    pins.put(key, base["chosen"], tier, True, now)
-                    pin = {
-                        "backend": base["chosen"],
-                        "tier": tier,
-                        "escalated": True,
-                    }
-                    steps.append(
-                        "escalate signal: pin %s -> %s (upward, exactly once)"
-                        " [%s]" % (escalated_from, base["chosen"], base["reason"])
-                    )
+                    if pins.escalate(key, base["chosen"], tier, now):
+                        escalated_from = pin["backend"]
+                        pin = {
+                            "backend": base["chosen"],
+                            "tier": tier,
+                            "escalated": True,
+                        }
+                        steps.append(
+                            "escalate signal: pin %s -> %s (upward, exactly"
+                            " once) [%s]"
+                            % (escalated_from, base["chosen"], base["reason"])
+                        )
+                    else:
+                        # The guarded UPDATE found no un-escalated pin: a
+                        # concurrent signal flipped it first (or the pin was
+                        # dropped). Exactly-once held at the store — this
+                        # request records the no-op, not a second hop.
+                        pin = pins.get(key, now) or pin
+                        steps.append(
+                            "escalate signal: no-op (concurrent escalation"
+                            " already flipped the pin)"
+                        )
                 else:
                     steps.append(
                         "escalate signal: no-op, hop NOT burned (no capable"
@@ -1066,14 +1165,14 @@ class RoutingRecorder(CustomLogger):
                         # peek and _policy_session see the same `now`, and a
                         # same-key race between them just turns one miss into
                         # a hit (both would pin the same choice anyway).
-                        pin = _PINS.get(key, now)
+                        pin = _pins().get(key, now)
                         needs_eval = pin is None or (escalate and not pin["escalated"])
                         if needs_eval:
                             registry_models, registry_state = await _registry_snapshot()
                         else:
                             registry_models, registry_state = None, None
                         block = _policy_session(
-                            _PINS,
+                            _pins(),
                             key,
                             escalate,
                             candidates,

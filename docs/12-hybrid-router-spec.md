@@ -68,6 +68,16 @@ Hard constraints (carried from the Fugu research, non-negotiable):
 > 24h), zero routing influence. TTL + restart are proven offline with an
 > injected clock. See [docs/09 "Shadow sticky pins"](09-observability.md).
 > Enforcement is goal 26.
+>
+> **Build discovery:** option (a)'s "broken with >1 gateway replica" caveat
+> bites EARLIER than replica time — every profile runs the proxy with
+> `--num_workers 2`, i.e. two processes, so per-process memory gave each
+> worker contradictory pins. The build keeps (a)'s intent with a
+> **container-scoped SQLite file** (`POLICY_PIN_DB`, default in the
+> container's `/tmp`): one store for all workers, guarded SQL for atomic
+> pin-once / escalate-once, still nothing outside the gateway container,
+> still lost with the container. (c) remains the promotion for real replicas
+> (§8.3 — separate hosts don't share a filesystem).
 
 - **Pin at first sight of a stickiness key**: the backend chosen for that
   request becomes the session's backend. All subsequent requests with the same

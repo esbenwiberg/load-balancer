@@ -19,7 +19,9 @@ Run:  python3 obs_callback_test.py        (also pytest-discoverable)
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 import types
 import unittest
 
@@ -441,6 +443,16 @@ class TestPolicyOutcome(unittest.TestCase):
 # no-ops, no downward edge.
 
 
+def _store(ttl_s=100, cap=4096, path=None):
+    """A pin store on its own fresh SQLite file — each call simulates a fresh
+    gateway CONTAINER (new /tmp). Pass an explicit `path` to simulate a second
+    WORKER sharing the same container's store."""
+    if path is None:
+        fd, path = tempfile.mkstemp(prefix="pins-test-", suffix=".db")
+        os.close(fd)
+    return _PinStore(ttl_s=ttl_s, cap=cap, path=path)
+
+
 def _sess(pins, key, now, escalate=False, cands=_CANDIDATES, key_models=None):
     """One session-arm evaluation with quiet defaults (config-only registry)."""
     return _policy_session(
@@ -450,7 +462,7 @@ def _sess(pins, key, now, escalate=False, cands=_CANDIDATES, key_models=None):
 
 class TestPinStore(unittest.TestCase):
     def test_first_sight_pins_the_stateless_choice(self):
-        pins = _PinStore(ttl_s=100)
+        pins = _store(ttl_s=100)
         b = _sess(pins, "sess-1", now=0.0)
         self.assertEqual(b["arm"], "session")
         self.assertIs(b["pin_hit"], False)
@@ -462,7 +474,7 @@ class TestPinStore(unittest.TestCase):
     def test_pin_hit_beats_re_evaluation(self):
         # Stickiness is the point: once pinned, the pin wins even if a fresh
         # evaluation would now choose differently (candidate pool changed).
-        pins = _PinStore(ttl_s=100)
+        pins = _store(ttl_s=100)
         _sess(pins, "sess-1", now=0.0)
         foundry_only = [c for c in _CANDIDATES if c["tier"] == "foundry"]
         b = _sess(pins, "sess-1", now=1.0, cands=foundry_only)
@@ -473,7 +485,7 @@ class TestPinStore(unittest.TestCase):
         self.assertIn("pin hit: qwen3-coder", b["reason"])
 
     def test_different_keys_get_independent_pins(self):
-        pins = _PinStore(ttl_s=100)
+        pins = _store(ttl_s=100)
         _sess(pins, "sess-a", now=0.0)
         b = _sess(pins, "sess-b", now=1.0, key_models=["claude-sonnet"])
         self.assertIs(b["pin_hit"], False)
@@ -484,7 +496,7 @@ class TestPinStore(unittest.TestCase):
         self.assertEqual(a["pinned_backend"], "qwen3-coder")
 
     def test_ttl_expires_on_inactivity_and_the_next_turn_repins(self):
-        pins = _PinStore(ttl_s=10)
+        pins = _store(ttl_s=10)
         _sess(pins, "sess-1", now=0.0)
         # Past the TTL: the pin is gone — not an error, just a re-pin, which
         # re-evaluates against the CURRENT pool (here: local disappeared).
@@ -496,7 +508,7 @@ class TestPinStore(unittest.TestCase):
     def test_activity_refreshes_the_ttl(self):
         # TTL is inactivity-based (docs/12 §3): a session that keeps talking
         # keeps its pin, even long past ttl_s from the FIRST sight.
-        pins = _PinStore(ttl_s=10)
+        pins = _store(ttl_s=10)
         _sess(pins, "sess-1", now=0.0)
         _sess(pins, "sess-1", now=8.0)  # touch
         b = _sess(pins, "sess-1", now=16.0)  # 8s since last touch < 10s TTL
@@ -504,21 +516,22 @@ class TestPinStore(unittest.TestCase):
         self.assertEqual(b["pinned_backend"], "qwen3-coder")
 
     def test_restart_loses_pins_safely(self):
-        # A fresh store IS the restart (pins are process memory by design).
-        # The escalated session re-pins cleanly — and gets its one hop back,
-        # the honest reading of having lost the state.
-        pins = _PinStore(ttl_s=100)
+        # A store on a fresh path IS the recreated container (new /tmp — pins
+        # are container-scoped by design). The escalated session re-pins
+        # cleanly — and gets its one hop back, the honest reading of having
+        # lost the state.
+        pins = _store(ttl_s=100)
         _sess(pins, "sess-1", now=0.0)
         esc = _sess(pins, "sess-1", now=1.0, escalate=True)
         self.assertIs(esc["escalated"], True)
-        restarted = _PinStore(ttl_s=100)
+        restarted = _store(ttl_s=100)
         b = _sess(restarted, "sess-1", now=2.0)
         self.assertIs(b["pin_hit"], False)
         self.assertEqual(b["pinned_backend"], "qwen3-coder")
         self.assertIs(b["escalated"], False)
 
     def test_store_is_bounded(self):
-        pins = _PinStore(ttl_s=100, cap=2)
+        pins = _store(ttl_s=100, cap=2)
         for i, key in enumerate(("sess-a", "sess-b", "sess-c")):
             _sess(pins, key, now=float(i))
         # Oldest evicted; the two youngest survive.
@@ -526,10 +539,31 @@ class TestPinStore(unittest.TestCase):
         self.assertIsNotNone(pins.get("sess-b", 3.0))
         self.assertIsNotNone(pins.get("sess-c", 3.0))
 
+    def test_two_workers_share_pins(self):
+        # THE reason the store is a file: every profile runs the proxy with
+        # --num_workers 2, so two processes must see ONE pin universe. Two
+        # store instances on the same path are those two workers.
+        w1 = _store(ttl_s=100)
+        w2 = _store(ttl_s=100, path=w1.path)
+        _sess(w1, "sess-1", now=0.0)  # worker 1 pins...
+        b = _sess(w2, "sess-1", now=1.0)  # ...worker 2 must hit it
+        self.assertIs(b["pin_hit"], True)
+        self.assertEqual(b["pinned_backend"], "qwen3-coder")
+
+    def test_concurrent_first_sight_is_first_writer_wins(self):
+        # Same-key pin race across workers: the store's INSERT OR IGNORE makes
+        # the first writer win; the loser reports the winner's pin as a hit.
+        w1 = _store(ttl_s=100)
+        w2 = _store(ttl_s=100, path=w1.path)
+        w1.pin("sess-1", "qwen3-coder", "local", 0.0)
+        pin, created = w2.pin("sess-1", "claude-opus", "foundry", 0.0)
+        self.assertIs(created, False)
+        self.assertEqual(pin["backend"], "qwen3-coder")
+
 
 class TestEscalation(unittest.TestCase):
     def test_escalation_replaces_the_pin_upward(self):
-        pins = _PinStore(ttl_s=100)
+        pins = _store(ttl_s=100)
         _sess(pins, "sess-1", now=0.0)  # pinned qwen3-coder (local)
         b = _sess(pins, "sess-1", now=1.0, escalate=True)
         self.assertIs(b["pin_hit"], True)
@@ -538,8 +572,21 @@ class TestEscalation(unittest.TestCase):
         self.assertEqual(b["escalated_from"], "qwen3-coder")
         self.assertIn("upward, exactly once", b["reason"])
 
+    def test_escalation_is_exactly_once_across_workers(self):
+        # Two workers firing the signal for the same key: the guarded UPDATE
+        # lets exactly ONE flip through; the other worker records the no-op.
+        w1 = _store(ttl_s=100)
+        w2 = _store(ttl_s=100, path=w1.path)
+        _sess(w1, "sess-1", now=0.0)
+        first = _sess(w2, "sess-1", now=1.0, escalate=True)
+        second = _sess(w1, "sess-1", now=2.0, escalate=True)
+        self.assertEqual(first["escalated_from"], "qwen3-coder")
+        self.assertIs(second["escalated"], True)
+        self.assertNotIn("escalated_from", second)
+        self.assertEqual(second["pinned_backend"], "claude-opus")
+
     def test_second_signal_is_a_recorded_noop(self):
-        pins = _PinStore(ttl_s=100)
+        pins = _store(ttl_s=100)
         _sess(pins, "sess-1", now=0.0)
         _sess(pins, "sess-1", now=1.0, escalate=True)
         b = _sess(pins, "sess-1", now=2.0, escalate=True)
@@ -551,7 +598,7 @@ class TestEscalation(unittest.TestCase):
     def test_no_downward_edge_ever(self):
         # After escalation the local backend is still the cheapest capable —
         # and must never win the session back.
-        pins = _PinStore(ttl_s=100)
+        pins = _store(ttl_s=100)
         _sess(pins, "sess-1", now=0.0)
         _sess(pins, "sess-1", now=1.0, escalate=True)
         b = _sess(pins, "sess-1", now=2.0)
@@ -561,7 +608,7 @@ class TestEscalation(unittest.TestCase):
     def test_escalation_target_respects_the_stateless_filters(self):
         # The upward re-run is the FULL stateless arm over the higher tiers:
         # governance still bounds it (claude-opus excluded ⇒ sonnet wins).
-        pins = _PinStore(ttl_s=100)
+        pins = _store(ttl_s=100)
         allow = ["qwen3-coder", "claude-sonnet"]
         _sess(pins, "sess-1", now=0.0, key_models=allow)
         b = _sess(pins, "sess-1", now=1.0, escalate=True, key_models=allow)
@@ -573,7 +620,7 @@ class TestEscalation(unittest.TestCase):
         # recorded no-op AND escalated stays False — nothing moved, so the
         # session's one hop is not spent on an impossible move.
         foundry_only = [c for c in _CANDIDATES if c["tier"] == "foundry"]
-        pins = _PinStore(ttl_s=100)
+        pins = _store(ttl_s=100)
         _sess(pins, "sess-1", now=0.0, cands=foundry_only)
         b = _sess(pins, "sess-1", now=1.0, escalate=True, cands=foundry_only)
         self.assertEqual(b["pinned_backend"], "claude-opus")
@@ -583,7 +630,7 @@ class TestEscalation(unittest.TestCase):
     def test_escalate_with_nothing_pinnable_is_a_noop(self):
         # No capable candidate at all: no pin exists, so the signal has
         # nothing to act on — recorded, never a crash.
-        pins = _PinStore(ttl_s=100)
+        pins = _store(ttl_s=100)
         b = _sess(pins, "sess-1", now=0.0, escalate=True, key_models=["no-such"])
         self.assertIsNone(b["pinned_backend"])
         self.assertIsNone(b["chosen"])
@@ -593,7 +640,7 @@ class TestEscalation(unittest.TestCase):
     def test_first_sight_plus_escalate_pins_then_escalates(self):
         # The stub trigger arriving on turn 1: pin first (docs/12 §2 row 2),
         # then the state machine fires — deterministic, single request.
-        pins = _PinStore(ttl_s=100)
+        pins = _store(ttl_s=100)
         b = _sess(pins, "sess-1", now=0.0, escalate=True)
         self.assertIs(b["pin_hit"], False)
         self.assertIs(b["escalated"], True)
@@ -602,7 +649,7 @@ class TestEscalation(unittest.TestCase):
 
     def test_deterministic(self):
         def run():
-            pins = _PinStore(ttl_s=100)
+            pins = _store(ttl_s=100)
             return [
                 _sess(pins, "sess-1", now=0.0),
                 _sess(pins, "sess-1", now=1.0, escalate=True),

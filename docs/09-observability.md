@@ -672,19 +672,34 @@ whichever of its per-surface shapes is present). A key ⇒ the session arm; no
 key ⇒ the stateless arm (goal 24, unchanged).
 
 **The pin store** (`obs_callback._PinStore`) is docs/12 §3 option (a) — the
-decided default for the single-gateway build phase: **gateway-local memory**,
-keyed by stickiness key, bounded (LRU-ish, 4096), with an **inactivity TTL**
-knob `POLICY_PIN_TTL_S` (default 86400 = the spec's 24h; every hit refreshes
-it). First sight of a key runs the stateless arm and **pins its choice**;
-subsequent same-key requests carry the pin, bypassing re-evaluation — a pure
-pin hit reads no registry and stamps `registry: null` (no health signal was
-consulted, and the record must not claim one). Because this is the *shadow*
-router's own state, the pin records what the policy **would have** pinned,
-not what actually served. **Restart story, by design:** pins are process
-memory; a restart (or TTL expiry) just means the next turn re-pins — docs/12
-§3's "the cache-loss cost is the same as a restart today". Both are proven
+decided default for the single-gateway build phase: **gateway-local**, keyed
+by stickiness key, bounded (least-recently-seen eviction past 4096), with an
+**inactivity TTL** knob `POLICY_PIN_TTL_S` (default 86400 = the spec's 24h;
+every hit refreshes it). First sight of a key runs the stateless arm and
+**pins its choice**; subsequent same-key requests carry the pin, bypassing
+re-evaluation — a pure pin hit reads no registry and stamps `registry: null`
+(no health signal was consulted, and the record must not claim one). Because
+this is the *shadow* router's own state, the pin records what the policy
+**would have** pinned, not what actually served.
+
+**Backing: a container-scoped SQLite file, not process memory** (knob
+`POLICY_PIN_DB`, default under the container's `/tmp` — the control-plane's
+own SQLite pattern). Discovered building this: **every profile runs the proxy
+with `--num_workers 2`**, and pins are the first *cross-request* state in the
+callback — per-process memory gave each worker its own contradictory pin
+universe (requests round-robin, so a session's pin "flapped" ~50% of turns).
+A multi-worker gateway is already "replicas" in docs/12 §3(a)'s sense. The
+file keeps §3(a)'s intent — nothing leaves the gateway container, no shared
+infra, no schema in the shared Postgres — while giving all workers one store;
+guarded SQL (`INSERT OR IGNORE` for pin-once, `UPDATE … WHERE escalated=0`
+for the hop) makes first-writer-wins and **exactly-once escalation atomic
+across workers**, not just threads. **Restart story, by design:** a recreated
+container starts with a fresh `/tmp`, so pins are lost — the next turn just
+re-pins (docs/12 §3's "the cache-loss cost is the same as a restart today").
+TTL, restart, worker-sharing, and cross-worker exactly-once are all proven
 offline with an injected clock (`obs_callback_test.py`), no docker, no
-sleeping. Postgres promotion is a later, flagged decision (docs/12 §8.3).
+sleeping. Postgres promotion — needed only when *replicas* (separate hosts)
+arrive — stays a later, flagged decision (docs/12 §8.3).
 
 **The block.** Same-key requests carry:
 
