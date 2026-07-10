@@ -227,6 +227,50 @@ block after risk 2) with the full basis. The table above stands as the
 evaluation record; the archgw/Plano column stays as-researched (rename note
 above). Re-look gate: ≥ 2027-01 AND Plano documents session affinity.
 
+### Goal-26 pre-build research — R1/R4/R9 verified, R6 sharpened (2026-07-10)
+
+Probed live on the pinned `v1.83.14-stable` (e2e stack + a throwaway
+pre-call callback rewriting `data["model"]` on an `x-probe-rewrite` header —
+the exact mechanic enforce mode will use), plus a source read inside the
+vetted image. Findings, in de-risking order:
+
+- **R1 ✅ VERIFIED (was: suspected).** Every LLM endpoint flows through
+  `base_process_llm_request` → `data = await pre_call_hook(...)` →
+  `route_request(data)`: the hook's returned dict IS what routes. Probed on
+  all three surfaces: a `claude-opus` request rewritten to `qwen3-coder` is
+  served by the workbench (mockd stamp) on chat, `/v1/messages`, and
+  `/v1/responses`.
+- **R4 ✅ VERIFIED (was: the flagged riskiest unknown).** The fallback lookup
+  keys off the model the ROUTER received (`kwargs["model"]` in
+  `async_function_with_fallbacks_common_utils`) — i.e. the **rewritten**
+  group, so the **policy-chosen backend's own chain** applies. Probed: 503 on
+  the rewrite target (`qwen3-coder`) → clean HTTP 200 served by
+  `claude-sonnet` (its chain's head). Exactly the wanted semantics: fallback
+  protects the policy's choice.
+- **R9 ✅ VERIFIED under rewrite.** Streaming with a rewritten model is
+  untouched on all three surfaces — chat SSE ends with `[DONE]`,
+  `/v1/messages` emits `message_stop`, `/v1/responses` emits
+  `response.completed`. The rewrite happens strictly before the first
+  backend byte; nothing buffers.
+- **R6 ⚠️ SHARPENED — the allowlist has NO post-rewrite backstop.**
+  `can_key_call_model` runs only during auth, on the model the client
+  requested. Probed: a key restricted to `claude-opus` gets HTTP 401 asking
+  for `qwen3-coder` directly — but a `claude-opus` request **rewritten** to
+  `qwen3-coder` returns HTTP 200. Under enforce, the policy layer is the
+  SOLE guardian of the never-leaves-the-building rule for the rewrite
+  target. The policy already candidate-filters by the key allowlist (§4
+  step 1), so it never chooses outside it by construction — goal 26 must
+  pin that with a dedicated test, because nothing downstream catches a bug.
+- **Records must stash the ORIGINAL ask at rewrite time.** Post-rewrite,
+  the entire pipeline (router, logging, our records) sees only the new
+  model: the probe's delivered record read `requested_model: qwen3-coder`
+  for a request the client addressed to `claude-opus`. The one place the
+  original survives is the client's own `response.model`, which LiteLLM
+  restores to the requested model on the DIRECT path (on the fallback path
+  the client sees the winner, unchanged from today). Enforce mode must
+  therefore capture requested-vs-chosen-vs-served in the hook, before
+  rewriting — nothing downstream can reconstruct it.
+
 ## 8. Open decisions (⛔ Needs-a-human, collected; ✅ = since decided)
 
 1. **Escalation trigger** — complexity threshold / verify-then-escalate /
