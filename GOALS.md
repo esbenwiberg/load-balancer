@@ -88,9 +88,37 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 ## § Autonomy-friendly (safe to run unattended)
 
 _The policy-layer build arc (24 → 25 → 26, engine decided 2026-07-09:
-LiteLLM custom policy layer) is COMPLETE — see § Done. Nothing is queued
-here right now; candidates live in § Needs-a-human (several become
-autonomy-friendly once their decision is made)._
+LiteLLM custom policy layer) is COMPLETE, and goal 27 gave the dashboard its
+per-dimension rollups — see § Done. Goals 28–29 below are its follow-ups
+(discovered during the goal-27 build); more candidates live in
+§ Needs-a-human (several become autonomy-friendly once their decision is
+made)._
+
+- **28. Workbench traffic join — heartbeat carries `api_base`.** Completion
+  condition: the control-plane heartbeat payload accepts an optional
+  `api_base` per (workbench, model) row (persisted in the registry, exposed
+  on `/models` instance drill-downs; absent → null, everything degrades as
+  today), and the dashboard's per-backend rollup (goal 27) joins attempt
+  `api_base` → `workbench_id` when the registry provides it, rendering the
+  workbench name on the backend-traffic table. Proof: control_plane_test +
+  dashboard_test cover the new field + join (including the no-api_base
+  degrade), `e2e/run.sh` exit 0 surfaced in the transcript, PR merged green.
+  Reversible; no new deps; mock workbenches gain the field in their
+  heartbeats.
+- **29. Streamed requests become first-class routing records.** Today no
+  `delivered` record fires for streamed responses on the pinned litellm
+  (docs/09 caveat) — streamed traffic is invisible to every per-request fold
+  and only surfaces via goal 27's `unattributed_requests` count. Completion
+  condition: obs_callback emits a delivered-equivalent record for streamed
+  responses (research the pin's post-stream hooks first — e.g. the success
+  callback's stream flag / `async_post_call_streaming_hook`; document what
+  the pin actually offers), carrying at minimum requested vs served, fallback
+  flag, tokens when the pin reports them, and the goal-16 correlation_id so
+  the existing folds pick it up unchanged. Proof: a dedicated e2e test
+  streams a request and asserts it appears in the dashboard's `requests`
+  view (not just unattributed), `e2e/run.sh` exit 0 surfaced in the
+  transcript, PR merged green. If the pin offers NO workable post-stream
+  hook, stop at a draft PR documenting the findings instead.
 
 ---
 

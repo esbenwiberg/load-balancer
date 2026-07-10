@@ -1266,6 +1266,16 @@ def test_dashboard_data_endpoint_shows_direct_request():
     assert rq.get("tokens_total"), (
         "dashboard request row must carry token usage: %r" % rq
     )
+    # Goal 27: the same delivered record feeds the per-dimension rollups —
+    # per-model traffic (demand vs supply), per-user, per-backend (deployment).
+    mrow = next(
+        (m for m in data.get("models", []) if m.get("model") == "claude-sonnet"), None
+    )
+    assert mrow and mrow["served"] >= 1 and mrow["requested"] >= 1, data.get("models")
+    assert any(b.get("attempts", 0) >= 1 for b in data.get("backends", [])), data.get(
+        "backends"
+    )
+    assert data.get("users"), "per-user rollup missing/empty: %r" % data.get("users")
 
 
 def test_dashboard_data_endpoint_shows_fallback_route():
@@ -2909,6 +2919,15 @@ def test_enforce_one_shot_served_by_cheapest_capable():
     # enforce (nothing downstream sees the original — the block carries it).
     assert row["requested_model"] == "qwen3-coder", row
     assert not row.get("fallback"), row
+    # Goal 27: enforcement is visible in the AGGREGATE too — the policy strip's
+    # enforced split counts this request apart from shadow opinion.
+    data = _poll_dash(
+        lambda d: (
+            (d.get("policy_agreement", {}).get("enforced") or {}).get("count", 0) >= 1
+        )
+    )
+    enf = data["policy_agreement"]["enforced"]
+    assert enf["count"] >= 1, enf
 
 
 def test_enforce_session_pin_and_stub_escalation_actually_serve():
@@ -2949,6 +2968,23 @@ def test_enforce_session_pin_and_stub_escalation_actually_serve():
     # Post-escalation turn: the NEW pin serves; no downward edge.
     r = _enforce_request("claude-sonnet", "after escalation", tags="session:" + sid)
     assert "served_model=claude-opus" in r.json()["choices"][0]["message"]["content"]
+
+    # Goal 27: the SESSIONS rollup folds this whole conversation into one row —
+    # latest pin state, the escalation, and the enforce mode at a glance.
+    def _sess_row(d):
+        for s in d.get("sessions", []):
+            if s.get("stickiness_key") == sid:
+                return s
+        return None
+
+    data = _poll_dash(lambda d: (_sess_row(d) or {}).get("turns", 0) >= 4)
+    srow = _sess_row(data)
+    assert srow, "no sessions-rollup row for %s: %r" % (sid, data.get("sessions"))
+    assert srow["turns"] >= 4, srow
+    assert srow["pinned_backend"] == "claude-opus", srow  # the post-hop pin
+    assert srow["escalated"] is True, srow
+    assert srow["enforced"] is True, srow
+    assert srow["pin_hits"] >= 1, srow
 
 
 def test_enforce_fallback_composes_and_the_pin_does_not_move():

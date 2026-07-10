@@ -798,6 +798,55 @@ triple on record; session pin + stub escalation actually serving; the
 503-fallback + pin-does-not-move + recovery story; streaming with proper
 terminators on chat//v1/messages//v1/responses; the governance guard.
 
+## Dashboard v3 — stats per model / user / session / backend (goal 27)
+
+The record streams above already carried every dimension a fleet operator asks
+about; goal 27 folds them into first-class rollups on `GET /api/records` and
+renders each as a table on the page. All folds are pure functions over the
+in-memory record store (`e2e/dashboard.py`), pinned offline in
+`dashboard_test.py` and asserted live in the e2e suite:
+
+- **`models`** — traffic per model, *demand vs supply*: how often an alias was
+  **asked for** vs how often it actually **served** (plus fallback wins, its
+  delivered/consumed tokens, cost). Under `ROUTER_POLICY=enforce` the record's
+  requested_model is the post-rewrite ask, so demand here is the *router's*
+  demand; the client's original ask lives in the policy block. Fleet
+  *capacity* per model stays on `/api/fleet` — different question.
+- **`users`** — per `user_id` across **all** their virtual keys (the per-key
+  table shows a two-key user as two rows; this shows one, with a distinct-key
+  count). Nulls collapse into one `(no user)` row.
+- **`sessions`** — one row per stickiness key (goal 22's derivation): turns,
+  distinct backends served, and the goal-25/26 state made visible — latest
+  pinned backend, pin hits, whether the one upward escalation fired, and
+  whether any turn was **enforced** vs shadow. Ordered by most recent
+  activity, using a sink-side `received_at` stamp (arrival time at the
+  dashboard — records carry no wall clock of their own; documented as such,
+  never presented as backend time).
+- **`backends`** — attempt-trail traffic per concrete deployment
+  `(backend, api_base)`: attempts, failures, tokens, mean completion latency,
+  tier. This is the honest per-workbench view **today**: the control-plane
+  registry has no `api_base`, so a hard attempts→workbench_id join does not
+  exist yet (follow-up goal — heartbeat gains `api_base`). In the dev/e2e
+  stacks each workbench is a distinct `api_base`, so the table already reads
+  per-box.
+
+Two visibility fixes ride along:
+
+- **Enforcement on the page** (the goal-26 gap): the policy badge now
+  distinguishes `enforced` (the policy *drove* routing) from shadow
+  agree/disagree — under enforcement, disagree means *post-rewrite fallback
+  drift* (the chain fired after the rewrite, docs/12 R4), rendered as
+  `enforced·drift`. Session-arm chips (`pin`, `esc`) surface goal 25's state
+  per request, and `policy_agreement` gains an `enforced` sub-count so the
+  strip reads "N enforced (M drift)".
+- **The streamed-traffic hole, surfaced** (not fixed): no `delivered` record
+  fires for streamed responses on the pin, so streamed requests are invisible
+  to every per-request fold. `overhead.unattributed_requests` now counts
+  distinct correlation ids that have attempts but no delivered record, and
+  the page says "N req / T tok unattributed (streamed/aborted — NOT in these
+  tables)" instead of silently undercounting. Making streamed traffic
+  first-class is an obs_callback change, queued as its own goal.
+
 ## What this is *not* (yet)
 
 - **Not durable.** All sinks are ephemeral (stdout ring / mockd + dashboard
