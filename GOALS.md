@@ -105,27 +105,7 @@ made)._
   degrade), `e2e/run.sh` exit 0 surfaced in the transcript, PR merged green.
   Reversible; no new deps; mock workbenches gain the field in their
   heartbeats.
-- **30. Dashboard v4 — routes/pages + entity drill-downs (the UX-audit
-  blueprint, 2026-07-10).** Owner verdict on v3: one page is too messy; wants
-  per-user sessions and a per-session trail with a title. The audit's
-  findings, all verified live: 0 anchors/0 focusable elements (no navigation
-  or drill-down at all), 18 hover-only tooltips carry every "why", 3 tables
-  clip columns at 1280px, one long transcript-hash key blows a table to
-  1519px, no timestamps on request/attempt rows. Completion condition:
-  `e2e/dashboard.py` (still ONE stdlib file, zero deps, no external assets)
-  serves hash-routed views — overview (strips + fleet), traffic (per-model +
-  per-backend), identity (per-key + per-user), sessions, requests+trail —
-  with a persistent header nav; every entity row links to a filtered detail
-  view, minimally `#/user/<id>` (that user's keys, sessions, requests) and
-  `#/session/<key>` (metadata-derived title: key alias · first-seen ·
-  dominant complexity · turns — NO prompt content, governance line holds;
-  pin/escalation state; the session's requests with nested attempt chips
-  rendered as visible text, not hover-only). Long identifiers truncate with
-  full-value-on-detail; request/attempt rows render `received_at` as
-  relative time. The existing `/api/records` + `/api/fleet` shapes stay
-  byte-compatible (additive only) so every current assertion passes
-  unchanged; `dashboard_test.py` covers any new folds; `e2e/run.sh` exit 0
-  surfaced in the transcript; PR merged green. Reversible throughout. Today no
+- **29. Streamed requests become first-class routing records.** Today no
   `delivered` record fires for streamed responses on the pinned litellm
   (docs/09 caveat) — streamed traffic is invisible to every per-request fold
   and only surfaces via goal 27's `unattributed_requests` count. Completion
@@ -210,6 +190,24 @@ decision is made.
    its condition literally holds on `main` — if in doubt, re-check it, don't
    trust the checkmark.
 
+- ✅ 30. Dashboard v4 — routes/pages + entity drill-downs (the UX-audit
+  blueprint) — the single scrolling page became hash-routed views
+  (`#/overview` strips+fleet, `#/traffic`, `#/identity`, `#/sessions`,
+  `#/requests`) behind a persistent header nav, still ONE stdlib file, zero
+  deps; every user id links to `#/user/<id>` (their keys, sessions,
+  requests) and every session to `#/session/<key>` — a per-turn table where
+  each turn shows its attempt-trail chips AND the policy reason + complexity
+  features as VISIBLE text (the "why" is no longer hover-only). Sessions get
+  METADATA-ONLY titles (`key alias · first-seen · dominant complexity ·
+  turns` — no prompt content, governance line holds) sourced from additive
+  rollup fields {key_alias, user_id, first_received_at, complexity_mix}.
+  Audit hardening: identifier truncation + click-to-copy, relative `age`
+  columns (sink-arrival), `Cache-Control: no-store` on the page shell
+  (stale-page bug observed live), query-string-tolerant `/` route, inline
+  SVG favicon. API shapes stayed byte-compatible; page-render e2e contract
+  unchanged by construction (all sections remain in the served HTML). Also
+  repaired goal 29's entry (its header was accidentally swallowed by PR
+  #49's insertion). docs/09 "Dashboard v4". — PR #50 (2026-07)
 - ✅ 27. Dashboard v3 — stats per model / user / session / backend +
   enforcement visibility — four new pure folds on `GET /api/records`, each a
   table on the page: `models` (traffic demand vs supply per alias), `users`

@@ -847,6 +847,38 @@ Two visibility fixes ride along:
   tables)" instead of silently undercounting. Making streamed traffic
   first-class is an obs_callback change, queued as its own goal.
 
+## Dashboard v4 — routes, pages & entity drill-downs (goal 30)
+
+Goal 27 gave the dashboard its data; a live UX audit (2026-07-10) showed the
+presentation had hit the wall: nine sections on one unbounded scroll, zero
+navigation or focusable elements, all explanations hover-only, tables clipping
+at laptop widths, and one long identifier able to blow a table out. V4 is the
+audit's blueprint, still ONE stdlib file with zero dependencies:
+
+- **Hash-routed views** — `#/overview` (strips + fleet), `#/traffic`
+  (per-model + per-backend), `#/identity` (per-key + per-user), `#/sessions`,
+  `#/requests` (requests + attempt trail) — behind a persistent header nav.
+  All sections remain in the served HTML (the router only toggles
+  visibility), so the page-render e2e contract is unchanged.
+- **Entity drill-downs** — every user id links to `#/user/<id>` (that user's
+  keys, sessions and requests) and every session links to `#/session/<key>`:
+  a per-turn table where each turn shows its attempt-trail chips **and the
+  policy's full reason + complexity features as visible text** — the "why"
+  is no longer hover-only where it matters.
+- **Metadata-only session titles** — `<key alias> · <first-seen HH:MM> ·
+  <dominant complexity> · <n> turns` (e.g. `repo-a · 14:02 · agentic ·
+  3 turns`). Records carry NO prompt content by design, so titles derive
+  strictly from metadata; the rollup gained `key_alias`, `user_id`,
+  `first_received_at` and `complexity_mix` (additive) to source them.
+- **Hardening from the audit** — identifier truncation with full value +
+  click-to-copy on detail views; relative `age` columns on request/attempt
+  rows (sink-arrival time); `Cache-Control: no-store` on the page shell
+  (a stale pre-upgrade page was observed served from browser cache); the
+  `/` route tolerates query strings; inline SVG favicon (kills the 404).
+
+`/api/records` and `/api/fleet` stayed byte-compatible (additive keys only) —
+every pre-v4 assertion passes unchanged.
+
 ## What this is *not* (yet)
 
 - **Not durable.** All sinks are ephemeral (stdout ring / mockd + dashboard
