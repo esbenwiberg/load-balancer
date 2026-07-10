@@ -39,7 +39,12 @@ from obs_callback import (  # noqa: E402  (needs the stub above)
     _ESCALATE_TAG,
     _apply_enforcement,
     _complexity,
+    _ctx_recall,
+    _ctx_remember,
+    _delivered_mark_once,
+    _delivered_stream_record,
     _PinStore,
+    _policy_remember,
     _policy_session,
     _policy_stateless,
     _policy_with_outcome,
@@ -711,6 +716,173 @@ class TestEnforcement(unittest.TestCase):
         self.assertEqual(out["chosen"], "qwen3-coder")
         self.assertEqual(out["actual"], "claude-sonnet")
         self.assertIs(out["agree"], False)  # the chain fired — visible
+
+
+# --- Streamed delivered records (goal 29) ------------------------------------
+# The pure builder over (success-event kwargs, pre-call context): what the
+# post-stream success event yields as the request's `delivered` record. The
+# hook-firing facts it builds on (the success event DOES fire post-stream for
+# streamed responses — fallback winners included, same pre-call trace_id, on
+# all three inbound surfaces; async_post_call_success_hook does NOT) were
+# probed live on the pinned v1.83.14 and are pinned by the dedicated e2e test.
+
+
+def _stream_kwargs(
+    cid="cid-g29",
+    group="qwen3-coder",
+    stream=True,
+    status="success",
+    tokens=(12, 9, 21),
+    headers=None,
+    messages=None,
+):
+    slo = {
+        "status": status,
+        "stream": stream,
+        "model_group": group,
+        "model": "openai/" + (group or "x"),
+        "model_id": "abcdef1234567890",
+        "api_base": "http://mockd:9100/v1",
+        "custom_llm_provider": "openai",
+        "response_cost": 0.024,
+        "prompt_tokens": tokens[0],
+        "completion_tokens": tokens[1],
+        "total_tokens": tokens[2],
+        "trace_id": cid,
+        "litellm_call_id": "call-1",
+    }
+    return {
+        "standard_logging_object": slo,
+        "messages": messages if messages is not None else [_user("stream me")],
+        "optional_params": {},
+        "litellm_params": {"metadata": {"headers": headers or {}}},
+    }
+
+
+class TestStreamedDelivered(unittest.TestCase):
+    def test_non_streamed_success_event_yields_nothing(self):
+        # The non-streamed path's delivered record comes from the post-call
+        # hook — the event-side builder must not double it.
+        self.assertIsNone(_delivered_stream_record(_stream_kwargs(stream=False)))
+        self.assertIsNone(_delivered_stream_record(_stream_kwargs(stream=None)))
+
+    def test_failure_event_yields_nothing(self):
+        # An aborted / mid-stream-dead stream delivered nothing; it stays
+        # visible via its attempt trail + the unattributed counts.
+        self.assertIsNone(_delivered_stream_record(_stream_kwargs(status="failure")))
+
+    def test_streamed_success_builds_full_delivered_record(self):
+        cid = "cid-g29-direct"
+        _ctx_remember(
+            cid,
+            {
+                "requested_model": "qwen3-coder",
+                "identity": {"key_alias": "k", "user_id": "u", "team_id": "t"},
+                "session": None,
+            },
+        )
+        r = _delivered_stream_record(_stream_kwargs(cid=cid))
+        self.assertEqual(r["event"], "delivered")
+        self.assertIs(r["stream"], True)
+        self.assertEqual(r["requested_model"], "qwen3-coder")
+        self.assertEqual(r["served_model"], "qwen3-coder")
+        self.assertIs(r["fallback"], False)
+        self.assertEqual(r["tokens"], {"prompt": 12, "completion": 9, "total": 21})
+        self.assertEqual(r["correlation_id"], cid)
+        self.assertEqual(r["served_model_id"], "abcdef123456")  # 12-char trunc
+        self.assertEqual(r["provider"], "openai")
+        self.assertEqual(r["response_cost"], 0.024)
+        self.assertEqual((r["key_alias"], r["user_id"], r["team_id"]), ("k", "u", "t"))
+        self.assertIn("complexity", r)  # classified from the event's messages
+
+    def test_streamed_fallback_winner_carries_requested_vs_served(self):
+        # The winner's event only knows the winner (model_group) — the
+        # pre-call stash restores what the request was routed FOR, which is
+        # the whole reason the context map exists.
+        cid = "cid-g29-fallback"
+        _ctx_remember(
+            cid,
+            {"requested_model": "qwen3-coder", "identity": None, "session": None},
+        )
+        r = _delivered_stream_record(_stream_kwargs(cid=cid, group="claude-sonnet"))
+        self.assertEqual(r["requested_model"], "qwen3-coder")
+        self.assertEqual(r["served_model"], "claude-sonnet")
+        self.assertIs(r["fallback"], True)
+
+    def test_context_miss_degrades_to_served_group_and_null_identity(self):
+        # Cap eviction / a stamping hiccup must yield an honest record, not a
+        # crash and not a phantom fallback.
+        r = _delivered_stream_record(
+            _stream_kwargs(cid="cid-g29-ctxmiss", group="claude-sonnet")
+        )
+        self.assertEqual(r["requested_model"], "claude-sonnet")
+        self.assertIs(r["fallback"], False)
+        self.assertEqual(
+            (r["key_alias"], r["user_id"], r["team_id"]), (None, None, None)
+        )
+
+    def test_same_cid_delivers_exactly_once(self):
+        cid = "cid-g29-once"
+        first = _delivered_stream_record(_stream_kwargs(cid=cid))
+        second = _delivered_stream_record(_stream_kwargs(cid=cid))
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+
+    def test_mark_once_claims_and_blocks(self):
+        self.assertTrue(_delivered_mark_once("cid-g29-guard"))
+        self.assertFalse(_delivered_mark_once("cid-g29-guard"))
+        # A missing join key can't be deduped — never drop a record over it.
+        self.assertTrue(_delivered_mark_once(None))
+        self.assertTrue(_delivered_mark_once(None))
+
+    def test_stashed_session_preferred_over_event_headers(self):
+        # The pre-call stash reads all three protocols' metadata shapes; the
+        # event-time header map is chat-only on this pin. The stash must win.
+        cid = "cid-g29-sess"
+        _ctx_remember(
+            cid,
+            {
+                "requested_model": "qwen3-coder",
+                "identity": None,
+                "session": {
+                    "request_class": "one-shot",
+                    "stickiness_key": "tagged-key",
+                    "key_source": "tag",
+                },
+            },
+        )
+        r = _delivered_stream_record(_stream_kwargs(cid=cid))
+        self.assertEqual(r["session"]["stickiness_key"], "tagged-key")
+
+    def test_event_headers_back_fill_session_on_context_miss(self):
+        r = _delivered_stream_record(
+            _stream_kwargs(
+                cid="cid-g29-sessmiss",
+                headers={"x-litellm-tags": "session:evt-key"},
+            )
+        )
+        self.assertEqual(r["session"]["stickiness_key"], "evt-key")
+        self.assertEqual(r["session"]["key_source"], "tag")
+
+    def test_policy_block_rides_with_served_outcome(self):
+        cid = "cid-g29-policy"
+        _ctx_remember(
+            cid,
+            {"requested_model": "qwen3-coder", "identity": None, "session": None},
+        )
+        _policy_remember(
+            cid, _policy_stateless(_CANDIDATES, [], "trivial", None, "absent")
+        )
+        r = _delivered_stream_record(_stream_kwargs(cid=cid, group="claude-sonnet"))
+        self.assertEqual(r["shadow_policy"]["chosen"], "qwen3-coder")
+        self.assertEqual(r["shadow_policy"]["actual"], "claude-sonnet")
+        self.assertIs(r["shadow_policy"]["agree"], False)
+
+    def test_ctx_store_bounded_and_recallable(self):
+        _ctx_remember("cid-g29-a", {"requested_model": "m"})
+        self.assertEqual(_ctx_recall("cid-g29-a")["requested_model"], "m")
+        self.assertIsNone(_ctx_recall("cid-g29-never"))
+        self.assertIsNone(_ctx_recall(None))
 
 
 class TestEscalateTag(unittest.TestCase):

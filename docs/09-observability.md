@@ -33,15 +33,18 @@ Keyed by `event`:
   served_model`** — the chosen backend and the fallback-hit flag, with the
   delivered token usage.
 
-> ⚠️ **LiteLLM quirk (verified against `v1.83.14-stable`).** On a *proxy
-> fallback*, LiteLLM does not reliably fire a success **`llm_call`** event for
-> the deployment that *won* the fallback — only the failed primary attempt is
-> guaranteed to log there. That is exactly why the `delivered` record exists: it
-> is emitted from the proxy's `async_post_call_success_hook` and names the winner
-> even when no success `llm_call` was logged for it. Treat `delivered` as the
-> authoritative "who served it" and the `llm_call` records as the attempt trail.
-> When the winner's success event *does* fire, it shares the failed primary's
-> `trace_id`, so you can also correlate the pair that way.
+> ⚠️ **LiteLLM quirk (verified against `v1.83.14-stable`).** On a
+> **non-streamed** *proxy fallback*, LiteLLM does not reliably fire a success
+> **`llm_call`** event for the deployment that *won* the fallback — only the
+> failed primary attempt is guaranteed to log there. That is exactly why the
+> `delivered` record exists: it is emitted from the proxy's
+> `async_post_call_success_hook` and names the winner even when no success
+> `llm_call` was logged for it. Treat `delivered` as the authoritative "who
+> served it" and the `llm_call` records as the attempt trail. When the winner's
+> success event *does* fire, it shares the failed primary's `trace_id`, so you
+> can also correlate the pair that way. (**Streamed** fallbacks behave
+> differently: a consumed stream's winner *always* fires its success event on
+> this pin — the goal-29 research, § "Streamed requests are first-class".)
 
 ### Trace correlation — joining a request to its attempt trail (goal 16)
 
@@ -399,18 +402,19 @@ the winner). Two conventions, both deliberate:
   nothing — the sum never guesses.
 - **The winner is counted exactly once.** When the trail contains a success
   attempt, its tokens are already in the sum. When it does **not** (the
-  verified quirk: a fallback winner's success event may not fire — streamed
-  winners in particular), the delivered tokens stand in for the winner. Never
-  dropped, never double-counted (`dashboard._consumed_tokens`).
+  verified quirk: a **non-streamed** fallback winner's success event may not
+  fire — goal-29 research showed a *consumed stream's* winner always logs),
+  the delivered tokens stand in for the winner. Never dropped, never
+  double-counted (`dashboard._consumed_tokens`).
 
 **The at-a-glance rollup.** `/api/records` carries an **`overhead`** object —
 `{requests, tokens_delivered, tokens_consumed, overhead_tokens,
 overhead_ratio, unattributed_attempt_tokens}` — rendered on the Requests
 header. A retry-storm or flappy-primary config shows up as a **ratio**, not a
 vibe. `unattributed_attempt_tokens` counts `llm_call` tokens whose
-`correlation_id` matches **no** `delivered` record — chiefly **streamed
-traffic** (no `delivered` record fires for streamed responses on the pinned
-LiteLLM — the standing caveat above) plus requests that errored out entirely.
+`correlation_id` matches **no** `delivered` record — since goal 29 gave
+streamed responses a `delivered` record of their own, that means
+aborted/mid-stream-dead streams plus requests that errored out entirely.
 It is surfaced **separately** rather than folded into the ratio, so the
 per-request math stays exact and the gap stays visible instead of silently
 skewing the number.
@@ -477,9 +481,9 @@ the tag is **omitted**, never guessed.
 
 **Where it lands.** Both record shapes: `delivered` (classified from the
 original request `data`) and best-effort on `llm_call` attempts (from the
-logging kwargs) — attempt-level stamping matters because **streamed requests
-fire no `delivered` record** on the pinned LiteLLM (the standing caveat), so
-the attempt trail is their only carrier. The dashboard shows a bucket badge
+logging kwargs) — attempt-level stamping keeps every attempt auditable alone
+(and was streamed traffic's only carrier until goal 29 gave streams a
+`delivered` record of their own). The dashboard shows a bucket badge
 per request (feature vector on hover) and `/api/records` carries a
 **`complexity_buckets`** distribution — untagged records count as
 `unclassified` so the denominator stays honest.
@@ -536,8 +540,9 @@ routing — zero influence, zero request-path latency.
      path is the fix.
   3. **`null`** — an untagged one-shot needs no stickiness.
 
-**Where it lands.** Delivered records AND attempt records (streamed traffic has
-no `delivered` record on this pin — the attempt trail is its carrier). The
+**Where it lands.** Delivered records AND attempt records (streamed included
+since goal 29 — before that the attempt trail was streamed traffic's only
+carrier). The
 dashboard shows a class badge per request (stickiness key + source on hover)
 and `/api/records` carries a **`request_classes`** distribution (untagged ⇒
 `unclassified`) — the sticky-vs-free load split the hybrid router's capacity
@@ -624,10 +629,9 @@ records built in *other* hooks. It travels by the **goal-16 correlation id**
 in a bounded module map: the id is already proven to reach every surface
 (delivered records via `data`, attempt events via `slo.trace_id`) — unlike
 the request `metadata` dict, whose shape varies across the three inbound
-protocols. `delivered` carries the authoritative verdict; `llm_call` attempts
-carry the block best-effort (`actual` = that attempt's alias on success only) —
-the carrier for **streamed** traffic, which fires no `delivered` record on
-this pin (the standing caveat).
+protocols. `delivered` carries the authoritative verdict — streamed requests included
+since goal 29; `llm_call` attempts carry the block best-effort (`actual` =
+that attempt's alias on success only).
 
 **Zero influence, on record.** The hook never touches `data["model"]`, never
 buffers a stream, and any policy error degrades to "no block" — the request
@@ -839,13 +843,13 @@ Two visibility fixes ride along:
   `enforced·drift`. Session-arm chips (`pin`, `esc`) surface goal 25's state
   per request, and `policy_agreement` gains an `enforced` sub-count so the
   strip reads "N enforced (M drift)".
-- **The streamed-traffic hole, surfaced** (not fixed): no `delivered` record
-  fires for streamed responses on the pin, so streamed requests are invisible
-  to every per-request fold. `overhead.unattributed_requests` now counts
+- **The streamed-traffic hole, surfaced** (not fixed here — **closed by goal
+  29**, § "Streamed requests are first-class"): at goal-27 time no `delivered`
+  record fired for streamed responses, so streamed requests were invisible
+  to every per-request fold. `overhead.unattributed_requests` counts
   distinct correlation ids that have attempts but no delivered record, and
-  the page says "N req / T tok unattributed (streamed/aborted — NOT in these
-  tables)" instead of silently undercounting. Making streamed traffic
-  first-class is an obs_callback change, queued as its own goal.
+  the page surfaces the count instead of silently undercounting — since goal
+  29 that means aborted/errored requests, not streamed ones.
 
 ## Dashboard v4 — routes, pages & entity drill-downs (goal 30)
 
@@ -879,13 +883,72 @@ audit's blueprint, still ONE stdlib file with zero dependencies:
 `/api/records` and `/api/fleet` stayed byte-compatible (additive keys only) —
 every pre-v4 assertion passes unchanged.
 
+## Streamed requests are first-class routing records (goal 29)
+
+**The hole this closes.** On the pinned LiteLLM, `async_post_call_success_hook`
+— the `delivered` record's carrier — **structurally never runs for streams**:
+every streaming route (chat SSE, Anthropic-messages SSE, the Responses bridge)
+early-returns through an SSE generator *before* the proxy reaches
+`post_call_success_hook` (`proxy/common_request_processing.py`). So streamed
+traffic had attempts but no request row: invisible to every per-request fold,
+surfacing only in goal 27's `unattributed_requests` count.
+
+**What the pin actually offers post-stream (the research, probed live on
+`v1.83.14-stable` — not guessed):**
+
+- `async_post_call_streaming_hook` — fires **per chunk**, receives only the
+  response text; no request dict, no join key. Useless as a record carrier.
+- `async_post_call_streaming_iterator_hook` — wraps the final response
+  iterator (fallback winner included) with `request_data` in hand. A workable
+  carrier, **rejected deliberately**: it sits ON the request path — a bug in
+  a pass-through generator breaks live streams, and per-surface usage parsing
+  (chat usage chunk vs `message_delta` vs `response.completed`) is fragile.
+  Observability must never be able to break the request path.
+- **The success event (`async_log_success_event`) — the chosen carrier.**
+  `CustomStreamWrapper` fires it when the client's stream is exhausted, with
+  the full `StandardLoggingPayload`: `stream: true`, the **assembled token
+  usage** (present even when the client never asked for `include_usage`),
+  cost, `api_base`, and our pre-call `trace_id`. Crucially, **it fires for a
+  streamed fallback WINNER too, carrying the same shared trace_id** —
+  verified on all three inbound surfaces. The long-standing "fallback winner
+  fires no success event" quirk is a **non-streamed-path** behavior; a
+  consumed stream always logs its success attempt on this pin.
+
+**The mechanism** (`obs_callback._delivered_stream_record`): a success event
+with `stream: true` yields the request's `delivered` record — marked
+`stream: true` so the carrier is on-record — and the existing folds pick it
+up unchanged. What the event alone cannot say is what the request was routed
+*for* (the winner's `model_group` IS the winner — a fallback would look
+direct), *who* asked, and the cross-protocol session tag. Those ride a
+**pre-call context stash** keyed by the goal-16 correlation id (the same
+bounded-map pattern as the policy blocks): `requested_model` read
+post-enforcement (so `fallback` keeps meaning "the availability chain fired",
+exactly the non-streamed semantics), identity read off `UserAPIKeyAuth` (the
+same source as the non-streamed path), and the session tag derived via the
+all-protocol header reader. On a stash miss the record degrades honestly
+(requested = served, null identity) rather than guessing. A bounded
+**dedupe guard** claims each correlation id so a future litellm upgrade that
+fires both carriers can only ever yield one `delivered` per request.
+
+**What deliberately still has no request row:** a stream the client ABORTED
+or that died mid-stream fires the *failure* event — nothing was delivered.
+Such traffic stays visible via its attempt trail and the unattributed counts,
+which since this goal mean "aborted/errored", not "streamed".
+
+Pinned live by `test_streamed_request_is_first_class_in_requests_view`
+(direct: row + tokens + minted-key identity + joined trail with `ttft_ms`)
+and `test_streamed_fallback_is_first_class_in_requests_view` (503'd primary,
+winner serves the stream: `fallback: true`, the 503 "why" and the winner's
+success on the same correlation id); the builder's edge cases (dedupe,
+stash miss, aborted streams) offline in `obs_callback_test.py`.
+
 ## What this is *not* (yet)
 
 - **Not durable.** All sinks are ephemeral (stdout ring / mockd + dashboard
   in-memory). Durable, queryable, per-user/team spend is [goal 11b](../GOALS.md)
   (Postgres spend logs).
 - **TTFT is per successful streamed attempt.** It rides the success `llm_call`
-  record, so it is present for direct streamed routes and for a streamed
-  fallback *winner* only when that winner's success event fires (docs/09 quirk);
+  record — present for direct streamed routes AND streamed fallback winners
+  (whose success event always fires on this pin, per the goal-29 research);
   the `delivered` summary does not carry it. Aggregated per-model TTFT
   (p50/p95) over these records is a later refinement.

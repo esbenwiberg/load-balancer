@@ -1137,9 +1137,10 @@ def test_streamed_llm_call_carries_ttft():
     token), and it must be <= latency_ms (time-to-completion). Non-streamed
     records omit it (guarded in test_direct_request_routing_record_no_fallback).
 
-    Direct route (claude-sonnet serves itself) so the winner's SUCCESS event
-    fires normally — on a fallback the winner's success llm_call is not reliably
-    logged (docs/09 quirk), and TTFT lives on that success record."""
+    Direct route (claude-sonnet serves itself), keeping this test about TTFT
+    alone — the streamed-fallback path (whose winner also fires the success
+    event, per the goal-29 research) is pinned by
+    test_streamed_fallback_is_first_class_in_requests_view."""
     with httpx.stream(
         "POST",
         GATEWAY + "/v1/chat/completions",
@@ -3170,3 +3171,134 @@ def test_enforce_governance_is_the_sole_guard():
     assert pol["chosen"] == "claude-opus", pol
     assert pol["actual"] == "claude-opus", pol
     assert "governance key-allowlist" in pol["reason"], pol
+
+
+# --- streamed requests as first-class routing records (goal 29) ---------------
+#
+# Research (probed live on the pinned v1.83.14, documented in docs/09): the
+# proxy's async_post_call_success_hook structurally NEVER runs for streams —
+# every streaming route early-returns through an SSE generator before it is
+# called — which is why streamed traffic used to be invisible to the per-request
+# folds. But CustomStreamWrapper fires the SUCCESS EVENT once the client's
+# stream is exhausted, with the full StandardLoggingPayload (stream:true, the
+# assembled usage, our pre-call correlation id), and it fires for the FALLBACK
+# WINNER too — the "fallback winner logs no success event" quirk is a
+# non-streamed behavior. obs_callback._delivered_stream_record turns that event
+# into the request's `delivered` record; these tests pin the whole path live:
+# stream -> success event -> delivered record -> dashboard requests view.
+
+
+def _drain_stream(payload, key=None, tags=None):
+    """POST a STREAMED chat request and consume it fully — LiteLLM only fires
+    the streamed success event once the whole stream is drained."""
+    headers = {"Authorization": "Bearer " + (key or KEY)}
+    if tags:
+        headers["x-litellm-tags"] = tags
+    with httpx.stream(
+        "POST",
+        GATEWAY + "/v1/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=TIMEOUT,
+    ) as resp:
+        assert resp.status_code == 200, resp.read()
+        for _line in resp.iter_lines():
+            pass
+
+
+def _request_row_by_session_key(data, skey):
+    for rq in data.get("requests", []):
+        if (rq.get("session") or {}).get("stickiness_key") == skey:
+            return rq
+    return None
+
+
+def test_streamed_request_is_first_class_in_requests_view():
+    """Goal 29: a DIRECT streamed request appears in the dashboard's requests
+    view — not just in the unattributed counts — carrying requested vs served,
+    the fallback flag, tokens, the goal-16 correlation id with its joined
+    attempt trail, the stream marker, and the minted key's identity (proving
+    the pre-call context stash, since the success event's own metadata is not
+    what the non-streamed path reads)."""
+    key_alias = _unique("repo-a")
+    user_id = _unique("user")
+    gen = _admin_post(
+        "/key/generate",
+        {"models": ["qwen3-coder"], "key_alias": key_alias, "user_id": user_id},
+    )
+    skey = _unique("g29-direct")
+    _drain_stream(
+        {
+            "model": "qwen3-coder",
+            "stream": True,
+            "messages": [{"role": "user", "content": "goal-29 direct stream"}],
+        },
+        key=gen["key"],
+        tags="session:" + skey,
+    )
+
+    data = _poll_dash(lambda d: _request_row_by_session_key(d, skey) is not None)
+    row = _request_row_by_session_key(data, skey)
+    assert row is not None, (
+        "streamed request never appeared in the requests view (goal 29): %r"
+        % [r.get("session") for r in data.get("requests", [])]
+    )
+    assert row["stream"] is True, row
+    assert row["requested_model"] == "qwen3-coder", row
+    assert row["served_model"] == "qwen3-coder", row
+    assert row["fallback"] is False, row
+    assert isinstance(row["tokens_total"], int) and row["tokens_total"] > 0, (
+        "streamed delivered record must carry the assembled usage: %r" % row
+    )
+    assert row["correlation_id"], row
+    # Identity via the pre-call stash — same source as the non-streamed path.
+    assert row["key_alias"] == key_alias, row
+    assert row["user_id"] == user_id, row
+    # The joined trail: the streamed success attempt shares the correlation id
+    # (it carries ttft_ms — the goal-18 streamed marker on the attempt side).
+    successes = [a for a in row["attempts"] if a.get("status") == "success"]
+    assert successes, "streamed request row lost its attempt trail: %r" % row
+    assert any(a.get("ttft_ms") is not None for a in successes), successes
+
+
+def test_streamed_fallback_is_first_class_in_requests_view():
+    """Goal 29, the half the old carrier could never see: a STREAMED request
+    whose primary 503s and whose fallback WINNER serves the stream still yields
+    a delivered record — requested names the asked-for alias, served the
+    winner, fallback:true — with the failed 503 attempt joined on the same
+    correlation id. (The stateless-policy 'zero influence' guarantee is pinned
+    elsewhere; here the chain is REAL litellm availability fallback.)"""
+    _inject({"model": "qwen3-coder", "status": 503})  # cleared by the fixture
+    skey = _unique("g29-fb")
+    _drain_stream(
+        {
+            "model": "qwen3-coder",
+            "stream": True,
+            "messages": [{"role": "user", "content": "goal-29 fallback stream"}],
+        },
+        tags="session:" + skey,
+    )
+
+    data = _poll_dash(lambda d: _request_row_by_session_key(d, skey) is not None)
+    row = _request_row_by_session_key(data, skey)
+    assert row is not None, (
+        "streamed FALLBACK request never appeared in the requests view: %r"
+        % [r.get("session") for r in data.get("requests", [])]
+    )
+    assert row["stream"] is True, row
+    assert row["requested_model"] == "qwen3-coder", row
+    assert row["served_model"] == "claude-sonnet", (
+        "expected the first fallback-chain entry to serve the stream: %r" % row
+    )
+    assert row["fallback"] is True, row
+    assert isinstance(row["tokens_total"], int) and row["tokens_total"] > 0, row
+    # The "why" is on the joined trail: the faulted primary's 503 attempt(s)
+    # AND the winner's streamed success share this request's correlation id.
+    codes = [
+        a.get("error_code") for a in row["attempts"] if a.get("status") == "failure"
+    ]
+    assert "503" in codes, "the 503 'why' must ride the joined trail: %r" % row
+    assert any(
+        a.get("status") == "success" and a.get("backend") == "openai/claude-sonnet"
+        for a in row["attempts"]
+    ), row

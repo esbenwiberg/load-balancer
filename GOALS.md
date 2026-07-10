@@ -89,10 +89,10 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 
 _The policy-layer build arc (24 → 25 → 26, engine decided 2026-07-09:
 LiteLLM custom policy layer) is COMPLETE, and goal 27 gave the dashboard its
-per-dimension rollups — see § Done. Goals 28–29 below are its follow-ups
-(discovered during the goal-27 build); more candidates live in
-§ Needs-a-human (several become autonomy-friendly once their decision is
-made)._
+per-dimension rollups — see § Done. Goal 28 below is its remaining follow-up
+(discovered during the goal-27 build; sibling 29 is done); more candidates
+live in § Needs-a-human (several become autonomy-friendly once their
+decision is made)._
 
 - **28. Workbench traffic join — heartbeat carries `api_base`.** Completion
   condition: the control-plane heartbeat payload accepts an optional
@@ -105,21 +105,6 @@ made)._
   degrade), `e2e/run.sh` exit 0 surfaced in the transcript, PR merged green.
   Reversible; no new deps; mock workbenches gain the field in their
   heartbeats.
-- **29. Streamed requests become first-class routing records.** Today no
-  `delivered` record fires for streamed responses on the pinned litellm
-  (docs/09 caveat) — streamed traffic is invisible to every per-request fold
-  and only surfaces via goal 27's `unattributed_requests` count. Completion
-  condition: obs_callback emits a delivered-equivalent record for streamed
-  responses (research the pin's post-stream hooks first — e.g. the success
-  callback's stream flag / `async_post_call_streaming_hook`; document what
-  the pin actually offers), carrying at minimum requested vs served, fallback
-  flag, tokens when the pin reports them, and the goal-16 correlation_id so
-  the existing folds pick it up unchanged. Proof: a dedicated e2e test
-  streams a request and asserts it appears in the dashboard's `requests`
-  view (not just unattributed), `e2e/run.sh` exit 0 surfaced in the
-  transcript, PR merged green. If the pin offers NO workable post-stream
-  hook, stop at a draft PR documenting the findings instead.
-
 ---
 
 ## § Needs-a-human (do NOT run unattended)
@@ -190,6 +175,28 @@ decision is made.
    its condition literally holds on `main` — if in doubt, re-check it, don't
    trust the checkmark.
 
+- ✅ 29. Streamed requests become first-class routing records — the demanded
+  research first (probed live on the pin, documented in docs/09 "Streamed
+  requests are first-class"): `async_post_call_success_hook` structurally
+  never runs for streams (every streaming route early-returns through an SSE
+  generator); the per-chunk streaming hook carries no request dict/join key;
+  the iterator hook works but sits ON the request path — rejected. The
+  chosen carrier: the post-stream SUCCESS EVENT, which fires with
+  stream:true, assembled usage and our pre-call trace_id on all three
+  surfaces — **including the streamed fallback WINNER** (the "winner fires
+  no success event" quirk is non-streamed-only — key research finding).
+  `obs_callback._delivered_stream_record` turns it into the request's
+  `delivered` record (marked stream:true, folds pick it up unchanged);
+  requested-vs-served/identity/session ride a pre-call context stash keyed
+  by the goal-16 correlation id (requested read post-enforcement so
+  `fallback` keeps its meaning; identity from UserAPIKeyAuth, same source as
+  non-streamed; session via the all-protocol header reader). Bounded dedupe
+  guard = exactly-one-delivered per request even if a future pin fires both
+  carriers. Aborted/mid-stream-dead streams deliberately stay unattributed
+  (nothing was delivered) — the dashboard's unattributed labels now say so.
+  11 new offline builder tests + 2 e2e (direct streamed row incl. minted-key
+  identity + joined trail with ttft; streamed 503-fallback row with the
+  winner serving and the "why" on the trail). — PR #51 (2026-07)
 - ✅ 30. Dashboard v4 — routes/pages + entity drill-downs (the UX-audit
   blueprint) — the single scrolling page became hash-routed views
   (`#/overview` strips+fleet, `#/traffic`, `#/identity`, `#/sessions`,

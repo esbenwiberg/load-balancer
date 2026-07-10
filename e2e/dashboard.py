@@ -240,6 +240,11 @@ def _requests_view(records: list) -> list:
                 "provider": r.get("provider"),
                 "api_base": r.get("api_base"),
                 "fallback": bool(r.get("fallback")),
+                # STREAMED delivery (goal 29): true when this request's
+                # delivered record was built from the post-stream success
+                # event (obs_callback._delivered_stream_record). False on
+                # non-streamed records, which omit the key.
+                "stream": bool(r.get("stream")),
                 "response_cost": r.get("response_cost"),
                 "tokens_total": tokens.get("total"),
                 "tokens_prompt": tokens.get("prompt"),
@@ -582,11 +587,12 @@ def _overhead_rollup(records: list, requests: list) -> dict:
     client); this rollup exists so OUR gateway can never hide that shape.
 
     `unattributed_attempt_tokens` counts llm_call tokens whose correlation_id
-    matches NO delivered record — on the pinned litellm that is chiefly STREAMED
-    traffic (no delivered record fires for streamed responses; docs/09 caveat)
-    plus requests that errored out entirely. Surfaced separately rather than
-    folded into the ratio, so the per-request math stays exact and the gap
-    stays VISIBLE instead of silently skewing the ratio."""
+    matches NO delivered record. Since goal 29 gave streamed responses a
+    delivered record of their own, that is ABORTED/mid-stream-dead streams
+    (nothing was delivered — deliberately not a request row) plus requests
+    that errored out entirely. Surfaced separately rather than folded into
+    the ratio, so the per-request math stays exact and the gap stays VISIBLE
+    instead of silently skewing the ratio."""
     delivered = 0
     consumed = 0
     for rq in requests:
@@ -623,13 +629,13 @@ def _overhead_rollup(records: list, requests: list) -> dict:
         "overhead_ratio": round(consumed / delivered, 3) if delivered else None,
         "unattributed_attempt_tokens": unattributed,
         # HOW MANY requests the per-request view is BLIND to (goal 27): distinct
-        # correlation ids with attempts but no delivered record — chiefly
-        # streamed traffic (no delivered event fires on the pin; docs/09
-        # caveat) plus requests that errored out entirely. Surfaced as a COUNT
-        # so the dashboard says "N requests happened that the tables below
-        # don't show" instead of lying by omission. Attempts with no
-        # correlation_id at all can't be grouped into requests and are covered
-        # by the token counter above only.
+        # correlation ids with attempts but no delivered record — since goal 29
+        # that is aborted/mid-stream-dead streams plus requests that errored
+        # out entirely (a COMPLETED stream delivers like everything else).
+        # Surfaced as a COUNT so the dashboard says "N requests happened that
+        # the tables below don't show" instead of lying by omission. Attempts
+        # with no correlation_id at all can't be grouped into requests and are
+        # covered by the token counter above only.
         "unattributed_requests": len(unattributed_cids),
     }
 
@@ -1326,8 +1332,8 @@ function overheadStrip(data){
     +' / consumed '+esc(ov.tokens_consumed)
     +(ov.overhead_ratio!=null ? ' (ratio '+esc(ov.overhead_ratio)+')' : '')
     +(ov.unattributed_requests ? ' &middot; '+esc(ov.unattributed_requests)+' req / '
-      +esc(ov.unattributed_attempt_tokens)+' tok unattributed (streamed/aborted &mdash; NOT in these tables)'
-      : (ov.unattributed_attempt_tokens ? ' &middot; +'+esc(ov.unattributed_attempt_tokens)+' unattributed (streamed/aborted)' : ''));
+      +esc(ov.unattributed_attempt_tokens)+' tok unattributed (aborted/errored &mdash; NOT in these tables)'
+      : (ov.unattributed_attempt_tokens ? ' &middot; +'+esc(ov.unattributed_attempt_tokens)+' unattributed (aborted/errored)' : ''));
 }
 function mixStrip(data){
   const cx = data.complexity_buckets || {};

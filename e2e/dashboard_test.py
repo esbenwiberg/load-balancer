@@ -170,6 +170,20 @@ class TestRequestsViewIdentity(unittest.TestCase):
         self.assertIsNone(row["team_id"])
 
 
+class TestRequestsViewStreamMarker(unittest.TestCase):
+    def test_streamed_delivered_record_marks_the_row(self):
+        # Goal 29: a delivered record built from the post-stream success event
+        # carries stream:true; the view surfaces it so streamed requests are
+        # first-class AND distinguishable.
+        row = dashboard._requests_view([_delivered(stream=True)])[0]
+        self.assertIs(row["stream"], True)
+
+    def test_non_streamed_record_reads_false(self):
+        # Non-streamed records omit the key entirely — the row says False.
+        row = dashboard._requests_view([_delivered()])[0]
+        self.assertIs(row["stream"], False)
+
+
 class TestKeyRollup(unittest.TestCase):
     def test_rollup_aggregates_per_key(self):
         recs = [
@@ -953,11 +967,12 @@ class TestBackendRollup(unittest.TestCase):
 
 
 class TestUnattributedRequests(unittest.TestCase):
-    def test_streamed_attempts_counted_as_unattributed_requests(self):
+    def test_attempts_without_delivered_counted_as_unattributed_requests(self):
         # Two attempts sharing one correlation_id with no delivered record are
-        # ONE unattributed request (a streamed fallback, say); a third with its
-        # own id is another. Attempts with no id at all can't be grouped and
-        # must not inflate the count.
+        # ONE unattributed request (an aborted/mid-stream-dead request, or one
+        # that errored out entirely — since goal 29 a COMPLETED stream delivers
+        # like everything else); a third with its own id is another. Attempts
+        # with no id at all can't be grouped and must not inflate the count.
         records = [
             {
                 "event": "llm_call",
