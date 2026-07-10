@@ -190,6 +190,22 @@ decision is made.
    its condition literally holds on `main` — if in doubt, re-check it, don't
    trust the checkmark.
 
+- ✅ 27. Dashboard v3 — stats per model / user / session / backend +
+  enforcement visibility — four new pure folds on `GET /api/records`, each a
+  table on the page: `models` (traffic demand vs supply per alias), `users`
+  (per user_id across ALL their keys, distinct-key count), `sessions` (one
+  row per stickiness key: turns, latest pin state, pin hits, the one
+  escalation, enforced vs shadow, recency-ordered via a sink-side
+  `received_at` stamp), `backends` (per (backend, api_base) deployment —
+  the honest per-workbench view until the registry carries api_base, goal
+  28). The goal-26 gap closed on the page: the policy badge distinguishes
+  ENFORCED routing from shadow opinion (`enforced·drift` = post-rewrite
+  fallback), with pin/esc chips (goal 25) and an `enforced` sub-count on
+  `policy_agreement`. The streamed-traffic hole SURFACED (not fixed):
+  `overhead.unattributed_requests` counts requests the per-request folds
+  can't see (→ goal 29). 19 new offline shaping tests; e2e asserts the
+  rollups live incl. the full sessions row on the enforce pin+escalation
+  path. docs/09 "Dashboard v3". — PR #48 (2026-07)
 - ✅ 26. Enforcement flip — policy drives routing behind a flag —
   `ROUTER_POLICY` knob (default `shadow`: everything byte-for-byte unchanged,
   proven by the untouched existing suite running against the default
