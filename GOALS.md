@@ -162,6 +162,28 @@ decision is made.
    its condition literally holds on `main` — if in doubt, re-check it, don't
    trust the checkmark.
 
+- ✅ 26. Enforcement flip — policy drives routing behind a flag —
+  `ROUTER_POLICY` knob (default `shadow`: everything byte-for-byte unchanged,
+  proven by the untouched existing suite running against the default
+  gateway; `enforce`: the owned pre-call hook rewrites the requested model
+  to the policy's choice for BOTH arms incl. the stub escalation).
+  `_apply_enforcement` stashes the client's original ask on the block
+  pre-rewrite (nothing downstream can reconstruct it — PR #46 research) so
+  records carry `enforced:true` + requested/chosen/served; top-level
+  requested_model shows the post-policy model, `fallback` keeps meaning
+  "the chain fired" (served != chosen). E2e: second gateway container
+  (`litellm-e2e-enforce`, :4001, own pin store) + 5 dedicated tests —
+  cheapest-capable actually serves (client-visible stamp + triple on
+  record + response.model restored to the ask on the direct path), pin +
+  stub escalation serve (traffic follows the pin flip, exactly once), R4
+  live (503 on the chosen backend → clean 200 via ITS chain, pin does NOT
+  move, next healthy turn re-served by the pin — §6 proven), streaming
+  untouched on all three surfaces, governance sole-guard (LiteLLM never
+  re-checks the allowlist post-rewrite — the policy filter is the only
+  wall). 5 new offline tests (71 total). Healthcheck windows widened after
+  `depends_on` made a latent prisma-boot tightness binding. Docs: docs/09
+  "Enforcement", docs/12 banners+§6, e2e/README. Flipping a REAL deployment
+  to enforce is an ops call, deliberately not made here. — PR #47 (2026-07)
 - ✅ 25. Shadow sticky pins + escalation mechanics (stub trigger) — the
   session arm (docs/12 §2/§3/§5) in shadow: `_PinStore` + `_policy_session`
   in obs_callback, dispatched pre-call by goal-22's stickiness key (tag >
