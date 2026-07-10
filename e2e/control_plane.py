@@ -52,7 +52,8 @@ container with no pip install.
 
 HTTP surface:
   POST /heartbeat   {workbench_id, models:[{model, warm, in_flight,
-                     agent_capable, healthy}]}   # upsert; refreshes last_seen
+                     agent_capable, healthy, api_base?}]}
+                                                 # upsert; refreshes last_seen
   GET  /registry                                 # per-(workbench,model) rows,
                                                  #   with derived healthy + age
   GET  /models                                   # aggregated per-model state —
@@ -128,10 +129,16 @@ class Registry:
                     agent_capable  INTEGER NOT NULL DEFAULT 0,
                     reported_healthy INTEGER NOT NULL DEFAULT 1,
                     last_seen_ms   INTEGER NOT NULL,
+                    api_base       TEXT,
                     PRIMARY KEY (workbench_id, model)
                 )
                 """
             )
+            # Goal 28: pre-existing db files (CONTROL_PLANE_DB is durable by
+            # default) lack the api_base column — add it in place.
+            cols = {r[1] for r in self._db.execute("PRAGMA table_info(registrations)")}
+            if "api_base" not in cols:
+                self._db.execute("ALTER TABLE registrations ADD COLUMN api_base TEXT")
             self._db.commit()
 
     # --- writes ------------------------------------------------------------
@@ -140,8 +147,15 @@ class Registry:
         """Upsert one workbench's per-model state; stamp last_seen = now.
 
         `models` is a list of dicts: {model, warm?, in_flight?, agent_capable?,
-        healthy?}. Missing fields default conservatively (not warm, no load,
-        not agent-capable, reported healthy). Returns the count accepted.
+        healthy?, api_base?}. Missing fields default conservatively (not warm,
+        no load, not agent-capable, reported healthy, no api_base). Returns the
+        count accepted.
+
+        `api_base` (goal 28) is the OpenAI-compatible base URL this workbench
+        serves the model on — the join key that lets the dashboard attribute
+        gateway attempt traffic (which records api_base) back to a workbench.
+        Optional: absent → NULL, and full-snapshot semantics apply like every
+        other field — a beat that omits it clears a previously-declared one.
 
         A heartbeat REPLACES the prior row for each (workbench, model) — it is a
         full snapshot of that model's current state, not a delta. Re-heartbeating
@@ -157,18 +171,22 @@ class Registry:
                 model = (m or {}).get("model")
                 if not model:
                     continue  # skip malformed entries rather than fail the whole beat
+                api_base = m.get("api_base")
+                if not isinstance(api_base, str) or not api_base.strip():
+                    api_base = None  # junk types / empty strings read as absent
                 self._db.execute(
                     """
                     INSERT INTO registrations
                         (workbench_id, model, warm, in_flight, agent_capable,
-                         reported_healthy, last_seen_ms)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                         reported_healthy, last_seen_ms, api_base)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(workbench_id, model) DO UPDATE SET
                         warm=excluded.warm,
                         in_flight=excluded.in_flight,
                         agent_capable=excluded.agent_capable,
                         reported_healthy=excluded.reported_healthy,
-                        last_seen_ms=excluded.last_seen_ms
+                        last_seen_ms=excluded.last_seen_ms,
+                        api_base=excluded.api_base
                     """,
                     (
                         workbench_id,
@@ -178,6 +196,7 @@ class Registry:
                         1 if m.get("agent_capable") else 0,
                         0 if m.get("healthy") is False else 1,
                         now,
+                        api_base,
                     ),
                 )
                 accepted += 1
@@ -208,6 +227,7 @@ class Registry:
         return {
             "workbench_id": row["workbench_id"],
             "model": row["model"],
+            "api_base": row["api_base"],  # goal 28: attempts→workbench join key
             "warm": bool(row["warm"]),
             "in_flight": row["in_flight"],
             "agent_capable": bool(row["agent_capable"]),

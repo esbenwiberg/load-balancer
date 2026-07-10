@@ -2063,6 +2063,85 @@ def test_dashboard_fleet_surfaces_derived_health():
     assert insts["wb-live"]["healthy"] is True, insts["wb-live"]
 
 
+def test_backend_rollup_joins_workbench_via_heartbeat_api_base():
+    """Goal 28: the attempts→workbench join, end to end. A heartbeat may now
+    declare the api_base a workbench serves on; the registry persists it, the
+    fleet drill-down exposes it, and the dashboard's per-backend rollup joins
+    attempt api_base → workbench_id so the backend-traffic table names the box.
+    Also proves the degrade: BEFORE any workbench declares the api_base, the
+    same row renders with workbench_id null (pre-goal-28 behaviour intact)."""
+    # Drive one request through the gateway so the rollup has a live row
+    # carrying the api_base the gateway actually dialed.
+    r = httpx.post(
+        GATEWAY + "/v1/chat/completions",
+        headers=AUTH,
+        json={
+            "model": "claude-sonnet",
+            "messages": [{"role": "user", "content": "ping workbench join"}],
+        },
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+
+    data = _poll_dash(
+        lambda d: any(
+            b.get("attempts", 0) >= 1 and b.get("api_base")
+            for b in d.get("backends", [])
+        )
+    )
+    rows = [b for b in data.get("backends", []) if b.get("api_base")]
+    assert rows, (
+        "backends rollup has no row with an api_base to join on: %r"
+        % data.get("backends")
+    )
+    # The registry is empty (autouse reset) — the join must degrade, not guess.
+    assert all(b.get("workbench_id") is None for b in rows), (
+        "no workbench declared this api_base yet, so workbench_id must be "
+        "null: %r" % rows
+    )
+    api_base = rows[0]["api_base"]
+
+    # Now a workbench declares that exact api_base in its heartbeat...
+    _beat(
+        "wb-e2e-join",
+        "claude-sonnet",
+        warm=True,
+        healthy=True,
+        api_base=api_base,
+    )
+
+    # ...it surfaces on the fleet's per-instance drill-down...
+    fleet = _poll_fleet(
+        lambda d: (
+            d.get("available")
+            and any(
+                i.get("workbench_id") == "wb-e2e-join" and i.get("api_base") == api_base
+                for i in d.get("instances", [])
+            )
+        )
+    )
+    assert any(
+        i.get("workbench_id") == "wb-e2e-join" and i.get("api_base") == api_base
+        for i in fleet.get("instances", [])
+    ), "fleet drill-down must expose the heartbeat-declared api_base: %r" % (
+        fleet.get("instances"),
+    )
+
+    # ...and the SAME backend row now names the workbench.
+    data = _poll_dash(
+        lambda d: any(
+            b.get("workbench_id") == "wb-e2e-join" for b in d.get("backends", [])
+        )
+    )
+    row = next(
+        (b for b in data.get("backends", []) if b.get("api_base") == api_base), None
+    )
+    assert row and row.get("workbench_id") == "wb-e2e-join", (
+        "backend row must join to the workbench that declared its api_base: %r"
+        % data.get("backends")
+    )
+
+
 # --- spend audit: users, teams, attribution, durability (goal 11b) -----------
 # Goal 11 proved the wallet GATES (over-budget / over-limit -> clean 4xx). Goal
 # 11b proves the LEDGER: with per-model costs configured (litellm-config.e2e.yaml

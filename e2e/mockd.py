@@ -150,6 +150,11 @@ def _heartbeat_config():
         "url": url + "/heartbeat",
         "models": models,
         "workbench_id": INSTANCE or os.environ.get("HEARTBEAT_WORKBENCH_ID", "mockd"),
+        # Goal 28: the OpenAI-compatible base URL THIS box serves on — as the
+        # gateway's litellm-config spells it, so the dashboard can join attempt
+        # traffic (which records api_base) back to this workbench. Optional:
+        # unset → omitted from beats, the registry stores null, nothing joins.
+        "api_base": os.environ.get("HEARTBEAT_API_BASE", "").strip() or None,
         "agent_capable": os.environ.get("HEARTBEAT_AGENT_CAPABLE", "1")
         not in ("0", "", "false"),
         "interval_s": max(
@@ -163,18 +168,18 @@ def _beat_once(cfg: dict) -> None:
     A mock is always warm + reported-healthy; in_flight is the LIVE counter (a
     fleet-wide snapshot, so the same count is reported for each served model —
     the box, not the model, is what's loaded)."""
+    entry = {
+        "warm": True,
+        "in_flight": INFLIGHT.value(),
+        "agent_capable": cfg["agent_capable"],
+        "healthy": True,
+    }
+    if cfg["api_base"]:
+        # One box, one base URL — the same api_base for every model it serves.
+        entry["api_base"] = cfg["api_base"]
     payload = {
         "workbench_id": cfg["workbench_id"],
-        "models": [
-            {
-                "model": m,
-                "warm": True,
-                "in_flight": INFLIGHT.value(),
-                "agent_capable": cfg["agent_capable"],
-                "healthy": True,
-            }
-            for m in cfg["models"]
-        ],
+        "models": [dict(entry, model=m) for m in cfg["models"]],
     }
     data = json.dumps(payload).encode()
     req = urllib.request.Request(

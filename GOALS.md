@@ -88,23 +88,12 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 ## § Autonomy-friendly (safe to run unattended)
 
 _The policy-layer build arc (24 → 25 → 26, engine decided 2026-07-09:
-LiteLLM custom policy layer) is COMPLETE, and goal 27 gave the dashboard its
-per-dimension rollups — see § Done. Goal 28 below is its remaining follow-up
-(discovered during the goal-27 build; sibling 29 is done); more candidates
-live in § Needs-a-human (several become autonomy-friendly once their
-decision is made)._
+LiteLLM custom policy layer) is COMPLETE, and the goal-27 dashboard-rollup
+follow-ups (28 + 29) are done — see § Done. **This queue is currently
+EMPTY**: nothing is vetted for an unattended run. More candidates live in
+§ Needs-a-human (several become autonomy-friendly once their decision is
+made — the escalation trigger is the one that unblocks the most)._
 
-- **28. Workbench traffic join — heartbeat carries `api_base`.** Completion
-  condition: the control-plane heartbeat payload accepts an optional
-  `api_base` per (workbench, model) row (persisted in the registry, exposed
-  on `/models` instance drill-downs; absent → null, everything degrades as
-  today), and the dashboard's per-backend rollup (goal 27) joins attempt
-  `api_base` → `workbench_id` when the registry provides it, rendering the
-  workbench name on the backend-traffic table. Proof: control_plane_test +
-  dashboard_test cover the new field + join (including the no-api_base
-  degrade), `e2e/run.sh` exit 0 surfaced in the transcript, PR merged green.
-  Reversible; no new deps; mock workbenches gain the field in their
-  heartbeats.
 ---
 
 ## § Needs-a-human (do NOT run unattended)
@@ -175,6 +164,21 @@ decision is made.
    its condition literally holds on `main` — if in doubt, re-check it, don't
    trust the checkmark.
 
+- ✅ 28. Workbench traffic join — heartbeat carries `api_base` — the
+  control-plane heartbeat accepts an optional `api_base` per (workbench,
+  model) row (full-snapshot semantics like every other field: an omitting
+  beat clears it; junk/empty values read as absent; in-place ALTER TABLE
+  migration for pre-goal-28 db files), persisted and exposed on /registry +
+  /models instance drill-downs. The dashboard's per-backend rollup joins
+  attempt `api_base` → `workbench_id` server-side in /api/records via the
+  same fleet read /api/fleet uses (exact match after trailing-slash strip —
+  no URL canonicalization guessing; an api_base claimed by two workbenches
+  is ambiguous → dropped, never guessed; control-plane down/unconfigured →
+  null workbench, table reads exactly as before), and the backend-traffic
+  table gained the workbench column. mockd workbenches declare it via
+  HEARTBEAT_API_BASE (wired in the dev stack to each box's litellm-config
+  api_base). 5 new control_plane tests + 9 dashboard tests + 1 e2e proving
+  degrade-then-join live. — PR #52 (2026-07)
 - ✅ 29. Streamed requests become first-class routing records — the demanded
   research first (probed live on the pin, documented in docs/09 "Streamed
   requests are first-class"): `async_post_call_success_hook` structurally
