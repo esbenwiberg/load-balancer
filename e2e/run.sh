@@ -21,6 +21,7 @@ done
 COMPOSE="docker compose -f docker-compose.e2e.yaml"
 export LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-sk-e2e-master-test-key}"
 export GATEWAY_URL="${GATEWAY_URL:-http://localhost:4000}"
+export GATEWAY_ENFORCE_URL="${GATEWAY_ENFORCE_URL:-http://localhost:4001}"  # goal-26 enforce-mode gateway
 export MOCKD_URL="${MOCKD_URL:-http://localhost:9100}"
 export DASH_URL="${DASH_URL:-http://localhost:9300}"   # goal-12 dashboard sink + data endpoint
 export CONTROL_PLANE_URL="${CONTROL_PLANE_URL:-http://localhost:9400}"  # goal-13 fleet registry
@@ -56,6 +57,22 @@ for i in $(seq 1 60); do
   if [[ "$i" -eq 60 ]]; then
     echo "ERROR: gateway did not become healthy" >&2
     $COMPOSE logs --tail=50 litellm >&2 || true
+    exit 1
+  fi
+  sleep 2
+done
+
+# The enforce-mode gateway (goal 26) boots AFTER the shadow one (depends_on:
+# migrations). Wait for it too — the dedicated enforce tests hit it directly.
+echo "--- waiting for enforce-gateway health ---"
+for i in $(seq 1 60); do
+  if curl -sf "$GATEWAY_ENFORCE_URL/health/liveliness" >/dev/null 2>&1; then
+    echo "enforce gateway healthy"
+    break
+  fi
+  if [[ "$i" -eq 60 ]]; then
+    echo "ERROR: enforce gateway did not become healthy" >&2
+    $COMPOSE logs --tail=50 litellm-enforce >&2 || true
     exit 1
   fi
   sleep 2

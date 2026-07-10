@@ -37,6 +37,7 @@ sys.modules.setdefault("litellm.integrations.custom_logger", _stub)
 
 from obs_callback import (  # noqa: E402  (needs the stub above)
     _ESCALATE_TAG,
+    _apply_enforcement,
     _complexity,
     _PinStore,
     _policy_session,
@@ -657,6 +658,59 @@ class TestEscalation(unittest.TestCase):
             ]
 
         self.assertEqual(run(), run())
+
+
+# --- enforcement — the policy drives routing, behind a flag (goal 26) --------
+# The knob's plumbing (env read + hook branch) is two lines in the async hook;
+# what needs pinning offline is the REWRITE helper's contract: original ask
+# stashed before the mutation, both-arms coverage, and the no-survivor degrade.
+
+
+class TestEnforcement(unittest.TestCase):
+    def test_rewrite_points_data_at_the_chosen_backend(self):
+        block = _policy_stateless(_CANDIDATES, [], "trivial", None, "absent")
+        data = {"model": "claude-opus"}
+        b = _apply_enforcement(block, data)
+        self.assertEqual(data["model"], "qwen3-coder")  # the decision is real
+        self.assertIs(b["enforced"], True)
+        self.assertEqual(b["requested"], "claude-opus")  # stashed PRE-rewrite
+        self.assertEqual(b["chosen"], "qwen3-coder")
+
+    def test_agreeing_request_is_not_touched(self):
+        block = _policy_stateless(_CANDIDATES, [], "trivial", None, "absent")
+        data = {"model": "qwen3-coder"}
+        _apply_enforcement(block, data)
+        self.assertEqual(data["model"], "qwen3-coder")
+
+    def test_no_survivor_degrades_to_the_clients_ask(self):
+        block = _policy_stateless(
+            _CANDIDATES, ["no-such-model"], "trivial", None, "absent"
+        )
+        data = {"model": "claude-opus"}
+        b = _apply_enforcement(block, data)
+        self.assertEqual(data["model"], "claude-opus")  # untouched
+        self.assertIs(b["enforced"], True)  # mode still on-record
+        self.assertIsNone(b["chosen"])
+
+    def test_session_arm_block_enforces_the_pin(self):
+        pins = _store(ttl_s=100)
+        _sess(pins, "sess-1", now=0.0)
+        _sess(pins, "sess-1", now=1.0, escalate=True)  # pin now claude-opus
+        block = _sess(pins, "sess-1", now=2.0)
+        data = {"model": "qwen3-coder"}
+        _apply_enforcement(block, data)
+        self.assertEqual(data["model"], "claude-opus")  # the escalated pin
+        self.assertEqual(block["requested"], "qwen3-coder")
+
+    def test_outcome_triple_survives_enforcement(self):
+        # requested vs chosen vs served, all on one block, post-response.
+        block = _policy_stateless(_CANDIDATES, [], "trivial", None, "absent")
+        _apply_enforcement(block, {"model": "claude-opus"})
+        out = _policy_with_outcome(block, "claude-sonnet")  # fallback served
+        self.assertEqual(out["requested"], "claude-opus")
+        self.assertEqual(out["chosen"], "qwen3-coder")
+        self.assertEqual(out["actual"], "claude-sonnet")
+        self.assertIs(out["agree"], False)  # the chain fired — visible
 
 
 class TestEscalateTag(unittest.TestCase):

@@ -67,7 +67,9 @@ Hard constraints (carried from the Fugu research, non-negotiable):
 > gateway-local pins with an inactivity-TTL knob (`POLICY_PIN_TTL_S`, default
 > 24h), zero routing influence. TTL + restart are proven offline with an
 > injected clock. See [docs/09 "Shadow sticky pins"](09-observability.md).
-> Enforcement is goal 26.
+> **Enforcement SHIPPED (goal 26)** behind `ROUTER_POLICY=enforce` (default
+> `shadow`): the pin — escalated pin included — actually serves. See
+> [docs/09 "Enforcement"](09-observability.md).
 >
 > **Build discovery:** option (a)'s "broken with >1 gateway replica" caveat
 > bites EARLIER than replica time — every profile runs the proxy with
@@ -106,8 +108,10 @@ Hard constraints (carried from the Fugu research, non-negotiable):
 > **Status: BUILT in shadow (goal 24).** `obs_callback._policy_stateless`
 > applies this section's order verbatim; the decision rides routing records as
 > `shadow_policy` with zero routing influence. See
-> [docs/09 "Shadow routing policy"](09-observability.md). Enforcement is
-> goal 26.
+> [docs/09 "Shadow routing policy"](09-observability.md). **Enforcement
+> SHIPPED (goal 26)** behind `ROUTER_POLICY=enforce` (default `shadow`): the
+> cheapest-capable choice actually serves. See
+> [docs/09 "Enforcement"](09-observability.md).
 
 Cheapest **capable** backend, where "capable" is a candidate-set filter, in
 order:
@@ -173,6 +177,9 @@ innermost safety net. Interaction rules:
   the request follows the fallback chain. This is *not* an escalation — the
   pin does NOT move (next turn retries the pinned backend once it's healthy;
   cooldown per LiteLLM's router).
+  > **✅ PROVEN under enforce (goal 26):** forced 503 on the pinned backend →
+  > clean response via ITS fallback chain, pin intact, next healthy turn
+  > served by the pin again (`test_enforce_fallback_composes_and_the_pin_does_not_move`).
   - Rationale: a transient local blip should not permanently exile a session
     to Foundry — that would make every hiccup an unintended escalation and
     burn the session's one hop implicitly.
