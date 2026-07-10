@@ -273,12 +273,13 @@ else
   skip "python3" "not installed"
 fi
 
-# --- obs-callback complexity classifier unit tests (goal 21 — offline) -------
-# The shadow complexity decision tree (obs_callback._complexity) is a pure
-# function over request features; a stub satisfies the litellm import, so the
-# whole tree (buckets, precedence, degradations) pins in the fast tier. The e2e
-# stack proves the live stamping onto routing records.
-step "obs-callback complexity unit tests (e2e/obs_callback_test.py)"
+# --- obs-callback classifier + policy unit tests (goals 21/22/24 — offline) --
+# The shadow classifiers (obs_callback._complexity, ._session) and the shadow
+# stateless routing policy (._policy_stateless) are pure functions over
+# request/config/registry features; a stub satisfies the litellm import, so the
+# decision logic (buckets, precedence, policy filter order, degradations) pins
+# in the fast tier. The e2e stack proves the live stamping onto routing records.
+step "obs-callback classifier + policy unit tests (e2e/obs_callback_test.py)"
 if have python3; then
   if (cd e2e && python3 obs_callback_test.py); then
     ok "obs_callback_test.py"

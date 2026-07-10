@@ -85,6 +85,12 @@ Hard constraints (carried from the Fugu research, non-negotiable):
 
 ## 4. Free routing (one-shots)
 
+> **Status: BUILT in shadow (goal 24).** `obs_callback._policy_stateless`
+> applies this section's order verbatim; the decision rides routing records as
+> `shadow_policy` with zero routing influence. See
+> [docs/09 "Shadow routing policy"](09-observability.md). Enforcement is
+> goal 26.
+
 Cheapest **capable** backend, where "capable" is a candidate-set filter, in
 order:
 1. **governance filter** — key/tag-scoped backend allowlist (the "never leaves

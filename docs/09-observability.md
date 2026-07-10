@@ -548,6 +548,109 @@ planning hangs on.
 free-routing path, and the accumulated distribution says how much traffic each
 policy arm will actually carry.
 
+## Shadow routing policy — the stateless arm (goal 24)
+
+**Why this exists.** The engine fork is decided ([docs/03](03-open-questions-and-risks.md)
+engine decision block: **LiteLLM custom policy layer**), which makes the policy
+*ours to build* — as hook code. The safest first brick is
+[docs/12 §4](12-hybrid-router-spec.md)'s **stateless cheapest-capable policy**,
+computed at ingress but **SHADOW**: the decision rides the routing record next
+to what actually happened, so its choices are auditable against reality before
+anything enforces (goal 26 flips the switch only after this evidence
+accumulates). Same anti-Fugu constraints as goals 21/22: deterministic,
+inputs-on-record, **zero routing influence, never buffer the stream**.
+
+**The block.** `obs_callback.async_pre_call_hook` computes, **pre-call**, what
+the stateless arm would choose, and records stamp it as:
+
+```json
+"shadow_policy": {
+  "arm": "stateless",
+  "candidate_set": ["qwen3-coder", "claude-sonnet", "claude-opus", "gpt"],
+  "chosen": "qwen3-coder",
+  "reason": "governance: key unrestricted; agent_capable gate not applied (bucket=trivial); health via control-plane 4->4; chose qwen3-coder (tier=local, in_flight=0)",
+  "registry": "live",
+  "actual": "claude-opus",
+  "agree": false
+}
+```
+
+- **`candidate_set`** — the aliases that survived every filter, in final
+  ranked order (`chosen` is its head). Empty ⇒ `chosen: null`, never a guess.
+- **`reason`** — the citable audit trail: what each step did, by count, and
+  why the winner won. "Why did the policy pick THIS backend?" is answerable
+  from the record alone (the anti-Fugu constraint).
+- **`actual`/`agree`** — filled post-response: `actual` = the backend that
+  really served (`served_model` on `delivered` — authoritative even on the
+  fallback path), `agree = chosen == actual`. `agree: null` when there is no
+  verdict (no survivor, or no served backend).
+
+**The order, docs/12 §4 verbatim** (`obs_callback._policy_stateless`, a pure
+function — offline tests in `obs_callback_test.py` pin every step):
+
+1. **governance** — the calling key's model allowlist (LiteLLM's key-scoped
+   `models` off `UserAPIKeyAuth`) bounds the candidate set. Wildcards
+   (`all-proxy-models`, `*`) and keyless/master-key traffic are unrestricted.
+   Tag-scoped governance is future work (premium-gated on the pin — docs/12 R6).
+2. **`agent_capable` gate** — `complexity.bucket ∈ {toolful, agentic}` (the
+   goal-21 classifier, reused at ingress) requires an agent-capable backend:
+   the **registry verdict** when the model is registered (any healthy instance
+   capable), the **config declaration** (`model_info.agent_capable` — the
+   conformance gate's declared-for-mocks / earned-for-real-models story)
+   otherwise.
+3. **health** — control-plane derived `healthy` ([docs/10](10-control-plane.md)
+   D3) excludes **registered-but-unhealthy** backends. Models the registry has
+   never seen pass on config: workbenches heartbeat, Foundry backends don't,
+   so absence-from-registry must not exile the fallback tier.
+4. **cheapest capable** — cheaper tier first (`local` < `foundry`; undeclared
+   tiers last), tie-break lowest `in_flight` (control-plane; unregistered = 0),
+   then name — a total, deterministic order.
+
+**The registry consumption + degrade story (the first consumer of goal 5's
+control plane).** The hook reads `CONTROL_PLANE_URL /models` with a short
+timeout, TTL-cached (`POLICY_REGISTRY_CACHE_S`, default 2s — the e2e stack
+sets 0 so tests see their own heartbeats immediately). When the registry is
+**absent** (no URL / unreachable with nothing cached) or **stale**
+(unreachable and the last snapshot outlived `POLICY_REGISTRY_STALE_S`,
+default 10s), the policy **degrades to config-only candidates** — step 3
+becomes a no-op — **and the record says so**: `registry: "absent"|"stale"`
+(vs `"live"`), plus the degrade named in `reason`. A blip inside the stale
+window rides the last good snapshot as `"live"`. Stacks without a control
+plane (bare pytest, cli-auth, local) just carry `registry: "absent"` blocks —
+never an error.
+
+**How the block crosses hook boundaries.** The pre-call decision must reach
+records built in *other* hooks. It travels by the **goal-16 correlation id**
+in a bounded module map: the id is already proven to reach every surface
+(delivered records via `data`, attempt events via `slo.trace_id`) — unlike
+the request `metadata` dict, whose shape varies across the three inbound
+protocols. `delivered` carries the authoritative verdict; `llm_call` attempts
+carry the block best-effort (`actual` = that attempt's alias on success only) —
+the carrier for **streamed** traffic, which fires no `delivered` record on
+this pin (the standing caveat).
+
+**Zero influence, on record.** The hook never touches `data["model"]`, never
+buffers a stream, and any policy error degrades to "no block" — the request
+path is untouched. The e2e proofs assert it: every policy test also asserts
+the request was served by exactly the backend it asked for, and
+`test_shadow_policy_disagrees_when_cheaper_capable_backend_is_healthy` pins
+the exact shape enforcement will act on — a request to `claude-opus` while a
+healthy `qwen3-coder` is registered yields `agree: false, chosen: qwen3-coder`
+while claude-opus still serves. The other two proofs:
+`test_routing_records_carry_shadow_policy_block` (the block, whole, with a
+non-empty ranked `candidate_set`) and
+`test_shadow_policy_candidate_set_respects_key_allowlist` (a governed key's
+`candidate_set` excludes the out-of-allowlist backends per request, on record).
+
+**Dashboard.** Each request row gets a **policy** badge — `agree` /
+`chose <backend>` (disagreement names the policy's pick) / `no verdict` — with
+the chosen backend, registry mode, and full reason on hover. `/api/records`
+carries a **`policy_agreement`** rollup `{evaluated, agree, disagree,
+unevaluated, agreement_rate}` rendered on the Requests header — the number the
+goal-26 enforcement flip will be judged against. Honest-denominator convention
+throughout: no-block and no-verdict records count as `unevaluated`, and an
+empty stream yields `agreement_rate: null`, not a fake 100%.
+
 ## What this is *not* (yet)
 
 - **Not durable.** All sinks are ephemeral (stdout ring / mockd + dashboard

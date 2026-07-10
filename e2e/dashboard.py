@@ -67,9 +67,11 @@ HTTP surface:
                                              #  {tokens_delivered,tokens_consumed}
                                              #  (goal 20), `keys` is the per-key
                                              #  rollup (requests, fallbacks,
-                                             #  tokens, cost), and `overhead` is
+                                             #  tokens, cost), `overhead` is
                                              #  the goal-20 delivered-vs-consumed
-                                             #  summary
+                                             #  summary, and `policy_agreement`
+                                             #  is the goal-24 shadow-policy
+                                             #  chosen-vs-actual rollup
   GET  /api/fleet                            # {"available":bool, "models":[...],
                                              #  "instances":[...]} — the goal-13
                                              #  fleet data endpoint: a server-side
@@ -248,6 +250,11 @@ def _requests_view(records: list) -> list:
                 # one-shot + the stickiness key a sticky router would pin on.
                 # Same shadow discipline; None on untagged records.
                 "session": r.get("session"),
+                # SHADOW routing policy (goal 24): what the stateless
+                # cheapest-capable arm WOULD have chosen vs what actually
+                # happened — {arm, candidate_set, chosen, reason, registry,
+                # actual, agree}. None on records from a stack without it.
+                "policy": r.get("shadow_policy"),
                 # TRACE CORRELATION (goal 16): the join key + this request's own
                 # attempt trail, nested under it by that id.
                 "correlation_id": cid,
@@ -392,6 +399,42 @@ def _request_class_distribution(records: list) -> dict:
         label = cls if cls else "unclassified"
         dist[label] = dist.get(label, 0) + 1
     return dist
+
+
+def _policy_agreement(records: list) -> dict:
+    """The chosen-vs-actual AGREEMENT rollup (goal 24): across every delivered
+    request the shadow policy evaluated, how often would the stateless
+    cheapest-capable arm have routed to the backend that actually served? This
+    is the number the enforcement flip (goal 26) is judged against — a policy
+    that disagrees with reality constantly is either finding real savings or
+    misconfigured, and either way you want to SEE it before it drives routing.
+    `unevaluated` counts delivered records with no verdict (no policy block —
+    older stacks — or agree:null, e.g. no surviving candidate), keeping the
+    denominator honest like the complexity/class rollups."""
+    agree = 0
+    disagree = 0
+    unevaluated = 0
+    for r in records:
+        if r.get("event") != "delivered":
+            continue
+        pol = r.get("shadow_policy")
+        verdict = pol.get("agree") if isinstance(pol, dict) else None
+        if verdict is True:
+            agree += 1
+        elif verdict is False:
+            disagree += 1
+        else:
+            unevaluated += 1
+    evaluated = agree + disagree
+    return {
+        "evaluated": evaluated,
+        "agree": agree,
+        "disagree": disagree,
+        "unevaluated": unevaluated,
+        # Share of evaluated requests where policy and reality matched; None
+        # when nothing was evaluated (no signal, not a fake 100%).
+        "agreement_rate": round(agree / evaluated, 3) if evaluated else None,
+    }
 
 
 def _attempts_view(records: list) -> list:
@@ -570,11 +613,11 @@ _PAGE = """<!doctype html>
   <div class="tablewrap">
     <table>
       <thead><tr>
-        <th>requested</th><th></th><th>served</th><th>route</th><th>complexity</th><th>class</th>
+        <th>requested</th><th></th><th>served</th><th>route</th><th>policy</th><th>complexity</th><th>class</th>
         <th>key</th><th>user</th>
         <th>provider</th><th class="num">delivered</th><th class="num">consumed</th><th class="num">cost</th>
       </tr></thead>
-      <tbody id="requests"><tr><td class="empty" colspan="12">no requests yet</td></tr></tbody>
+      <tbody id="requests"><tr><td class="empty" colspan="13">no requests yet</td></tr></tbody>
     </table>
   </div>
 
@@ -619,7 +662,20 @@ function reqTrail(r){
   if(!atts.length) return '';
   const chips = atts.map(attemptChip).join('<span class="arrow"> &rarr; </span>');
   const cid = r.correlation_id ? ' <span class="cid">('+esc(r.correlation_id)+')</span>' : '';
-  return '<tr class="trail"><td></td><td colspan="11">why'+cid+': '+chips+'</td></tr>';
+  return '<tr class="trail"><td></td><td colspan="12">why'+cid+': '+chips+'</td></tr>';
+}
+// Shadow routing policy (goal 24): would the stateless cheapest-capable arm
+// have routed here? agree/disagree as a badge, the chosen backend + the full
+// citable reason (and registry degrade mode) on hover — auditable in place.
+function polCell(p){
+  if(!p) return '<span class="muted">&mdash;</span>';
+  const why = 'policy chose '+(p.chosen||'(none)')+' \\u00b7 registry '+(p.registry||'?')
+    +' \\u00b7 '+(p.reason||'');
+  if(p.agree===true)
+    return '<span class="badge direct" title="'+esc(why)+'">agree</span>';
+  if(p.agree===false)
+    return '<span class="badge fall" title="'+esc(why)+'">chose '+esc(p.chosen)+'</span>';
+  return '<span class="badge no" title="'+esc(why)+'">no verdict</span>';
 }
 // Shadow session classification (goal 22): session-turn vs one-shot, with the
 // stickiness key + its source on hover — the hybrid-granularity telemetry.
@@ -657,6 +713,7 @@ function reqRow(r){
     + '<td class="arrow">&rarr;</td>'
     + '<td><code>'+esc(r.served_model)+'</code></td>'
     + '<td>'+badge+'</td>'
+    + '<td>'+polCell(r.policy)+'</td>'
     + '<td>'+cxCell(r.complexity)+'</td>'
     + '<td>'+sessCell(r.session)+'</td>'
     + '<td>'+idCell(r.key_alias)+'</td>'
@@ -774,7 +831,7 @@ async function refresh(){
       : '<tr><td class="empty" colspan="7">no keyed traffic yet</td></tr>';
     document.getElementById('requests').innerHTML = reqs.length
       ? reqs.map(reqRow).join('')
-      : '<tr><td class="empty" colspan="12">no requests yet</td></tr>';
+      : '<tr><td class="empty" colspan="13">no requests yet</td></tr>';
     document.getElementById('attempts').innerHTML = atts.length
       ? atts.map(attRow).join('')
       : '<tr><td class="empty" colspan="8">no attempts yet</td></tr>';
@@ -791,8 +848,17 @@ async function refresh(){
     // goal 22: the session-turn vs one-shot mix rides the same strip.
     const rc = data.request_classes || {};
     const cmix = Object.keys(rc).sort().map(k=>esc(k)+' '+esc(rc[k])).join(' / ');
+    // goal 24: shadow-policy agreement at a glance — chosen-vs-actual across
+    // every evaluated request (the number goal 26's enforcement flip is judged
+    // against).
+    const pa = data.policy_agreement;
+    const pmix = (pa && pa.evaluated)
+      ? ' &middot; policy: '+esc(pa.agree)+'/'+esc(pa.evaluated)+' agree'
+        +(pa.agreement_rate!=null ? ' ('+esc(pa.agreement_rate)+')' : '')
+        +(pa.unevaluated ? ', '+esc(pa.unevaluated)+' unevaluated' : '')
+      : '';
     document.getElementById('cxdist').innerHTML =
-      (mix ? '&middot; mix: '+mix : '') + (cmix ? ' &middot; class: '+cmix : '');
+      (mix ? '&middot; mix: '+mix : '') + (cmix ? ' &middot; class: '+cmix : '') + pmix;
     document.getElementById('status').textContent =
       reqs.length+' requests \\u00b7 '+atts.length+' attempts \\u00b7 '+(data.count||0)+' records';
   } catch(e) {
@@ -861,6 +927,9 @@ class Handler(BaseHTTPRequestHandler):
                     # goal 22: session-turn vs one-shot mix — see
                     # _request_class_distribution.
                     "request_classes": _request_class_distribution(recs),
+                    # goal 24: shadow-policy chosen-vs-actual agreement — see
+                    # _policy_agreement.
+                    "policy_agreement": _policy_agreement(recs),
                     "records": recs,
                 },
             )

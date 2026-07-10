@@ -139,6 +139,14 @@ services:
       # In-network addresses; each is a single process so it centralizes records
       # across BOTH litellm workers (--num_workers 2).
       OBS_WEBHOOK_URL: "http://mockd:9100/__observe,http://dashboard:9300/records"
+      # Shadow routing policy (goal 24): the control-plane registry backing the
+      # policy's health step (docs/12 §4 step 3). Cache TTL 0 so every request
+      # sees the test's freshest heartbeats — the suite pushes a heartbeat and
+      # asserts the very next request's policy block, so an amortizing cache
+      # would make those tests timing-dependent (mockd-speed registry reads make
+      # per-request fetches free here; dev/prod keep the amortizing default).
+      CONTROL_PLANE_URL: "http://control-plane:9400"
+      POLICY_REGISTRY_CACHE_S: "0"
     command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]
