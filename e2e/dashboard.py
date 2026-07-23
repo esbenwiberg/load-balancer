@@ -78,7 +78,12 @@ HTTP surface:
                                              #  supply), `users`, `sessions`
                                              #  (per stickiness key: turns,
                                              #  pin state, escalation) and
-                                             #  `backends` (per deployment)
+                                             #  `backends` (per deployment).
+                                             #  goal 31 adds
+                                             #  `escalation_trigger2_gate` (the
+                                             #  complexity-vs-manual agreement
+                                             #  gate; "insufficient data" while
+                                             #  the label count is low)
   GET  /api/fleet                            # {"available":bool, "models":[...],
                                              #  "instances":[...]} — the goal-13
                                              #  fleet data endpoint: a server-side
@@ -469,6 +474,9 @@ def _session_rollup(requests: list) -> list:
                 "pinned_backend": None,
                 "pin_hits": 0,
                 "escalated": False,
+                # Goal 31: what FIRED the one hop, carried from the firing
+                # turn's policy block (null until/unless this session escalated).
+                "escalation_trigger": None,
                 "enforced": False,
                 "tokens": 0,
                 "cost": 0.0,
@@ -506,6 +514,10 @@ def _session_rollup(requests: list) -> list:
                 e["pin_hits"] += 1
             if pol.get("escalated"):
                 e["escalated"] = True
+            # The trigger rides only the firing turn (escalated_from present),
+            # not the later pin-hit turns — capture it wherever it appears.
+            if pol.get("escalation_trigger"):
+                e["escalation_trigger"] = pol["escalation_trigger"]
             if pol.get("enforced"):
                 e["enforced"] = True
         d = rq.get("tokens_delivered")
@@ -759,6 +771,63 @@ def _policy_agreement(records: list) -> dict:
     }
 
 
+# --- the trigger-2 telemetry gate (goal 31) ---------------------------------
+# The escalation trigger is manual / client-signaled in v1 (docs/03 decision).
+# Trigger 2 — "the goal-21 complexity bucket crosses a line" — is a specced
+# follow-up, adoptable ONLY once telemetry shows the bucket signal would have
+# fired where humans manually escalated (docs/03 option 2 adoption gate). This
+# rollup MATERIALISES that gate instead of leaving it prose:
+#   * labels     = the manual escalations (each firing turn carries
+#                  escalation_trigger == "manual" — exactly one per session).
+#   * prediction = would trigger 2 have fired at that turn, i.e. is the turn's
+#                  complexity bucket in the escalate-set below.
+#   * agreement  = of the human labels, how many the bucket signal would have
+#                  caught (a recall-flavoured number — precision needs the
+#                  turns humans did NOT escalate, which needs real non-synthetic
+#                  traffic distributions we deliberately do not fabricate).
+# It reads "insufficient data" until the label count clears a floor: the POINT
+# is that the pipe exists and fills as manual-trigger v1 runs, not that a low
+# count yields a meaningful rate.
+_TRIGGER2_ESCALATE_BUCKETS = ("heavy", "agentic")
+_TRIGGER2_MIN_SAMPLE = 10
+
+
+def _escalation_trigger2_gate(requests: list) -> dict:
+    """Would the complexity-threshold trigger (trigger 2) have fired where the
+    human manually escalated? Folded over the per-request view (which carries
+    both the policy block and the complexity tag). Honest by construction: the
+    verdict stays "insufficient data" until `manual_escalations` reaches
+    `_TRIGGER2_MIN_SAMPLE`, and `agreement_rate` is None on an empty set (never
+    a fake 1.0)."""
+    manual = 0
+    would_fire = 0
+    for rq in requests:
+        pol = rq.get("policy")
+        if not isinstance(pol, dict):
+            continue
+        # The one firing turn per session carries the trigger label; pin-hit
+        # turns of the same session do not, so each escalation counts once.
+        if pol.get("escalation_trigger") != "manual":
+            continue
+        manual += 1
+        cx = rq.get("complexity")
+        bucket = cx.get("bucket") if isinstance(cx, dict) else None
+        if bucket in _TRIGGER2_ESCALATE_BUCKETS:
+            would_fire += 1
+    return {
+        "manual_escalations": manual,
+        "would_fire": would_fire,
+        # recall of trigger 2 against the human labels; None on an empty set.
+        "agreement_rate": round(would_fire / manual, 3) if manual else None,
+        # the definition, ON-RECORD so the number is never a black box.
+        "escalate_buckets": list(_TRIGGER2_ESCALATE_BUCKETS),
+        "min_sample": _TRIGGER2_MIN_SAMPLE,
+        "verdict": "measured"
+        if manual >= _TRIGGER2_MIN_SAMPLE
+        else "insufficient data",
+    }
+
+
 def _attempts_view(records: list) -> list:
     """The per-ATTEMPT trail (event=llm_call): every backend tried, its tier,
     latency, tokens, and — on failure — the error that triggered a fallback.
@@ -917,6 +986,11 @@ _PAGE = r"""<!doctype html>
      anymore on detail views */
   tr.why td { border-bottom:1px solid var(--line); padding:4px 12px 10px;
     white-space:normal; color:var(--muted); font-size:12px; }
+  /* goal 31: the escalation is a FIRST-CLASS event on the session timeline —
+     labeled + visible, not buried in the "why" prose. */
+  tr.escevent td { border-bottom:1px solid var(--line); padding:5px 12px;
+    white-space:normal; font-size:12px; color:var(--fall); }
+  tr.escevent code { color:var(--fall); }
   .attempt { display:inline-block; padding:1px 6px; margin:2px 2px;
     border:1px solid var(--line); border-radius:6px; }
   .attempt.failed { border-color:var(--warn); }
@@ -1022,7 +1096,8 @@ _PAGE = r"""<!doctype html>
 
 <section data-view="sessions">
   <h2>Sessions &mdash; sticky keys, pins &amp; the one escalation hop
-    <span class="h2note">&middot; one row per stickiness key &middot; titles are metadata-only (no prompt content)</span></h2>
+    <span class="h2note">&middot; one row per stickiness key &middot; titles are metadata-only (no prompt content)</span>
+    <span class="h2note" id="t2gate"></span></h2>
   <div class="tablewrap">
     <table>
       <thead><tr>
@@ -1303,8 +1378,13 @@ function backendRow(b){
 function sessionStateCells(s){
   const pinned = s.pinned_backend
     ? '<code>'+esc(s.pinned_backend)+'</code>' : '<span class="muted">&mdash;</span>';
+  // goal 31: label the trigger that fired the hop (manual v1) right on the
+  // escalated badge, so it reads as an attributed event, not a bare flag.
+  const trig = s.escalation_trigger ? ' ('+esc(s.escalation_trigger)+')' : '';
   const escd = s.escalated
-    ? '<span class="badge fall">esc</span>' : '<span class="badge no">no</span>';
+    ? '<span class="badge fall" title="one upward hop'
+        +(s.escalation_trigger ? ', trigger: '+esc(s.escalation_trigger) : '')+'">esc'+trig+'</span>'
+    : '<span class="badge no">no</span>';
   const mode = s.enforced
     ? '<span class="badge yes">enforced</span>' : '<span class="badge no">shadow</span>';
   return { pinned, escd, mode };
@@ -1389,6 +1469,20 @@ function mixStrip(data){
     : '';
   return (mix ? 'mix: '+mix : '') + (cmix ? ' &middot; class: '+cmix : '') + pmix;
 }
+// goal 31: the trigger-2 telemetry gate — would the complexity signal have
+// fired where humans manually escalated? Reads honestly as "insufficient data"
+// while the label count is below the floor (the pipe exists; it fills as v1 runs).
+function t2gateStrip(data){
+  const g = data.escalation_trigger2_gate;
+  if(!g || !g.manual_escalations) return '';
+  const set = (g.escalate_buckets||[]).join('/');
+  if(g.verdict !== 'measured')
+    return '&middot; trigger-2 gate: insufficient data ('+esc(g.manual_escalations)
+      +'/'+esc(g.min_sample)+' manual escalations, need '+esc(g.min_sample)+')';
+  return '&middot; trigger-2 gate: '+esc(g.would_fire)+'/'+esc(g.manual_escalations)
+    +' manual escalations would have fired on complexity ('+esc(set)+')'
+    +(g.agreement_rate!=null ? ' &mdash; '+esc(g.agreement_rate)+' agreement' : '');
+}
 
 // --- detail views (goal 30) ---------------------------------------------------
 function copySpan(v){
@@ -1398,6 +1492,7 @@ function copySpan(v){
 // full reason and the complexity features as text, not hover-only (goal 30).
 function turnRows(r){
   const c = reqCells(r);
+  const p = r.policy || {};
   let why = [];
   if(r.policy) why.push('policy: '+polWhy(r.policy));
   if(r.complexity && r.complexity.bucket) why.push('complexity: '+r.complexity.bucket+' ('+cxWhy(r.complexity)+')');
@@ -1407,6 +1502,14 @@ function turnRows(r){
       + (chips ? 'trail: '+chips+'<br>' : '')
       + esc(why.join(' · '))
       + '</td></tr>'
+    : '';
+  // goal 31: the firing turn (escalated_from present) is the escalation EVENT —
+  // surfaced as its own labeled, visible row with the trigger and the hop.
+  const escRow = p.escalated_from
+    ? '<tr class="escevent"><td></td><td colspan="9">&uarr; escalation ('
+      + esc(p.escalation_trigger || 'unknown trigger') + '): <code>'
+      + esc(p.escalated_from) + '</code> &rarr; <code>'
+      + esc(p.pinned_backend || p.chosen || '?') + '</code></td></tr>'
     : '';
   return '<tr>'
     + '<td class="num muted">'+ago(r.received_at)+'</td>'
@@ -1419,7 +1522,7 @@ function turnRows(r){
     + '<td class="num">'+c.con+'</td>'
     + '<td class="num">'+c.cost+'</td>'
     + '<td></td>'
-    + '</tr>' + whyRow;
+    + '</tr>' + escRow + whyRow;
 }
 function renderSessionDetail(key){
   const box = document.getElementById('sessiondetail');
@@ -1524,6 +1627,7 @@ function renderView(){
     document.getElementById('sessions').innerHTML = sessions.length
       ? sessions.map(sessionRow).join('')
       : '<tr><td class="empty" colspan="11">no sticky sessions yet</td></tr>';
+    document.getElementById('t2gate').innerHTML = t2gateStrip(data);
   } else if(r.view === 'requests'){
     const reqs = data.requests||[], atts = data.attempts||[];
     document.getElementById('requests').innerHTML = reqs.length
@@ -1663,6 +1767,11 @@ class Handler(BaseHTTPRequestHandler):
                     # goal 24: shadow-policy chosen-vs-actual agreement — see
                     # _policy_agreement.
                     "policy_agreement": _policy_agreement(recs),
+                    # goal 31: the trigger-2 telemetry gate — would the
+                    # complexity signal have fired where humans manually
+                    # escalated? Reads "insufficient data" until the label
+                    # count clears the floor. See _escalation_trigger2_gate.
+                    "escalation_trigger2_gate": _escalation_trigger2_gate(requests),
                     # goal 27: the per-dimension rollups. `models` here is
                     # TRAFFIC per model (demand vs supply) — fleet CAPACITY
                     # per model lives at /api/fleet.

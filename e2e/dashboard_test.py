@@ -911,6 +911,58 @@ class TestSessionRollup(unittest.TestCase):
         self.assertTrue(row["enforced"])
         self.assertEqual(row["pin_hits"], 1)
 
+    def test_escalation_trigger_captured_from_the_firing_turn(self):
+        # Goal 31: the trigger label rides only the firing turn (escalated_from
+        # present), NOT the later pin-hit turns. The rollup must still surface
+        # it — captured wherever in the stream it appears.
+        records = [
+            _session_delivered(
+                "sess-1",
+                shadow_policy={
+                    "arm": "session",
+                    "stickiness_key": "sess-1",
+                    "pin_hit": False,
+                    "pinned_backend": "qwen3-coder",
+                    "escalated": False,
+                    "chosen": "qwen3-coder",
+                },
+            ),
+            _session_delivered(  # the firing turn
+                "sess-1",
+                shadow_policy={
+                    "arm": "session",
+                    "stickiness_key": "sess-1",
+                    "pin_hit": True,
+                    "pinned_backend": "claude-opus",
+                    "escalated": True,
+                    "escalated_from": "qwen3-coder",
+                    "escalation_trigger": "manual",
+                    "chosen": "claude-opus",
+                },
+            ),
+            _session_delivered(  # a later plain pin-hit turn — no trigger label
+                "sess-1",
+                shadow_policy={
+                    "arm": "session",
+                    "stickiness_key": "sess-1",
+                    "pin_hit": True,
+                    "pinned_backend": "claude-opus",
+                    "escalated": True,
+                    "chosen": "claude-opus",
+                },
+            ),
+        ]
+        row = dashboard._session_rollup(dashboard._requests_view(records))[0]
+        self.assertTrue(row["escalated"])
+        self.assertEqual(row["escalation_trigger"], "manual")
+
+    def test_never_escalated_session_has_no_trigger(self):
+        row = dashboard._session_rollup(
+            dashboard._requests_view([_session_delivered("sess-1")])
+        )[0]
+        self.assertFalse(row["escalated"])
+        self.assertIsNone(row["escalation_trigger"])
+
     def test_distinct_backends_served_are_listed(self):
         records = [
             _session_delivered("sess-1", served_model="qwen3-coder"),
@@ -975,6 +1027,98 @@ class TestSessionRollup(unittest.TestCase):
         row = dashboard._session_rollup(dashboard._requests_view(records))[0]
         self.assertEqual(row["key_alias"], "repo-new")
         self.assertEqual(row["user_id"], "u-new")
+
+
+class TestEscalationTrigger2Gate(unittest.TestCase):
+    """Goal 31: does the goal-21 complexity bucket agree with the human's
+    manual escalation? The rollup is the pipe for trigger-2's adoption gate; it
+    must read honestly as 'insufficient data' until the label count clears the
+    floor, and never manufacture a rate from nothing."""
+
+    def _esc_turn(self, key, bucket):
+        """One firing turn: escalated_from + escalation_trigger present (the
+        exactly-once event marker), tagged with a complexity bucket."""
+        kw = {} if bucket is None else {"complexity": {"bucket": bucket}}
+        return _session_delivered(
+            key,
+            shadow_policy={
+                "arm": "session",
+                "stickiness_key": key,
+                "pin_hit": True,
+                "pinned_backend": "claude-opus",
+                "escalated": True,
+                "escalated_from": "qwen3-coder",
+                "escalation_trigger": "manual",
+                "chosen": "claude-opus",
+            },
+            **kw,
+        )
+
+    def _gate(self, records):
+        return dashboard._escalation_trigger2_gate(dashboard._requests_view(records))
+
+    def test_empty_set_is_insufficient_and_rate_is_none(self):
+        g = self._gate([])
+        self.assertEqual(g["manual_escalations"], 0)
+        self.assertEqual(g["would_fire"], 0)
+        self.assertIsNone(g["agreement_rate"])  # not a fake 1.0
+        self.assertEqual(g["verdict"], "insufficient data")
+
+    def test_only_manual_firing_turns_are_labels(self):
+        # A plain sticky turn and an escalated PIN-HIT turn (no trigger label)
+        # must NOT count — only the firing turn carries escalation_trigger, so
+        # each escalation is counted exactly once.
+        records = [
+            _session_delivered("s-plain", complexity={"bucket": "heavy"}),
+            _session_delivered(
+                "s-hit",
+                complexity={"bucket": "heavy"},
+                shadow_policy={
+                    "arm": "session",
+                    "stickiness_key": "s-hit",
+                    "pin_hit": True,
+                    "pinned_backend": "claude-opus",
+                    "escalated": True,  # escalated, but not the firing turn
+                    "chosen": "claude-opus",
+                },
+            ),
+            self._esc_turn("s-fire", "heavy"),
+        ]
+        g = self._gate(records)
+        self.assertEqual(g["manual_escalations"], 1)
+        self.assertEqual(g["would_fire"], 1)
+
+    def test_agreement_math_counts_only_escalate_buckets(self):
+        # 2 of 3 manual escalations were on heavy/agentic (trigger-2 would have
+        # fired); the trivial one it would have missed.
+        records = [
+            self._esc_turn("s1", "heavy"),
+            self._esc_turn("s2", "agentic"),
+            self._esc_turn("s3", "trivial"),
+        ]
+        g = self._gate(records)
+        self.assertEqual(g["manual_escalations"], 3)
+        self.assertEqual(g["would_fire"], 2)
+        self.assertEqual(g["agreement_rate"], round(2 / 3, 3))
+        # 3 < floor -> still honestly "insufficient data" despite a real rate.
+        self.assertEqual(g["verdict"], "insufficient data")
+
+    def test_missing_complexity_bucket_never_counts_as_a_fire(self):
+        g = self._gate([self._esc_turn("s1", "heavy"), self._esc_turn("s2", None)])
+        self.assertEqual(g["manual_escalations"], 2)
+        self.assertEqual(g["would_fire"], 1)
+
+    def test_measured_once_the_floor_is_cleared(self):
+        floor = dashboard._TRIGGER2_MIN_SAMPLE
+        records = [self._esc_turn("s%d" % i, "heavy") for i in range(floor)]
+        g = self._gate(records)
+        self.assertEqual(g["manual_escalations"], floor)
+        self.assertEqual(g["would_fire"], floor)
+        self.assertEqual(g["agreement_rate"], 1.0)
+        self.assertEqual(g["verdict"], "measured")
+        self.assertEqual(
+            g["escalate_buckets"], list(dashboard._TRIGGER2_ESCALATE_BUCKETS)
+        )
 
 
 class TestBackendRollup(unittest.TestCase):

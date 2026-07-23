@@ -663,11 +663,46 @@ identical (`chosen == actual`), and the pin story is in the hover reason.
 granularity ([docs/03](03-open-questions-and-risks.md)) says *sessions route
 sticky, with one upward-only escalation hop*. Goal 25 builds those mechanics
 ([docs/12 §2/§3/§5](12-hybrid-router-spec.md)) — still **SHADOW**, zero
-routing influence — on goal 22's stickiness key. The escalation **trigger**
-decision stays open (§ Needs-a-human): the trigger built here is the spec's
-manual/client-signaled option as a **STUB** — an explicit `escalate` entry on
-`x-litellm-tags` — which proves pin replacement, upward-only, and
-exactly-once without pre-deciding the real trigger.
+routing influence — on goal 22's stickiness key. The escalation **trigger** is
+now **DECIDED (2026-07-23): manual / client-signaled v1**, and goal 31 promoted
+goal 25's STUB tag to a first-class contract — see "The escalation contract"
+below.
+
+### The escalation contract (goal 31)
+
+The client fires the one upward hop with a **`router:escalate`** entry on the
+goal-22 carrier `x-litellm-tags` (comma-separated, next to `session:<id>`).
+This is the **public contract** — the promotion of goal 25's stub now that the
+trigger is decided ([docs/03](03-open-questions-and-risks.md) escalation-trigger
+block, [docs/12 §5](12-hybrid-router-spec.md)). The bare **`escalate`** tag
+(goal 25's original name) is a **documented back-compat alias**: same signal,
+recognised forever, never required — existing clients and the goal-25 tests do
+not change. Read pre-call where the session tag is read, so **zero
+request-path latency** is added. `obs_callback._escalate_requested` recognises
+either entry (exact match — `router:escalate-please` does **not** count).
+
+**Attribution as a first-class event.** The one firing turn stamps
+`escalation_trigger: "manual"` next to `escalated_from` on the record. v1 is
+manual-only, so the value is constant today — the **field's existence** is what
+lets a future automatic trigger be told apart on-record. It rides only the
+firing turn (not the pin-hit turns after), so each escalation is attributable
+exactly once. The dashboard's session drill-down (goal 30) surfaces it as a
+labeled, visible timeline event (`↑ escalation (manual): old → new`) and the
+sessions table's escalated badge carries the trigger label — metadata only, no
+prompt content (the governance line holds).
+
+**The trigger-2 telemetry gate.** Trigger 2 (the goal-21 complexity bucket
+crossing a line) is adoptable only once the manual-escalation telemetry shows
+the bucket signal would have fired where humans did. `GET /api/records` now
+carries `escalation_trigger2_gate` `{manual_escalations, would_fire,
+agreement_rate, escalate_buckets, min_sample, verdict}`: over the labeled set
+(manual escalations), how many had a complexity bucket in the escalate-set
+`{heavy, agentic}` at the escalating turn — a recall-flavoured agreement
+number (precision needs the non-escalating population, which needs real
+traffic we do not fabricate). `verdict` reads **`"insufficient data"`** until
+the label count clears `min_sample`, and `agreement_rate` is `null` on an empty
+set — the pipe exists and fills as v1 runs; it never manufactures a number.
+Full metric definition in [docs/12 §5.1](12-hybrid-router-spec.md).
 
 **Arm dispatch (docs/12 §2).** `async_pre_call_hook` derives the stickiness
 key **pre-call** (goal 22's derivation verbatim: `session:<id>` tag >
@@ -719,12 +754,13 @@ arrive — stays a later, flagged decision (docs/12 §8.3).
   "registry": "live",
   "actual": "claude-sonnet",
   "agree": false,
-  "escalated_from": "qwen3-coder"
+  "escalated_from": "qwen3-coder",
+  "escalation_trigger": "manual"
 }
 ```
 
-**Escalation mechanics (docs/12 §5), exactly as spec'd.** The `escalate`
-signal replaces the pin **upward only** — the target is the stateless arm
+**Escalation mechanics (docs/12 §5), exactly as spec'd.** The `router:escalate`
+signal (or its `escalate` alias) replaces the pin **upward only** — the target is the stateless arm
 re-run over the tiers *strictly above* the pin's, so governance, the
 agent_capable gate, and health still bound it. The state machine is
 `pinned(local) → escalated(foundry)` with **no reverse edge and no second
@@ -798,7 +834,7 @@ restricted key is never routed to the cheaper out-of-allowlist workbench.
 store) so the existing suite keeps hitting the default-mode gateway
 unchanged — the "existing tests pass under the default" condition holds by
 construction. Dedicated tests: one-shot served by cheapest-capable with the
-triple on record; session pin + stub escalation actually serving; the
+triple on record; session pin + escalation actually serving; the
 503-fallback + pin-does-not-move + recovery story; streaming with proper
 terminators on chat//v1/messages//v1/responses; the governance guard.
 

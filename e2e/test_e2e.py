@@ -3071,6 +3071,82 @@ def test_enforce_session_pin_and_stub_escalation_actually_serve():
     assert srow["pin_hits"] >= 1, srow
 
 
+def _noop_row(d, key):
+    """The newest enforced row for `key` whose escalate signal was a recorded
+    no-op ('already escalated'), or None."""
+    for rq in d.get("requests", []):
+        pol = rq.get("policy") or {}
+        if pol.get("stickiness_key") != key:
+            continue
+        if "no-op (already escalated" in (pol.get("reason") or ""):
+            return rq
+    return None
+
+
+def test_enforce_router_escalate_contract_and_alias_both_fire():
+    """Goal 31: the FIRST-CLASS `router:escalate` tag fires the one upward hop
+    under enforce — the pin flips AND traffic follows, exactly once — and the
+    firing turn stamps escalation_trigger:"manual" on the record. The bare
+    `escalate` alias (goal 25) MUST still fire the same hop (kept for
+    back-compat, not migrated). Both signals proven against a live gateway; the
+    trigger-2 telemetry gate is asserted present on /api/records at the end."""
+    _beat("wb-e2e-policy", "qwen3-coder", warm=True, agent_capable=True, healthy=True)
+
+    for tag_name in ("router:escalate", "escalate"):
+        sid = _unique("enforce-esc-" + tag_name.replace(":", "-"))
+
+        # Pin the session on the local workbench (pin miss -> served qwen).
+        r = _enforce_request("gpt", "turn 1", tags="session:" + sid)
+        assert (
+            "served_model=qwen3-coder" in r.json()["choices"][0]["message"]["content"]
+        ), r.text
+        _await_enforce_row("gpt", key=sid)
+
+        # Fire the escalation: the pin flips upward AND the traffic follows.
+        r = _enforce_request("gpt", "escalate", tags="session:" + sid + "," + tag_name)
+        assert (
+            "served_model=claude-opus" in r.json()["choices"][0]["message"]["content"]
+        ), (tag_name, r.text)
+        data = _poll_dash(
+            lambda d: (
+                ((_enforce_policy_of(d, "gpt", sid) or {}).get("policy", {}) or {}).get(
+                    "escalated"
+                )
+                is True
+            )
+        )
+        pol = _enforce_policy_of(data, "gpt", sid)["policy"]
+        assert pol["escalated"] is True, (tag_name, pol)
+        assert pol["escalated_from"] == "qwen3-coder", (tag_name, pol)
+        assert pol["actual"] == "claude-opus", (tag_name, pol)  # traffic followed
+        # Goal 31: WHAT fired it is on-record as a first-class field.
+        assert pol["escalation_trigger"] == "manual", (tag_name, pol)
+
+        # Exactly once: a SECOND signal is a recorded no-op — pin does not move
+        # again, no downward edge, and no fresh escalated_from to attribute.
+        r = _enforce_request("gpt", "again", tags="session:" + sid + "," + tag_name)
+        assert (
+            "served_model=claude-opus" in r.json()["choices"][0]["message"]["content"]
+        ), (tag_name, r.text)
+        data = _poll_dash(lambda d: _noop_row(d, sid) is not None)
+        noop = _noop_row(data, sid)["policy"]
+        assert noop["pinned_backend"] == "claude-opus", (tag_name, noop)
+        assert "escalated_from" not in noop, (tag_name, noop)
+        assert "escalation_trigger" not in noop, (tag_name, noop)
+
+    # Goal 31: the trigger-2 telemetry gate PIPE exists on /api/records and
+    # counts the manual escalations we just fired (both tags label as manual).
+    data = _poll_dash(
+        lambda d: (
+            (d.get("escalation_trigger2_gate") or {}).get("manual_escalations", 0) >= 2
+        )
+    )
+    gate = data["escalation_trigger2_gate"]
+    assert gate["manual_escalations"] >= 2, gate
+    assert gate["escalate_buckets"], gate  # the definition is on-record
+    assert gate["verdict"] in ("insufficient data", "measured"), gate
+
+
 def test_enforce_fallback_composes_and_the_pin_does_not_move():
     """Condition (c), the R4 proof in enforce mode: a forced 503 on the
     policy-chosen backend still follows the fallback chain to a clean

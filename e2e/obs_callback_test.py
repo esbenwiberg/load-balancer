@@ -37,7 +37,9 @@ sys.modules.setdefault("litellm.integrations.custom_logger", _stub)
 
 from obs_callback import (  # noqa: E402  (needs the stub above)
     _ESCALATE_TAG,
+    _ESCALATE_TAG_NS,
     _apply_enforcement,
+    _escalate_requested,
     _complexity,
     _ctx_recall,
     _ctx_remember,
@@ -576,7 +578,23 @@ class TestEscalation(unittest.TestCase):
         self.assertIs(b["escalated"], True)
         self.assertEqual(b["pinned_backend"], "claude-opus")  # foundry, by name
         self.assertEqual(b["escalated_from"], "qwen3-coder")
+        # Goal 31: the firing turn stamps WHAT fired it (manual v1) as a
+        # first-class field, so a future automatic trigger is distinguishable.
+        self.assertEqual(b["escalation_trigger"], "manual")
         self.assertIn("upward, exactly once", b["reason"])
+
+    def test_escalation_trigger_rides_only_the_firing_turn(self):
+        # The trigger label is the event marker: present on the ONE turn that
+        # flipped the pin, absent on the pin-hit turns before and after (so the
+        # trigger-2 gate counts each escalation exactly once).
+        pins = _store(ttl_s=100)
+        first = _sess(pins, "sess-1", now=0.0)  # pin miss — no escalation
+        self.assertNotIn("escalation_trigger", first)
+        fired = _sess(pins, "sess-1", now=1.0, escalate=True)
+        self.assertEqual(fired["escalation_trigger"], "manual")
+        after = _sess(pins, "sess-1", now=2.0)  # plain pin-hit turn
+        self.assertIs(after["escalated"], True)
+        self.assertNotIn("escalation_trigger", after)
 
     def test_escalation_is_exactly_once_across_workers(self):
         # Two workers firing the signal for the same key: the guarded UPDATE
@@ -599,6 +617,7 @@ class TestEscalation(unittest.TestCase):
         self.assertEqual(b["pinned_backend"], "claude-opus")  # did not move
         self.assertIs(b["escalated"], True)
         self.assertNotIn("escalated_from", b)  # nothing flipped THIS request
+        self.assertNotIn("escalation_trigger", b)  # no fresh event to attribute
         self.assertIn("no-op (already escalated", b["reason"])
 
     def test_no_downward_edge_ever(self):
@@ -887,10 +906,27 @@ class TestStreamedDelivered(unittest.TestCase):
 
 class TestEscalateTag(unittest.TestCase):
     def test_bare_escalate_tag_parses_alongside_session_tag(self):
+        # Back-compat alias (goal 25): the bare tag must keep working.
         headers = {"x-litellm-tags": "session:abc, escalate"}
         self.assertIn(_ESCALATE_TAG, _tags(headers))
+        self.assertTrue(_escalate_requested(_tags(headers)))
         s = _session(headers, [_user("hi")])
         self.assertEqual(s["stickiness_key"], "abc")
+
+    def test_namespaced_router_escalate_tag_is_recognised(self):
+        # Goal 31: the first-class contract is the NAMESPACED tag.
+        headers = {"x-litellm-tags": "session:abc," + _ESCALATE_TAG_NS}
+        self.assertIn(_ESCALATE_TAG_NS, _tags(headers))
+        self.assertTrue(_escalate_requested(_tags(headers)))
+        # The namespaced tag must not be mistaken for a stickiness key.
+        s = _session(headers, [_user("hi")])
+        self.assertEqual(s["stickiness_key"], "abc")
+
+    def test_escalate_requested_is_false_without_either_tag(self):
+        self.assertFalse(_escalate_requested(["session:abc", "repo:x"]))
+        self.assertFalse(_escalate_requested([]))
+        # A near-miss substring must NOT trigger (exact entry match only).
+        self.assertFalse(_escalate_requested(["router:escalate-please"]))
 
     def test_garbage_headers_yield_no_tags(self):
         for h in (None, {}, {"x-litellm-tags": 42}, {"x-litellm-tags": " ,, "}):
