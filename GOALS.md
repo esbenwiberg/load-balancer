@@ -97,8 +97,53 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 _The policy-layer build arc (24 → 25 → 26, engine decided 2026-07-09:
 LiteLLM custom policy layer) is COMPLETE, the goal-27 dashboard-rollup
 follow-ups (28 + 29) are done, and **goal 31 is done** (`router:escalate`
-first-class contract + trigger-2 telemetry gate — see § Done). The only vetted
-autonomy-friendly item left is the discovered follow-up below._
+first-class contract + trigger-2 telemetry gate — see § Done). The
+**2026-07-23 go-real premortem** (`premortem-report-20260723-201257.html`)
+opened a hardening batch (33–37) below — the "make a rule an actual control"
+work that must precede any real deploy. Two premortem findings were already
+fixed in the goal-31 follow-up PR (governance fail-closed MODE +
+`DASH_HOST` safe default); 33–37 lock and extend them._
+
+- **33. Prove governance fail-closed end-to-end (lock the premortem fix).**
+  Completion condition: on `main`, an e2e proves that with
+  `POLICY_GOVERNANCE_FAIL_CLOSED=1` a key with NO/empty allowlist (as it
+  arrives on each of the three inbound protocols — chat / responses / messages,
+  esp. the Codex/Responses path where `UserAPIKeyAuth.models` was observed
+  empty) is NOT routed to a foundry-tier backend under `ROUTER_POLICY=enforce`
+  — it is served locally or cleanly refused, never Foundry. The MODE already
+  exists (fail-open default unchanged); this goal is the enforce-mode proof
+  across protocols that the mechanism actually closes the hole. Add the
+  enforce-mode container an env to run fail-closed (a third gateway, or param
+  the existing enforce one). Ship to PR → auto-merge if both gates green.
+- **34. Dashboard auth + safe-bind guard.** Completion condition: on `main`,
+  the dashboard requires a bearer/shared-token (env `DASH_AUTH_TOKEN`) on
+  `/api/*` and the page when the token is set, and REFUSES to start on a
+  non-loopback bind unless a token is configured (the `0.0.0.0` compose stacks
+  set the token in-network). Synthetic e2e + offline: token present → 200 with,
+  401 without; loopback bind → no token required. No public exposure decided
+  here (that's the needs-a-human exposure model) — this just makes "not naked
+  on a port" possible. Ship to PR → auto-merge if both gates green.
+- **35. Make the auto-merge tripwire a technical gate, not prose.** Completion
+  condition: on `main`, `scripts/check.sh` (and CI) FAIL if a deploy-from-`main`
+  workflow/marker exists while the release-model decision is still open — so an
+  unattended run cannot auto-merge into a world where `main` deploys. Offline,
+  deterministic (grep the workflows + a committed `RELEASE_MODEL` marker file).
+  Ship to PR → auto-merge if both gates green.
+- **36. Postgres-backed pin store (docs/12 §3 replica-time promotion).**
+  Completion condition: on `main`, behind a knob (`POLICY_PIN_BACKEND=sqlite|
+  postgres`, default sqlite unchanged), the pin store can use the existing
+  Postgres, and an e2e proves sticky routing AND exactly-once escalation hold
+  across TWO gateway containers sharing that Postgres (the premortem's replica
+  failure). SQLite default byte-for-byte unchanged. Ship to PR → auto-merge if
+  both gates green. **Stop / draft-only if** it needs schema in the shared
+  ledger DB that ops must approve.
+- **37. Spend push-alert plumbing.** Completion condition: on `main`, a
+  threshold alert over the SpendLogs/records (e.g. an `/api/records` rollup +
+  a tiny checker that fires when per-key or total spend crosses an env
+  threshold within a window) — so a cost blowout is a PUSH, not a dashboard
+  nobody's watching at 2am. Offline-testable with synthetic spend. Real
+  per-key budget NUMBERS (from real Foundry pricing) stay needs-a-human. Ship
+  to PR → auto-merge if both gates green.
 
 - **32. `agent_capable`-style conformance probe for the escalation contract on
   a real client.** Completion condition: on `main`, there is a documented,
@@ -122,11 +167,34 @@ These block on real infra, external sign-off, or an irreversible call. Bring
 them up when you're present; several become autonomy-friendly *after* the
 decision is made.
 
+> **⚠️ Go-real gate (2026-07-23 premortem, `premortem-report-20260723-201257.html`).**
+> The synthetic harness has taken us as far as it structurally can — every green
+> checkmark comes from the one config where the go-real threats can't exist (one
+> container, mock Foundry, localhost, synthetic prompts). Before ANY real
+> deploy, the premortem's pre-launch checklist must hold: (1) governance fails
+> CLOSED and is proven under enforce (goal 33); (2) DISCO sign-off matches the
+> control that ACTUALLY exists — backend-gating, Foundry default-deny — not an
+> assumed content-inspection/DLP; (3) the dashboard is not naked on a port (goal
+> 34) and never on public ingress; (4) the pin store is Postgres-backed or
+> replicas pinned to 1 (goal 36); (5) no deploy-from-`main` until the release
+> model is decided AND a technical gate enforces the tripwire (goal 35), a spend
+> push-alert is live (goal 37), and prompt-caching is verified or escalation
+> re-priced. The single hidden assumption to kill: *"a rule we wrote down is a
+> control we enforce."*
+
 - **Real Spark inventory** ([RUNBOOK step 0](deploy/RUNBOOK.md)) — ⏸ **parked**:
   we're not taking in Spark workbenches yet (see Current focus). Needs actual
   boxes, pinned models, memory headroom, vLLM tool-call parser. Infra.
 - **Data-governance sign-off with DISCO** ([docs/03 risk 10](docs/03-open-questions-and-risks.md))
   — is Foundry OK for the intended work; residency/retention. External.
+  **⚠️ Premortem (most-likely failure):** the governance rule is currently
+  enforced by *test discipline*, not a control — there is NO content inspection;
+  the filter gates WHICH BACKEND a key reaches, not WHAT is in the prompt. Real
+  devs will paste real code/PII into coding agents that stream straight to
+  Foundry. Get DISCO's sign-off against the control that EXISTS (backend-gating,
+  Foundry default-deny per key via goal 33's fail-closed), state in writing
+  which data classes may touch Foundry, and do NOT let approval assume a DLP
+  that isn't there.
 - ~~**Routing granularity decision**~~ — **✅ DECIDED 2026-07-08: HYBRID**
   (sticky sessions + free per-request stateless + one upward-only escalation
   hop) — recorded in [docs/03 risks 1–2](docs/03-open-questions-and-risks.md)
@@ -161,6 +229,22 @@ decision is made.
   creds behind it is a *target*; a leaked master key is someone else's free LLM.
   Creds + security + outward-facing. *(Noted for later — build phase is
   local/test only, nothing hosted yet. Decide the release model first ⤵)*
+  **⚠️ Premortem:** the dashboard (:9300) exposes routing/identity/session/fleet
+  metadata and had NO auth (goal 34 adds it) — it must never share the gateway's
+  public ingress. `api_base` URLs + health in the fleet view are an internal
+  attack map. Verify with an external port scan of the deployed endpoint that
+  :9300 is unreachable. Keys are a spend-cap not a breach-alarm: add secret
+  scanning that catches `sk-` LiteLLM keys + a per-key anomaly alert
+  (steady-max-budget / unknown IP).
+- **Real-Foundry soak before trusting fallback/health/cost** — the fallback
+  order, cooldowns, and health-derivation were all tuned against a deterministic
+  MOCK. **⚠️ Premortem:** real Foundry has capacity-429s (distinct from
+  rate-429 — must NOT fan out retries across an exhausted region), variable
+  latency (single-digit tok/s big models), token expiry, and prompt-caching
+  that is UNVERIFIED (docs/03 risk 5) — if caching doesn't work the "escalate
+  rarely" cost model is fiction (every sticky/escalated turn re-ingests
+  uncached). Needs real creds: soak test, separate the 429 classes, re-tune
+  cooldowns, cap fallback fan-out, verify caching or re-price escalation.
 - **Release model BEFORE anything deploys from `main`** — the moment the
   balancer deploys from `main`, CLAUDE.md's tripwire kills auto-merge and
   vacation autonomy with it. Decide *in advance*: manual promotion, a release

@@ -529,11 +529,30 @@ _TIER_RANK = {"local": 0, "foundry": 1}
 # LiteLLM key-allowlist wildcards: a key carrying either grants all models, so
 # governance must NOT treat them as a one-model allowlist.
 _ALLOWLIST_WILDCARDS = ("all-proxy-models", "*")
+# Governance FAIL-CLOSED (go-real hardening; premortem finding). Default OFF =
+# byte-for-byte the current fail-OPEN behavior (an absent/empty key allowlist
+# reads as "unrestricted", keeping every tier). The danger: a restriction that
+# FAILED TO LOAD looks identical to no restriction (UserAPIKeyAuth.models shape
+# varies across the three inbound protocols), so under enforce a restricted key
+# could be routed to a governance-sensitive backend with no backstop. When ON,
+# an ABSENT allowlist no longer opens the restricted tiers below — only an
+# EXPLICIT wildcard does. Opt-in on purpose: flipping it requires every real
+# key to carry an explicit allowlist (or a wildcard for admin), a provisioning
+# decision that belongs with the go-real deploy, not a silent default flip that
+# would change shadow records + break the master-key path.
+_GOVERNANCE_FAIL_CLOSED = os.environ.get(
+    "POLICY_GOVERNANCE_FAIL_CLOSED", ""
+).strip().lower() in ("1", "true", "yes", "on")
+# Tiers that require an EXPLICIT grant under fail-closed (an absent allowlist
+# does NOT reach them). Local is always allowed — cheapest, non-sensitive.
+_RESTRICTED_TIERS = ("foundry",)
 # Complexity buckets that demand an agent_capable backend (docs/12 §4 step 2).
 _AGENT_BUCKETS = ("toolful", "agentic")
 
 
-def _policy_stateless(candidates, key_models, bucket, registry_models, registry_state):
+def _policy_stateless(
+    candidates, key_models, bucket, registry_models, registry_state, fail_closed=None
+):
     """The stateless cheapest-capable policy (docs/12 §4), applied VERBATIM in
     the spec's order — governance → agent_capable gate → health → cheapest
     tier, tie-break lowest in_flight. Pure + deterministic: same inputs, same
@@ -544,12 +563,16 @@ def _policy_stateless(candidates, key_models, bucket, registry_models, registry_
       candidates      — [{model, tier, agent_capable}] from the gateway CONFIG
                         (one entry per alias; see _config_candidates)
       key_models      — the calling key's model allowlist (UserAPIKeyAuth.models;
-                        empty/None/wildcard ⇒ unrestricted)
+                        explicit list ⇒ restrict; explicit wildcard ⇒ open;
+                        empty/None ⇒ open, or restricted under fail_closed)
       bucket          — the request's shadow complexity bucket (goal 21) or None
       registry_models — {model: aggregate} from the control-plane /models, or
                         None when degraded to config-only
       registry_state  — "live" | "absent" | "stale" (how registry_models came
                         to be; stamped on the block so degrade is on-record)
+      fail_closed     — None ⇒ use the module default (_GOVERNANCE_FAIL_CLOSED);
+                        True/False overrides it (offline tests pass it directly
+                        so the function stays pure over its args)
 
     Returns the shadow policy block with actual/agree left None — they are
     filled in when reality (the served backend) is known, post-response."""
@@ -557,16 +580,33 @@ def _policy_stateless(candidates, key_models, bucket, registry_models, registry_
     pool = [dict(c) for c in candidates if isinstance(c, dict) and c.get("model")]
 
     # 1. governance — the key's allowlist bounds where this caller may EVER
-    # route (the "never leaves the building" rule, docs/12 §1).
+    # route (the "never leaves the building" rule, docs/12 §1). An EXPLICIT
+    # wildcard is an intentional "unrestricted"; an ABSENT/empty allowlist is
+    # AMBIGUOUS — a real restriction that failed to load looks identical to no
+    # restriction. Fail-closed refuses the restricted tiers for that ambiguous
+    # case; only an explicit wildcard opens them.
+    fc = _GOVERNANCE_FAIL_CLOSED if fail_closed is None else fail_closed
     allow = None
+    explicit_wildcard = False
     if isinstance(key_models, list):
         names = [m for m in key_models if isinstance(m, str) and m]
-        if names and not any(w in names for w in _ALLOWLIST_WILDCARDS):
+        if names and any(w in names for w in _ALLOWLIST_WILDCARDS):
+            explicit_wildcard = True
+        elif names:
             allow = set(names)
     if allow is not None:
         before = len(pool)
         pool = [c for c in pool if c["model"] in allow]
         steps.append("governance key-allowlist %d->%d" % (before, len(pool)))
+    elif fc and not explicit_wildcard:
+        # Absent/ambiguous allowlist under fail-closed: deny the restricted
+        # tiers (an explicit wildcard would have set explicit_wildcard=True).
+        before = len(pool)
+        pool = [c for c in pool if c.get("tier") not in _RESTRICTED_TIERS]
+        steps.append(
+            "governance: no allowlist -> fail-closed %d->%d (restricted tiers denied)"
+            % (before, len(pool))
+        )
     else:
         steps.append("governance: key unrestricted")
 

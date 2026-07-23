@@ -93,7 +93,12 @@ HTTP surface:
   GET  /health                                # 200 (liveness)
 
 The sink is unauthenticated — like mockd, this is a TEST/DEV daemon; bind it to
-localhost / an internal compose network only.
+localhost / an internal compose network only. The bind default is therefore
+`127.0.0.1` (safe by default); a non-loopback bind (e.g. the `0.0.0.0` the
+compose stacks set explicitly, so a container is reachable) is honoured but
+prints a loud warning, because the records expose routing/identity/session/
+fleet METADATA to anyone who can reach the port. It must NEVER be on public
+ingress without an auth layer in front (see GOALS.md — dashboard auth goal).
 """
 
 from __future__ import annotations
@@ -1805,9 +1810,26 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found: " + self.path})
 
 
+# Loopback binds need no warning; anything else exposes unauthenticated
+# metadata to whoever can reach the port.
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "")
+
+
 def main():
     port = int(os.environ.get("DASH_PORT", "9300"))
-    host = os.environ.get("DASH_HOST", "0.0.0.0")
+    # Safe by default: bind loopback unless a host is set EXPLICITLY (the
+    # compose stacks set 0.0.0.0 so the container is reachable). A bare
+    # `python dashboard.py` in a prod-shaped env therefore does NOT silently
+    # expose the sink on all interfaces (the go-real premortem's dashboard
+    # finding — the old 0.0.0.0 default contradicted the docstring).
+    host = os.environ.get("DASH_HOST", "127.0.0.1")
+    if host.strip().lower() not in _LOOPBACK_HOSTS:
+        print(
+            "WARNING: dashboard bound to %s — it serves UNAUTHENTICATED "
+            "routing/identity/session/fleet metadata. Keep it on a trusted "
+            "network only; NEVER on public ingress without an auth layer "
+            "(GOALS.md dashboard-auth goal)." % host
+        )
     server = ThreadingHTTPServer((host, port), Handler)
     print(
         "dashboard listening on http://%s:%d (GET / , GET /api/records , POST /records)"
