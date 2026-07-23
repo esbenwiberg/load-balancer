@@ -148,18 +148,26 @@ cost exceeds the taster's TTFT+infra tax. Measured, not argued.
 
 ## 5. Escalation — one hop, upward only
 
-> **Status: mechanics BUILT in shadow (goal 25).** The state machine below —
-> pin replaced upward, exactly once, no downward edge, no-ops recorded — runs
-> in shadow, fired by the manual/client-signaled option as a **STUB**: an
-> explicit `escalate` entry on `x-litellm-tags`.
+> **Status: contract BUILT in shadow + enforce (goal 31).** The state machine
+> below — pin replaced upward, exactly once, no downward edge, no-ops recorded
+> — was built in shadow (goal 25) behind a STUB tag; goal 31 promoted that stub
+> to the first-class **`router:escalate`** contract now that the trigger is
+> decided.
 >
-> **Trigger DECIDED 2026-07-23: manual / client-signaled is v1** — the stub is
-> the chosen shape, promoted to a first-class contract (namespaced tag
-> `router:escalate`); the automatic triggers are telemetry-gated follow-ups.
-> Full rationale + the four-option scoring in
-> [docs/03](03-open-questions-and-risks.md) (escalation-trigger decision block).
-> Recorded below at open decision 1.
+> **Trigger DECIDED 2026-07-23: manual / client-signaled is v1** — promoted to
+> a first-class contract (namespaced tag `router:escalate`); the automatic
+> triggers are telemetry-gated follow-ups. Full rationale + the four-option
+> scoring in [docs/03](03-open-questions-and-risks.md) (escalation-trigger
+> decision block). Recorded below at open decision 1.
 
+- **The signal — PUBLIC CONTRACT (goal 31)**: a client fires the hop by adding
+  a **`router:escalate`** entry to the goal-22 carrier `x-litellm-tags`
+  (comma-separated, alongside the `session:<id>` tag — the same header that
+  reaches both logging surfaces on the pin, so no new plumbing). The bare
+  **`escalate`** tag (goal 25's original STUB name) is kept as a **documented
+  back-compat alias** for the identical signal — recognised, never required,
+  not migrated away from. Read pre-call where the session tag is read (zero
+  request-path latency added).
 - **Trigger**: ✅ **DECIDED 2026-07-23 — manual / client-signaled v1**
   (`router:escalate` tag), automatic triggers telemetry-gated (open decision 1
   below). The spec reserves the *mechanics* regardless of trigger choice:
@@ -171,10 +179,41 @@ cost exceeds the taster's TTFT+infra tax. Measured, not argued.
   moves are forbidden).
 - **Cost accounting**: the escalating turn re-ingests the whole transcript
   uncached. Goal 20's overhead instrument must show this: the escalated turn's
-  `tokens_consumed` includes the re-ingestion; the per-session view (future)
-  should mark the escalation turn. **Requirement: escalation is visible in
-  routing records** (`escalated: true` on the delivered record + the old/new
-  pin), never silent.
+  `tokens_consumed` includes the re-ingestion; the per-session view marks the
+  escalation turn (goal 31 — a labeled, visible event on the dashboard's
+  session drill-down). **Requirement: escalation is visible in routing
+  records** (`escalated: true` on the delivered record + the old/new pin),
+  never silent.
+- **Attribution — first-class event (goal 31)**: the one firing turn stamps
+  **`escalation_trigger`** (`"manual"` in v1) alongside `escalated_from`, so a
+  future automatic trigger (complexity threshold, rotten-pin) is
+  distinguishable on-record. The field rides only the firing turn, not the
+  pin-hit turns after it — so each escalation is counted exactly once.
+
+### 5.1 Trigger-2 telemetry gate (goal 31)
+
+Trigger 2 — "the goal-21 complexity bucket crosses a line" (open decision 1
+below) — is adoptable **only** once telemetry shows the bucket signal would
+have fired where humans manually escalated ([docs/03](03-open-questions-and-risks.md)
+option 2 adoption gate). Goal 31 materialises that gate as a pipe, not prose:
+
+- **The metric.** Over the labeled set (every manual escalation = a
+  human-labeled "local wasn't enough here"), what fraction had a complexity
+  bucket in the **escalate-set** `{heavy, agentic}` at the escalating turn —
+  i.e. how many would trigger 2 have caught. This is a **recall**-flavoured
+  number. *Precision* (turns humans did NOT escalate but the bucket would
+  have) needs the non-escalating population, which needs real, non-synthetic
+  traffic distributions — deliberately **not** fabricated here.
+- **The pipe.** `GET /api/records` → `escalation_trigger2_gate`
+  `{manual_escalations, would_fire, agreement_rate, escalate_buckets,
+  min_sample, verdict}`. Labels = request rows whose policy block carries
+  `escalation_trigger == "manual"` (exactly one per escalated session);
+  prediction = that turn's `complexity.bucket ∈ escalate_buckets`.
+- **Honest by construction.** `verdict` reads **`"insufficient data"`** until
+  `manual_escalations` clears `min_sample`, and `agreement_rate` is `null` on
+  an empty set (never a fake `1.0`). The point is that the pipe exists and
+  fills as manual-trigger v1 runs — a low count yields no adoption signal, and
+  the doc says so.
 
 ## 6. Failure semantics — stickiness vs availability-fallback
 
@@ -303,8 +342,10 @@ vetted image. Findings, in de-risking order:
    Full four-option scoring against the hard constraints in
    [docs/03](03-open-questions-and-risks.md) (escalation-trigger decision
    block). This absorbs decision 4 below (no streaming-latency override needed
-   under a manual trigger). Unblocks the GOALS.md build goal that promotes the
-   stub + writes the trigger-2 telemetry gate.
+   under a manual trigger). **BUILT (goal 31):** the `router:escalate` contract
+   (+ `escalate` back-compat alias) and trigger 2's adoption gate — the
+   `escalation_trigger2_gate` metric materialised on `/api/records`, reading
+   "insufficient data" until the labeled set is large enough. See §5.1.
 2. ~~**Engine** — LiteLLM custom policy layer vs archgw/Plano.~~
    **✅ DECIDED 2026-07-09: LiteLLM custom policy layer** — see §7 and the
    docs/03 engine decision block. Re-look gate ≥ 2027-01 + documented session

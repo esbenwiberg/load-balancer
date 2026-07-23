@@ -150,6 +150,13 @@ cost once)?
 > § Needs-a-human blocker into a vetted build goal (GOALS.md): promote the
 > `escalate` stub to the first-class `router:escalate` contract + write the
 > telemetry gate that governs adopting trigger #2.
+>
+> **✅ BUILT (goal 31, PR pending):** `router:escalate` is the first-class tag
+> (bare `escalate` kept as a back-compat alias); the firing turn stamps
+> `escalation_trigger: "manual"` and the dashboard session view labels it; the
+> trigger-2 gate is materialised as `/api/records → escalation_trigger2_gate`,
+> reading "insufficient data" until the labeled set is large enough. See
+> [docs/12 §5/§5.1](12-hybrid-router-spec.md) + [docs/09](09-observability.md).
 
 ### 3. Spark interactive latency for big models
 A 30B-class model on a Spark is **single-digit tok/s for one user.** A coding agent

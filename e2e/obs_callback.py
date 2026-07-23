@@ -122,13 +122,17 @@ would give each worker its own contradictory pins; lost on container restart
 BY DESIGN, an unpinned session-turn just re-pins). Subsequent same-key
 requests carry the pin, bypassing re-evaluation:
 `shadow_policy: {arm: "session", stickiness_key, pin_hit, pinned_backend,
-escalated, chosen, ...}`. An explicit `escalate` tag on the verified carrier
+escalated, chosen, ...}`. A `router:escalate` tag on the verified carrier
 (x-litellm-tags) fires docs/12 §5's state machine IN SHADOW: the pin is
 replaced upward (local tier -> foundry tier) exactly once — the escalation
 target is the stateless arm re-run over the strictly-higher tiers, so
 governance/gate/health still apply — no downward edge ever, and any further
-signal is a recorded no-op. The escalate tag is a STUB trigger: it proves the
-mechanics; the real trigger decision stays open (GOALS.md § Needs-a-human).
+signal is a recorded no-op. The bare `escalate` tag is a documented
+back-compat alias for the same signal (goal 25 shipped it as a STUB; goal 31
+promoted `router:escalate` to the first-class contract now that the trigger is
+DECIDED — manual / client-signaled v1, docs/03 escalation-trigger block). The
+firing turn stamps `escalation_trigger: "manual"` alongside `escalated_from`
+so a future automatic trigger is distinguishable on-record.
 Same shadow discipline throughout: zero routing influence, and the pin store
 is the SHADOW router's own state — it records what the policy WOULD have
 pinned, not what actually served. See _PinStore/_policy_session + docs/09.
@@ -136,7 +140,7 @@ pinned, not what actually served. See _PinStore/_policy_session + docs/09.
 ENFORCEMENT (goal 26): the ROUTER_POLICY knob flips the policy from shadow to
 real. Default "shadow" = everything above unchanged, zero influence. Under
 "enforce" the pre-call hook REWRITES data["model"] to the policy's chosen
-backend (both arms, stub escalation included), stashing the client's original
+backend (both arms, escalation included), stashing the client's original
 ask on the block FIRST — post-rewrite nothing downstream can reconstruct it
 (verified on the pin, docs/12 §7 goal-26 addendum). The block then carries
 {enforced: true, requested, chosen, actual, agree}: the full requested vs
@@ -409,11 +413,28 @@ def _complexity(messages, tools):
 # we additionally read ONLY this one key and never emit the header map.
 _SESSION_HEADER = "x-litellm-tags"
 _SESSION_TAG_PREFIX = "session:"
-# The STUB escalation trigger (goal 25): a bare `escalate` entry in the same
-# header fires docs/12 §5's state machine in shadow. Client-signaled on
-# purpose — it proves the mechanics without pre-deciding the real trigger
-# (still § Needs-a-human, decided against accumulated telemetry).
-_ESCALATE_TAG = "escalate"
+# The manual / client-signaled escalation trigger — DECIDED as v1
+# (2026-07-23, docs/03 escalation-trigger block). A namespaced
+# `router:escalate` entry on the same carrier fires docs/12 §5's state machine
+# in shadow (and drives the pin under enforce). PUBLIC CONTRACT — documented in
+# docs/09 + docs/12 §5. The bare `escalate` tag (goal 25's STUB name) is kept
+# as a documented BACK-COMPAT ALIAS: same signal, so existing clients/tests do
+# not break on the promotion. Recognise either; never require both.
+_ESCALATE_TAG_NS = "router:escalate"  # the first-class contract (goal 31)
+_ESCALATE_TAG = "escalate"  # back-compat alias (goal 25); kept, not migrated
+_ESCALATE_TAGS = (_ESCALATE_TAG_NS, _ESCALATE_TAG)
+# v1 is manual / client-signaled only, so the on-record trigger label is a
+# constant today. The FIELD's existence — not its current value — is what lets
+# an automatic trigger (complexity threshold, rotten-pin) be told apart on the
+# record when one is adopted. See docs/09 + the trigger-2 telemetry gate.
+_ESCALATION_TRIGGER_V1 = "manual"
+
+
+def _escalate_requested(tags):
+    """True when the caller signalled an escalation on x-litellm-tags —
+    the first-class `router:escalate` OR its back-compat `escalate` alias.
+    `tags` is the parsed list from `_tags`. Never raises."""
+    return any(t in tags for t in _ESCALATE_TAGS)
 
 
 def _tags(headers):
@@ -836,7 +857,7 @@ def _policy_session(
       by design (no registry read, `registry: null` on the block — no health
       signal was consulted; docs/12 §6's down-backend interplay is the
       availability-fallback layer's job, not the pin's).
-    * ESCALATE signal (the stub trigger) — upward only, exactly once:
+    * ESCALATE signal (manual / client-signaled v1) — upward only, exactly once:
       the target is the stateless arm re-run over the KNOWN tiers strictly
       above the pin's (governance/agent-gate/health still apply), the pin is
       REPLACED with it and marked escalated, and the request that fired the
@@ -960,6 +981,11 @@ def _policy_session(
     }
     if escalated_from is not None:
         block["escalated_from"] = escalated_from
+        # What FIRED the hop — a first-class field on the one turn that flipped
+        # the pin (goal 31). v1 is manual/client-signaled, so it's constant
+        # today; the field makes a future automatic trigger distinguishable
+        # on-record, and it's the label the trigger-2 telemetry gate reads.
+        block["escalation_trigger"] = _ESCALATION_TRIGGER_V1
     return block
 
 
@@ -1355,7 +1381,7 @@ class RoutingRecorder(CustomLogger):
         # it for the records (keyed by the correlation id above, which every
         # record of this request will carry). Arm dispatch per docs/12 §2: a
         # stickiness key (goal 22's derivation, read pre-call) selects the
-        # session arm — pin store + stub-trigger escalation; keyless requests
+        # session arm — pin store + router:escalate trigger; keyless requests
         # take the stateless arm (goal 24, unchanged). data["model"] is never
         # touched, the stream is never buffered, and any error degrades to "no
         # block" — the request path is sacred.
@@ -1370,7 +1396,7 @@ class RoutingRecorder(CustomLogger):
                     sess = _session(headers, data.get("messages"))
                     key = (sess or {}).get("stickiness_key")
                     if key:
-                        escalate = _ESCALATE_TAG in _tags(headers)
+                        escalate = _escalate_requested(_tags(headers))
                         now = time.monotonic()
                         # Registry read only when the session arm will actually
                         # evaluate candidates (pin miss, or a live escalation):

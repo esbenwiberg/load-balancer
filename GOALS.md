@@ -78,10 +78,14 @@ enforce-mode e2e coverage against a second gateway container. **The
 task-aware router exists.** The **escalation trigger is now DECIDED
 (2026-07-23): manual / client-signaled v1**, automatic triggers telemetry-gated
 ([docs/03](docs/03-open-questions-and-risks.md) escalation-trigger decision
-block) — which vetted **goal 31** (promote the stub to the `router:escalate`
-contract + materialise the trigger-2 telemetry gate) for an unattended run.
-What remains open: flipping a real deployment to enforce (an ops call, not a
-build), and Spark-infra-shaped work, still parked.
+block). **Goal 31 built that contract** (2026-07): `router:escalate` is
+first-class (bare `escalate` kept as a back-compat alias), the firing turn is
+attributable (`escalation_trigger: "manual"` + a labeled dashboard event), and
+the trigger-2 telemetry gate is materialised on `/api/records` (reads
+"insufficient data" until real v1 traffic fills it) — see § Done. What remains
+open: flipping a real deployment to enforce (an ops call, not a build),
+Spark-infra-shaped work (still parked), and the discovered client-side emit
+half (goal 32).
 
 Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 [`docs/06`](docs/06-recommendation.md) (decision), [`docs/03`](docs/03-open-questions-and-risks.md) (risks).
@@ -91,51 +95,24 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 ## § Autonomy-friendly (safe to run unattended)
 
 _The policy-layer build arc (24 → 25 → 26, engine decided 2026-07-09:
-LiteLLM custom policy layer) is COMPLETE, and the goal-27 dashboard-rollup
-follow-ups (28 + 29) are done — see § Done. The **escalation-trigger decision
-is MADE (2026-07-23): manual / client-signaled v1** ([docs/03](docs/03-open-questions-and-risks.md)
-escalation-trigger decision block), which vetted **goal 31** below for an
-unattended run._
+LiteLLM custom policy layer) is COMPLETE, the goal-27 dashboard-rollup
+follow-ups (28 + 29) are done, and **goal 31 is done** (`router:escalate`
+first-class contract + trigger-2 telemetry gate — see § Done). The only vetted
+autonomy-friendly item left is the discovered follow-up below._
 
-- **31. Promote the escalation stub to the first-class `router:escalate`
-  contract + write the trigger-2 telemetry gate.** Completion condition:
-  On `main`, the hybrid router's manual escalation trigger (decided
-  2026-07-23, docs/03 escalation-trigger decision block) is a **supported
-  contract**, not a stub: (1) `obs_callback` recognises a **namespaced
-  `router:escalate`** entry on the goal-22 carrier (`x-litellm-tags`) as the
-  escalation signal, with the bare `escalate` tag **kept as a documented
-  back-compat alias** (goal 25's existing tests/e2e must stay green — do not
-  break them to migrate); the tag name(s) are documented in docs/09 + docs/12
-  §5 as a public contract. (2) The escalation is **attributable as a
-  first-class event**: the delivered record already carries `escalated` +
-  `escalated_from` (goal 25) — additionally stamp *what fired it*
-  (`escalation_trigger: "manual"`) so an automatic trigger later is
-  distinguishable on-record, and surface manual escalations on the dashboard's
-  existing session view (goal 30) as a visible, labeled event (no prompt
-  content — metadata only, governance line holds). (3) The **trigger-2
-  telemetry gate** is materialised, not just prose: define in docs the metric
-  that governs adopting the complexity-threshold trigger (does the goal-21
-  bucket signal on an escalating turn agree with the human's manual escalation
-  — i.e. would trigger 2 have fired where the human did), AND add an
-  `/api/records` rollup + offline test that computes it over the labeled set
-  (manual escalations = the labels; bucket at the escalating turn = the
-  prediction). It reads honestly as "insufficient data" while the count is
-  low — the point is the pipe exists and fills as v1 runs.
-  **Constraints:** shadow default unchanged (`ROUTER_POLICY=shadow`
-  byte-for-byte); zero request-path latency added (the tag is read where goal
-  25 reads it, pre-call); deterministic + auditable + never buffer the stream
-  (the decided hard constraints); synthetic/mock traffic only; no new deps
-  (stdlib dashboard, owned callback). **Proof (must surface in transcript):**
-  `e2e/run.sh` green AND `conformance/selftest.py` green; new e2e proving a
-  `router:escalate` tag fires the one upward hop under `ROUTER_POLICY=enforce`
-  (traffic follows the flipped pin, exactly once) AND that the bare `escalate`
-  alias still fires it; offline tests for the trigger-2 gate rollup (agreement
-  math incl. the low-count "insufficient data" path). **Stop / draft-only if:**
-  making the gate meaningful would require real (non-synthetic) traffic
-  distributions — if so, ship the pipe + the "insufficient data" state and
-  leave a note; do NOT fabricate traffic to force a number. Ship to PR →
-  auto-merge if both gates green (CLAUDE.md contract; nothing deploys from
-  `main`).
+- **32. `agent_capable`-style conformance probe for the escalation contract on
+  a real client.** Completion condition: on `main`, there is a documented,
+  test-covered way for a coding agent (Claude Code / Codex) to EMIT the
+  goal-31 `router:escalate` signal through the gateway — the client-side other
+  half of the contract goal 31 deliberately did not touch. Autonomy-friendly
+  IF it stays synthetic: extend `e2e/README` (or a helper) showing exactly how
+  the `x-litellm-tags: session:<id>,router:escalate` header is set on each of
+  the three inbound surfaces, plus a smoke that a header set the way a real
+  client would set it reaches the pre-call hook (reuse the goal-31 e2e path).
+  **Stop / draft-only if** proving it needs a REAL Claude Code / Codex process
+  wired to a live gateway (that's a client-config + UX decision — when/how a
+  human triggers the hop — and belongs with a human). Ship to PR → auto-merge
+  if both gates green.
 
 ---
 
@@ -208,6 +185,30 @@ decision is made.
    its condition literally holds on `main` — if in doubt, re-check it, don't
    trust the checkmark.
 
+- ✅ 31. Promote the escalation stub to the first-class `router:escalate`
+  contract + write the trigger-2 telemetry gate — the manual/client-signaled
+  trigger (decided 2026-07-23) is now a supported contract: `obs_callback`
+  recognises the namespaced **`router:escalate`** entry on `x-litellm-tags`
+  (via `_escalate_requested`, exact-match), with the bare **`escalate`** tag
+  kept as a documented back-compat alias (goal 25's tests/e2e untouched). The
+  firing turn stamps `escalation_trigger: "manual"` alongside `escalated_from`
+  (rides the firing turn only, so each escalation counts once), and the
+  dashboard session drill-down (goal 30) surfaces it as a labeled, visible
+  timeline event + a trigger-labeled escalated badge (metadata only). The
+  **trigger-2 telemetry gate** is materialised as `/api/records →
+  escalation_trigger2_gate` `{manual_escalations, would_fire, agreement_rate,
+  escalate_buckets, min_sample, verdict}` — recall of the complexity signal
+  (`{heavy, agentic}`) against the human labels, reading honestly as
+  "insufficient data" until the label count clears the floor (never a
+  fabricated rate). Shadow default byte-for-byte unchanged; zero request-path
+  latency (tag read where goal 25 reads it). New e2e proves `router:escalate`
+  AND the `escalate` alias each fire the one upward hop under
+  `ROUTER_POLICY=enforce` (traffic follows the flipped pin, exactly once, no-op
+  on a second signal) + the gate pipe present on `/api/records`; 5 offline gate
+  tests (agreement math + the low-count "insufficient data" path) + escalation
+  attribution + tag-recognition tests. Docs: docs/09 "The escalation contract",
+  docs/12 §5/§5.1, docs/03 decision block. Discovered follow-up: goal 32
+  (client-side emit half). — PR #<pending> (2026-07)
 - ✅ 28. Workbench traffic join — heartbeat carries `api_base` — the
   control-plane heartbeat accepts an optional `api_base` per (workbench,
   model) row (full-snapshot semantics like every other field: an omitting
