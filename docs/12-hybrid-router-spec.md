@@ -127,7 +127,8 @@ order:
    cheaper tier (local before Foundry), tie-break on lowest `in_flight`
    (control-plane) — the "cheapest capable" rule. `heavy` buckets may override
    toward Foundry per docs/03 risk 3 (streaming latency beats complexity) —
-   the exact rule is part of the escalation-trigger decision.
+   the exact rule was open decision 4, now folded into the escalation-trigger
+   decision (§8.1): moot under the manual v1 trigger, re-opens with trigger 2.
 
 **Note — the learned-taster slot (future option, ⛔ decision 5).** Step 4 is
 where a *learned matcher* could later replace the goal-21 decision tree as the
@@ -150,11 +151,18 @@ cost exceeds the taster's TTFT+infra tax. Measured, not argued.
 > **Status: mechanics BUILT in shadow (goal 25).** The state machine below —
 > pin replaced upward, exactly once, no downward edge, no-ops recorded — runs
 > in shadow, fired by the manual/client-signaled option as a **STUB**: an
-> explicit `escalate` entry on `x-litellm-tags`. The trigger *decision* below
-> remains open — the stub proves the mechanics without pre-deciding it.
+> explicit `escalate` entry on `x-litellm-tags`.
+>
+> **Trigger DECIDED 2026-07-23: manual / client-signaled is v1** — the stub is
+> the chosen shape, promoted to a first-class contract (namespaced tag
+> `router:escalate`); the automatic triggers are telemetry-gated follow-ups.
+> Full rationale + the four-option scoring in
+> [docs/03](03-open-questions-and-risks.md) (escalation-trigger decision block).
+> Recorded below at open decision 1.
 
-- **Trigger**: ⛔ **Needs-a-human** (GOALS.md § Needs-a-human bullet). The spec
-  reserves the *mechanics* regardless of trigger choice:
+- **Trigger**: ✅ **DECIDED 2026-07-23 — manual / client-signaled v1**
+  (`router:escalate` tag), automatic triggers telemetry-gated (open decision 1
+  below). The spec reserves the *mechanics* regardless of trigger choice:
 - **Mechanics**: escalation REPLACES the session's pin with a higher-tier
   backend (local → Foundry). One transition per session, ever; the state
   machine is `pinned(local) → escalated(foundry)` with no reverse edge and no
@@ -280,15 +288,33 @@ vetted image. Findings, in de-risking order:
 
 ## 8. Open decisions (⛔ Needs-a-human, collected; ✅ = since decided)
 
-1. **Escalation trigger** — complexity threshold / verify-then-escalate /
-   manual / N-fallback-turns. Decide against goal 21+22 telemetry.
+1. ~~**Escalation trigger** — complexity threshold / verify-then-escalate /
+   manual / N-fallback-turns.~~ **✅ DECIDED 2026-07-23: manual /
+   client-signaled v1** — a namespaced `router:escalate` tag on the
+   goal-22-verified `x-litellm-tags` carrier, promoting goal 25's stub to a
+   first-class contract. The three automatic triggers are ordered follow-ups
+   gated on evidence, not argument: **(2) complexity threshold** — adopt only
+   when v1's manual-escalation telemetry shows the goal-21 bucket signal would
+   have fired where humans did; **(3) structural verify-then-escalate** — a
+   rule-based next-turn check (parse/compile/test failure), never a verifier
+   model and never mid-stream (the full verify-then-escalate shape is REJECTED
+   — it buffers the stream and is "the model said so"); **(4) N-consecutive
+   fallback turns** — a separate health/rotten-pin signal (§6), not difficulty.
+   Full four-option scoring against the hard constraints in
+   [docs/03](03-open-questions-and-risks.md) (escalation-trigger decision
+   block). This absorbs decision 4 below (no streaming-latency override needed
+   under a manual trigger). Unblocks the GOALS.md build goal that promotes the
+   stub + writes the trigger-2 telemetry gate.
 2. ~~**Engine** — LiteLLM custom policy layer vs archgw/Plano.~~
    **✅ DECIDED 2026-07-09: LiteLLM custom policy layer** — see §7 and the
    docs/03 engine decision block. Re-look gate ≥ 2027-01 + documented session
    affinity. Unblocks GOALS.md 24–26.
 3. **Pin store at replica time** — §3's (a)→(c) promotion point.
-4. **Streaming-latency override** (docs/03 risk 3) — whether `heavy`/long-
-   stream traffic skips local regardless of complexity; fold into decision 1.
+4. ~~**Streaming-latency override** (docs/03 risk 3) — whether `heavy`/long-
+   stream traffic skips local regardless of complexity.~~ **✅ FOLDED into
+   decision 1 (2026-07-23):** moot under a manual v1 trigger (nothing
+   auto-routes `heavy` traffic); it re-opens only if/when trigger 2 (complexity
+   threshold) is adopted, and is decided there against the same telemetry.
 5. **Learned taster inside the deterministic policy** (§4 note) — whether to
    replace the goal-21 tree with a pinned open-weights matcher proposing from
    the filtered candidate set. Adoption gate: shadow-telemetry evidence that

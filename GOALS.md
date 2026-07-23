@@ -75,9 +75,12 @@ machine, STUB client-signaled trigger), and the **enforcement flip** (docs/09
 existing profile and test unchanged) the policy layer now actually DRIVES
 routing, with the requested/chosen/served triple on-record and dedicated
 enforce-mode e2e coverage against a second gateway container. **The
-task-aware router exists.** What remains open: the **escalation trigger**
-(§ Needs-a-human, telemetry-gated — the stub proved the mechanics without
-pre-deciding it), flipping a real deployment to enforce (an ops call, not a
+task-aware router exists.** The **escalation trigger is now DECIDED
+(2026-07-23): manual / client-signaled v1**, automatic triggers telemetry-gated
+([docs/03](docs/03-open-questions-and-risks.md) escalation-trigger decision
+block) — which vetted **goal 31** (promote the stub to the `router:escalate`
+contract + materialise the trigger-2 telemetry gate) for an unattended run.
+What remains open: flipping a real deployment to enforce (an ops call, not a
 build), and Spark-infra-shaped work, still parked.
 
 Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
@@ -89,10 +92,50 @@ Source roadmap: [`docs/02`](docs/02-architecture.md) (phased delivery),
 
 _The policy-layer build arc (24 → 25 → 26, engine decided 2026-07-09:
 LiteLLM custom policy layer) is COMPLETE, and the goal-27 dashboard-rollup
-follow-ups (28 + 29) are done — see § Done. **This queue is currently
-EMPTY**: nothing is vetted for an unattended run. More candidates live in
-§ Needs-a-human (several become autonomy-friendly once their decision is
-made — the escalation trigger is the one that unblocks the most)._
+follow-ups (28 + 29) are done — see § Done. The **escalation-trigger decision
+is MADE (2026-07-23): manual / client-signaled v1** ([docs/03](docs/03-open-questions-and-risks.md)
+escalation-trigger decision block), which vetted **goal 31** below for an
+unattended run._
+
+- **31. Promote the escalation stub to the first-class `router:escalate`
+  contract + write the trigger-2 telemetry gate.** Completion condition:
+  On `main`, the hybrid router's manual escalation trigger (decided
+  2026-07-23, docs/03 escalation-trigger decision block) is a **supported
+  contract**, not a stub: (1) `obs_callback` recognises a **namespaced
+  `router:escalate`** entry on the goal-22 carrier (`x-litellm-tags`) as the
+  escalation signal, with the bare `escalate` tag **kept as a documented
+  back-compat alias** (goal 25's existing tests/e2e must stay green — do not
+  break them to migrate); the tag name(s) are documented in docs/09 + docs/12
+  §5 as a public contract. (2) The escalation is **attributable as a
+  first-class event**: the delivered record already carries `escalated` +
+  `escalated_from` (goal 25) — additionally stamp *what fired it*
+  (`escalation_trigger: "manual"`) so an automatic trigger later is
+  distinguishable on-record, and surface manual escalations on the dashboard's
+  existing session view (goal 30) as a visible, labeled event (no prompt
+  content — metadata only, governance line holds). (3) The **trigger-2
+  telemetry gate** is materialised, not just prose: define in docs the metric
+  that governs adopting the complexity-threshold trigger (does the goal-21
+  bucket signal on an escalating turn agree with the human's manual escalation
+  — i.e. would trigger 2 have fired where the human did), AND add an
+  `/api/records` rollup + offline test that computes it over the labeled set
+  (manual escalations = the labels; bucket at the escalating turn = the
+  prediction). It reads honestly as "insufficient data" while the count is
+  low — the point is the pipe exists and fills as v1 runs.
+  **Constraints:** shadow default unchanged (`ROUTER_POLICY=shadow`
+  byte-for-byte); zero request-path latency added (the tag is read where goal
+  25 reads it, pre-call); deterministic + auditable + never buffer the stream
+  (the decided hard constraints); synthetic/mock traffic only; no new deps
+  (stdlib dashboard, owned callback). **Proof (must surface in transcript):**
+  `e2e/run.sh` green AND `conformance/selftest.py` green; new e2e proving a
+  `router:escalate` tag fires the one upward hop under `ROUTER_POLICY=enforce`
+  (traffic follows the flipped pin, exactly once) AND that the bare `escalate`
+  alias still fires it; offline tests for the trigger-2 gate rollup (agreement
+  math incl. the low-count "insufficient data" path). **Stop / draft-only if:**
+  making the gate meaningful would require real (non-synthetic) traffic
+  distributions — if so, ship the pipe + the "insufficient data" state and
+  leave a note; do NOT fabricate traffic to force a number. Ship to PR →
+  auto-merge if both gates green (CLAUDE.md contract; nothing deploys from
+  `main`).
 
 ---
 
@@ -112,17 +155,18 @@ decision is made.
   hop) — recorded in [docs/03 risks 1–2](docs/03-open-questions-and-risks.md)
   (decision block after risk 2). Unblocked goals 22–23 above. The remaining
   sub-decision is the **escalation trigger** (next bullet).
-- **Escalation trigger for the hybrid router** — WHEN does a session take its
-  one upward hop? The options with real teeth: a complexity threshold (goal
-  21's signal crossing a line), **verify-then-escalate** (Fugu/TRINITY's
-  Verifier role: cheap verification pass on local output, escalate on
-  failure — mind Fugu Ultra's 8–160s latency floor, the cautionary tale), or
-  manual/client-signaled. Decide against goal 21's accumulated traffic-mix
-  telemetry once it has real distributions. Hard constraints regardless:
-  deterministic + auditable, never buffer the stream behind a verdict.
-  *(The engine fork below is decided; goal 25 builds the escalation
-  mechanics with a client-signaled STUB trigger — that proves the state
-  machine without pre-deciding this. This bullet remains the real call.)*
+- ~~**Escalation trigger for the hybrid router**~~ — **✅ DECIDED 2026-07-23:
+  manual / client-signaled v1** (namespaced `router:escalate` tag), with the
+  automatic triggers as telemetry-gated follow-ups — recorded in
+  [docs/03](docs/03-open-questions-and-risks.md) (escalation-trigger decision
+  block) + [docs/12 §5/§8.1](docs/12-hybrid-router-spec.md). Short version:
+  it's the only option decidable without real traffic (the harness has none),
+  fits every hard constraint by construction, and its manual escalations
+  become the eval set that gates adopting the complexity-threshold trigger
+  next. Verify-then-escalate rejected (buffers the stream + "model said so");
+  a rule-based structural check and N-fallback rotten-pin kept as later
+  signals. **This unblocked goal 31 below** (promote the stub → first-class
+  contract + write the trigger-2 telemetry gate) — now § Autonomy-friendly.
 - ~~**LiteLLM-only vs `archgw`/Plano evaluation**~~ — **✅ DECIDED 2026-07-09:
   LiteLLM custom policy layer** — recorded in [docs/03](docs/03-open-questions-and-risks.md)
   (engine decision block after risk 2) against [docs/12 §7](docs/12-hybrid-router-spec.md)'s
