@@ -442,6 +442,55 @@ class TestPolicyOutcome(unittest.TestCase):
         self.assertIsNone(block["actual"])  # delivered + attempts each stamp fresh
 
 
+class TestGovernanceFailClosed(unittest.TestCase):
+    """Go-real hardening (premortem finding): an ABSENT/empty allowlist must not
+    silently open the governance-sensitive (foundry) tier under fail-closed —
+    only an EXPLICIT wildcard does. Default mode (fail_closed=False) stays
+    fail-OPEN, byte-for-byte the pre-hardening behavior."""
+
+    def test_absent_allowlist_denies_restricted_tiers_when_closed(self):
+        for wl in (None, [], [""], "not-a-list"):
+            b = _policy_stateless(
+                _CANDIDATES, wl, "trivial", None, "absent", fail_closed=True
+            )
+            self.assertEqual(b["candidate_set"], ["qwen3-coder"], wl)  # local only
+            self.assertEqual(b["chosen"], "qwen3-coder", wl)
+            self.assertIn("fail-closed", b["reason"], wl)
+
+    def test_explicit_wildcard_still_opens_everything_when_closed(self):
+        for wl in (["*"], ["all-proxy-models"], ["*", "gpt"]):
+            b = _policy_stateless(
+                _CANDIDATES, wl, "trivial", None, "absent", fail_closed=True
+            )
+            self.assertEqual(len(b["candidate_set"]), 4, wl)
+            self.assertIn("governance: key unrestricted", b["reason"], wl)
+
+    def test_explicit_allowlist_unchanged_when_closed(self):
+        b = _policy_stateless(
+            _CANDIDATES, ["claude-opus"], "trivial", None, "absent", fail_closed=True
+        )
+        self.assertEqual(b["candidate_set"], ["claude-opus"])
+        self.assertIn("governance key-allowlist", b["reason"])
+
+    def test_default_mode_is_still_fail_open(self):
+        # fail_closed=False (the default): an absent allowlist keeps every tier.
+        b = _policy_stateless(
+            _CANDIDATES, None, "trivial", None, "absent", fail_closed=False
+        )
+        self.assertEqual(len(b["candidate_set"]), 4)
+        self.assertIn("governance: key unrestricted", b["reason"])
+
+    def test_fail_closed_denies_when_only_restricted_tier_remains(self):
+        # An absent-allowlist caller whose only backends are foundry-tier gets
+        # NO candidate under fail-closed — deny beats serve, the whole point.
+        foundry_only = [c for c in _CANDIDATES if c["tier"] == "foundry"]
+        b = _policy_stateless(
+            foundry_only, None, "trivial", None, "absent", fail_closed=True
+        )
+        self.assertEqual(b["candidate_set"], [])
+        self.assertIsNone(b["chosen"])
+
+
 # --- shadow sticky pins + escalation mechanics — the session arm (goal 25) ---
 # The e2e suite proves the live path (same-tag stickiness, the escalate tag,
 # zero influence); these pin the STATE MACHINE itself: pin-at-first-sight,

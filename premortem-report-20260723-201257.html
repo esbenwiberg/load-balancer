@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Premortem — LLM Load-Balancer go-real transition</title>
+<style>
+  :root{
+    --bg:#0a0e1a; --panel:#111726; --panel2:#0e1420; --line:#20293d;
+    --ink:#e6ebf5; --muted:#8b97b0; --dim:#5f6b85;
+    --crit:#ff5d6c; --high:#ff9f45; --med:#ffd24a; --ok:#4ad4a0; --accent:#5b9dff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .wrap{max-width:1080px;margin:0 auto;padding:40px 22px 80px}
+  h1{font-size:26px;margin:0 0 4px;letter-spacing:-.02em}
+  .sub{color:var(--muted);margin:0 0 6px}
+  .meta{color:var(--dim);font-size:13px;margin-bottom:30px}
+  h2{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);
+    margin:34px 0 14px;font-weight:600}
+  code{background:#0b1220;border:1px solid var(--line);border-radius:4px;padding:1px 5px;
+    font:12.5px/1.4 "SF Mono",ui-monospace,Menlo,monospace;color:#bcd0ff}
+  .synth{background:linear-gradient(180deg,#131b2e,#0e1524);border:1px solid var(--line);
+    border-radius:14px;padding:22px 24px;margin-bottom:14px}
+  .synth h3{margin:0 0 6px;font-size:16px}
+  .synth p{margin:0 0 4px}
+  .synth .tag{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.08em;
+    text-transform:uppercase;padding:2px 9px;border-radius:999px;margin-bottom:8px}
+  .t-likely{background:rgba(255,159,69,.14);color:var(--high);border:1px solid var(--high)}
+  .t-danger{background:rgba(255,93,108,.14);color:var(--crit);border:1px solid var(--crit)}
+  .t-assume{background:rgba(91,157,255,.14);color:var(--accent);border:1px solid var(--accent)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  ol.rev{margin:0;padding-left:20px} ol.rev li{margin:0 0 9px}
+  ul.chk{list-style:none;margin:0;padding:0}
+  ul.chk li{padding:10px 12px 10px 40px;position:relative;border:1px solid var(--line);
+    border-radius:9px;margin-bottom:8px;background:var(--panel2)}
+  ul.chk li:before{content:"";position:absolute;left:14px;top:14px;width:12px;height:12px;
+    border:2px solid var(--accent);border-radius:3px}
+  .cards{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 18px 16px;
+    border-top:3px solid var(--accent)}
+  .card.crit{border-top-color:var(--crit)} .card.high{border-top-color:var(--high)}
+  .card.med{border-top-color:var(--med)}
+  .card .num{font-size:12px;color:var(--dim);font-weight:700}
+  .card h4{margin:2px 0 10px;font-size:15.5px;line-height:1.35}
+  .badges{margin:0 0 12px;display:flex;gap:6px;flex-wrap:wrap}
+  .b{font-size:10.5px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
+    padding:2px 8px;border-radius:999px;border:1px solid}
+  .b.crit{color:var(--crit);border-color:var(--crit)} .b.high{color:var(--high);border-color:var(--high)}
+  .b.med{color:var(--med);border-color:var(--med)} .b.confirmed{color:var(--ok);border-color:var(--ok)}
+  .card p{margin:0 0 9px;font-size:13.5px;color:#d3dbec}
+  .lbl{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);
+    font-weight:700;display:block;margin:12px 0 3px}
+  .warn{font-size:13px;color:#c7d0e3}
+  .warn li{margin-bottom:3px}
+  footer{margin-top:40px;color:var(--dim);font-size:12.5px;border-top:1px solid var(--line);padding-top:16px}
+  @media(max-width:820px){.cards,.grid2{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Premortem — the go-real transition</h1>
+  <p class="sub">LLM load-balancer / task-aware router, the day after it goes live on Azure with real Foundry creds, real dev prompts, and a reachable endpoint.</p>
+  <p class="meta">8 failure modes investigated in parallel · 2 confirmed in code · frame: "it's 6 months out and this has failed — why?"</p>
+
+  <h2>Synthesis — read this first</h2>
+
+  <div class="synth">
+    <span class="tag t-likely">Most likely failure</span>
+    <h3>#2 · Real personal/customer data reaches Foundry</h3>
+    <p>Near-certain the instant real traffic flows — because <em>nothing technical has to break</em>. Devs point coding agents at real client repos; the agent slurps surrounding context (customer names, secrets, a prod DB row in a stack trace) and streams it through the one endpoint to Foundry. The system routes it <em>perfectly</em>. The governance rule ("no customer data on a real-model path") was never code — it lived in the discipline of using synthetic test prompts. The "no prompt content stored" design then makes the blast radius <strong>unknowable</strong>: you can't even prove what leaked.</p>
+  </div>
+
+  <div class="synth">
+    <span class="tag t-danger">Most dangerous failure</span>
+    <h3>#3 · The governance guard fails open under enforce <span class="b confirmed" style="vertical-align:middle">confirmed in code</span></h3>
+    <p>Lower-visibility, catastrophic, and <strong>a real code path today</strong>. <code>_policy_stateless</code> (e2e/obs_callback.py:561) treats a missing/empty <code>key_models</code> as "unrestricted" and keeps every candidate, Foundry included. <code>key_models</code> comes from <code>getattr(user_api_key_dict, "models", None)</code> — which the code itself warns varies across the three inbound protocols. On the Codex/Responses path the allowlist can arrive empty → a restricted key is silently treated as unrestricted → the enforce rewrite sends it to Foundry, which LiteLLM never re-checks. <strong>No backstop, by design.</strong> Detection came from the Foundry bill, not the gateway.</p>
+  </div>
+
+  <div class="synth">
+    <span class="tag t-assume">The hidden assumption</span>
+    <h3>"A rule we wrote down is a control we enforce."</h3>
+    <p>The one thing so obvious it stopped looking like an assumption. Every top failure is a documented <em>intention</em> standing in for an enforced <em>mechanism</em>:</p>
+    <ul class="warn">
+      <li>Governance rule → a sentence in <code>CLAUDE.md</code>, not content inspection <span style="color:var(--dim)">(#2)</span></li>
+      <li>Dashboard "localhost only" → a docstring, while the code binds <code>0.0.0.0</code> <span style="color:var(--dim)">(#6, confirmed)</span></li>
+      <li>Auto-merge tripwire → prose the CI never reads, not a technical gate <span style="color:var(--dim)">(#7)</span></li>
+      <li>Enforce "sole guard" → holds only until the "degrade to no block on error" path quietly removes it <span style="color:var(--dim)">(#3)</span></li>
+    </ul>
+    <p style="margin-top:8px">Underneath it: <strong>"green against the synthetic harness means safe in prod."</strong> The harness is 100% mock backends, mock Foundry, synthetic prompts, one container, localhost. It is green <em>precisely because</em> it tests the one configuration where the go-real threats can't exist.</p>
+  </div>
+
+  <div class="grid2">
+    <div class="synth">
+      <h3 style="font-size:14px;margin-bottom:10px">The revised plan</h3>
+      <ol class="rev">
+        <li><strong>Flip governance to fail CLOSED.</strong> Missing/empty/unloadable <code>key_models</code> ⇒ most-restrictive (local-only) candidate set. "Unrestricted" must require an explicit wildcard, never an absence.</li>
+        <li><strong>Make Foundry opt-in, default-deny per key</strong> until DISCO signs off on Foundry for a named data class — and get that sign-off against the control that actually exists (backend-gating, no DLP), not an assumed one.</li>
+        <li><strong><code>DASH_HOST=127.0.0.1</code> + auth</strong> (Azure Easy Auth / shared token). Startup refuses a <code>0.0.0.0</code> bind unless auth is set. :9300 never on public ingress.</li>
+        <li><strong>Postgres pin store before &gt;1 replica</strong> (the deferred docs/12 §3 call) — or pin replicas to 1 + scale-to-zero off, explicitly, with the migration as the documented scale gate.</li>
+        <li><strong>Turn the tripwire into a CI gate</strong> that fails the merge if a deploy-from-main workflow exists. Decide the release model before wiring any deploy.</li>
+        <li><strong>Push-based spend alert</strong> (SpendLogs → alert at X%/hour), real per-key budgets from real pricing, and <strong>verify prompt-caching on the real route</strong> before trusting the escalation cost model.</li>
+        <li><strong>Real-Foundry soak test</strong>: separate capacity-429 from rate-429 (don't fan out retries on capacity), re-tune cooldowns, cap fallback fan-out, map auth/quota errors to honest client errors.</li>
+      </ol>
+    </div>
+    <div class="synth">
+      <h3 style="font-size:14px;margin-bottom:10px">Pre-launch checklist</h3>
+      <ul class="chk">
+        <li><strong>Governance fails closed</strong> — a test proves a key with no/empty/unloadable allowlist cannot reach Foundry under enforce, on <em>all three</em> inbound protocols (esp. Codex/Responses). Until green, do not flip enforce in prod.</li>
+        <li><strong>DISCO sign-off matches reality</strong> — in writing, which data classes may touch Foundry; Foundry default-deny per key.</li>
+        <li><strong>Dashboard not public</strong> — <code>DASH_HOST</code> bound + authed; verified with an external port scan of the deployed endpoint.</li>
+        <li><strong>Pin store decided</strong> — Postgres-backed, or replicas=1 + scale-to-zero off, documented as the scale gate.</li>
+        <li><strong>No deploy-from-main</strong> until the release model is decided AND a technical gate enforces the tripwire; spend alert live before real creds; caching verified or escalation re-priced.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>The eight failure modes</h2>
+  <div class="cards">
+
+    <div class="card crit">
+      <div class="num">FAILURE 02</div>
+      <h4>Real customer data reaches Foundry</h4>
+      <div class="badges"><span class="b crit">Likelihood: very high</span><span class="b crit">Severity: critical</span></div>
+      <p>Devs pointed Claude Code at a live client repo; the agent slurped a config with a customer name, a <code>.env</code> fragment, a prod DB row in a stack trace, and streamed it to Foundry. The gateway routed perfectly and logged metadata only — so nothing was inspected, ever. Surfaced 3 months later when a Sulava client's vendor-data-flow review asked "does the shared gateway send our data to Foundry?" Yes, thousands of times. DISCO's sign-off (granted assuming a control existed) was voided; breach review across all five orgs.</p>
+      <span class="lbl">Underlying assumption</span>
+      <p>That a governance rule enforced by test discipline holds once real, uncontrolled human+agent traffic replaces the synthetic harness.</p>
+      <span class="lbl">Early warning signs</span>
+      <ul class="warn"><li>No one can name a single real dev prompt that ever flowed — the control has never been tested against its actual threat.</li><li>DISCO approval references "content controls / data inspection" that exist nowhere in the code; the filter only gates backends by key.</li></ul>
+    </div>
+
+    <div class="card crit">
+      <div class="num">FAILURE 03</div>
+      <h4>Governance filter fails open under enforce</h4>
+      <div class="badges"><span class="b high">Likelihood: high</span><span class="b crit">Severity: critical</span><span class="b confirmed">confirmed in code</span></div>
+      <p><code>_policy_stateless</code> only builds an allowlist when <code>key_models</code> is a non-empty list of real names; otherwise <code>allow=None</code> → "governance: key unrestricted" → every candidate kept. On the Responses/Codex bridge the key allowlist came back empty, so local-only keys were silently unrestricted. The <code>agent_capable</code> gate + unhealthy local workbenches left only Foundry surviving; the rewrite pointed there; LiteLLM never re-checks a rewritten model. Ran for weeks — the one governance e2e used a populated allowlist, so the broken path had no coverage. Caught by Foundry billing.</p>
+      <span class="lbl">Underlying assumption</span>
+      <p>That a restricted key's allowlist always reaches the policy as a populated list — so "no allowlist" safely means "unrestricted" rather than "failed to load."</p>
+      <span class="lbl">Early warning signs</span>
+      <ul class="warn"><li><code>ROUTING_RECORD</code> lines where a known-restricted <code>key_alias</code> shows <code>reason: "governance: key unrestricted"</code> or a <code>chosen</code> on the foundry tier — visible in shadow, before enforce flips.</li><li>Delivered records: local-only <code>key_alias</code> with a Foundry <code>served_model</code>.</li></ul>
+    </div>
+
+    <div class="card crit">
+      <div class="num">FAILURE 07</div>
+      <h4>Auto-merge tripwire missed → ships to live</h4>
+      <div class="badges"><span class="b med">Likelihood: medium</span><span class="b crit">Severity: critical</span></div>
+      <p>The Azure deploy got wired to push-on-<code>main</code> the obvious way. Nobody flipped the CLAUDE.md tripwire from prose to reality — it lives in a markdown file the pipeline never reads, and the release-model decision stayed "fine as-is." An overnight goal run branched, passed the synthetic gate (no real backends), squash-merged per contract, and the change deployed to the live endpoint. A routing/governance tweak that was green against mocks weakened the sole guard on real traffic, with nobody watching.</p>
+      <span class="lbl">Underlying assumption</span>
+      <p>A safety rule written as prose will be honored at the exact moment it matters, even by an unattended agent that never re-reads it against changed infra.</p>
+      <span class="lbl">Early warning signs</span>
+      <ul class="warn"><li>A deploy workflow triggering on merge to <code>main</code> exists while GOALS.md still lists the release model as undecided.</li><li>Auto-merged PRs touching routing/enforce/governance whose only evidence is the synthetic gate — zero prod smoke between merge and live.</li></ul>
+    </div>
+
+    <div class="card high">
+      <div class="num">FAILURE 06</div>
+      <h4>Unauthenticated dashboard exposed</h4>
+      <div class="badges"><span class="b high">Likelihood: high</span><span class="b high">Severity: high</span><span class="b confirmed">confirmed in code</span></div>
+      <p>Smoking gun: <code>e2e/dashboard.py:1810</code> defaults <code>DASH_HOST</code> to <code>0.0.0.0</code>, not localhost — the docstring says localhost, but a comment isn't a control. The gateway's :443 ingress config got copied to :9300 "temporarily" during a rushed cutover. An internet-wide scanner indexed the open port; <code>GET /api/records</code> returns clean JSON to anyone. Leaked: user_ids/key aliases → models, session patterns, per-team spend, and the fleet registry with every workbench's <code>api_base</code> + health — a live internal attack map. "Metadata only" was the fatal comfort.</p>
+      <span class="lbl">Underlying assumption</span>
+      <p>That a tool's intended context ("localhost test daemon") constrains its actual one — a documented convention substituting for an enforced bind + auth.</p>
+      <span class="lbl">Early warning signs</span>
+      <ul class="warn"><li>A <code>grep DASH_HOST</code> shows <code>0.0.0.0</code> shipped in code while every doc claims localhost-only.</li><li>The exposure model stayed an open Needs-a-human item after the go-live date was set.</li></ul>
+    </div>
+
+    <div class="card high">
+      <div class="num">FAILURE 05</div>
+      <h4>Cost blowout</h4>
+      <div class="badges"><span class="b high">Likelihood: high</span><span class="b high">Severity: high</span></div>
+      <p>Dominant driver: the escalation hop re-ingests the whole (already huge) agentic transcript <em>uncached</em> into premium Foundry, repeatedly, within one session. The "route cheap, escalate rarely" premise assumed caching absorbed the re-reads — but caching on the Foundry route was never verified and wasn't active. A stuck Codex loop times several concurrent devs compounded it. Synthetic budget tests (<code>max_budget:0→400</code>, <code>rpm:1→429</code>) proved the <em>plumbing</em> fires, not that the <em>numbers</em> were sane. The dashboard is a pull, not a push — first signal was the Azure invoice.</p>
+      <span class="lbl">Underlying assumption</span>
+      <p>That enforcement plumbing passing synthetic extremes meant the budget numbers were calibrated for real agentic + escalation volume — and that caching made re-ingestion cheap.</p>
+      <span class="lbl">Early warning signs</span>
+      <ul class="warn"><li>SpendLogs shows a session's cost jumping stepwise on each escalation; input-token counts never drop across turns.</li><li>Foundry premium input tokens climbing while cache-hit rate sits near zero.</li></ul>
+    </div>
+
+    <div class="card high">
+      <div class="num">FAILURE 08</div>
+      <h4>Real Foundry breaks mock-tuned assumptions</h4>
+      <div class="badges"><span class="b high">Likelihood: high</span><span class="b high">Severity: high</span></div>
+      <p>Peak-hour 429s weren't the rate-limit 429s mockd threw — they were regional <em>capacity</em>-429s. The fallback treated them identically and, since the next backend was the same exhausted region, the chain fanned out instead of failing over — multiplying load exactly when Foundry had none. Cooldowns tuned against a millisecond-recovery mock were far too short; backends flapped every heartbeat. Big-model streaming ran single-digit tok/s (risk 3). Caching didn't apply (risk 5), so cost ran 3–5×. Token expiry surfaced as opaque 5xx.</p>
+      <span class="lbl">Underlying assumption</span>
+      <p>A deterministic mock's fault taxonomy and timing are a valid proxy for a real capacity-constrained, latency-variable, caching-uncertain cloud backend.</p>
+      <span class="lbl">Early warning signs</span>
+      <ul class="warn"><li>Fallback-attempts-per-request &gt; 1 on average, correlated with time-of-day — the chain is fanning out, not failing over.</li><li>Cost-per-escalated-turn diverging upward; cached-token ratio near zero on the Foundry route.</li></ul>
+    </div>
+
+    <div class="card high">
+      <div class="num">FAILURE 01</div>
+      <h4>Leaked key → free LLM / cred drain</h4>
+      <div class="badges"><span class="b med">Likelihood: medium</span><span class="b high">Severity: high</span></div>
+      <p>A virtual key (not the master) escaped — into a client-shared GitHub repo via a <code>.env</code> variant <code>.gitignore</code> missed. GitHub secret-scanning doesn't flag <code>sk-</code> LiteLLM keys. A permissive ingress made the endpoint reachable from anywhere the key was. The per-key budget was a spend cap, not a breach alarm: the attacker ran the key flat to the ceiling each cycle — "within budget" on the dashboard, so nothing screamed. Found ~5 weeks later when Foundry spend pinned at ceiling every cycle from unrecognized prompts — now a DISCO question of what an attacker sent through a Projectum-only path.</p>
+      <span class="lbl">Underlying assumption</span>
+      <p>That a key in a trusted internal dev's hands stays private — so budgets/rate-limits suffice and key <em>exposure</em> itself needs no detection.</p>
+      <span class="lbl">Early warning signs</span>
+      <ul class="warn"><li>A key hitting its budget ceiling at a steady max every cycle, or requests from IPs/user-agents outside the known dev fleet.</li><li>Any key value in a git push / CI log; the :9300 dashboard reachable off-VNet at all.</li></ul>
+    </div>
+
+    <div class="card med">
+      <div class="num">FAILURE 04</div>
+      <h4>Pin store breaks across Azure replicas</h4>
+      <div class="badges"><span class="b high">Likelihood: high</span><span class="b med">Severity: medium–high</span></div>
+      <p>The guarded SQLite UPDATE gave real pin-once / exactly-once — <em>within one container</em>. Container Apps scaled to 3 replicas, and "atomic within one file" became "atomic within one of three." Session turns hit different replicas → re-pinned mid-conversation (format contract broken, context re-ingested, cost + latency spikes). Escalation was worse and silent: "exactly once per session" held per file, so a session bouncing across replicas escalated once per replica — double cost, duplicate side-effects. Scale-to-zero wiped <code>/tmp</code>, re-pinning returning sessions. Going live on Azure <em>was</em> "replica time"; the deferred Postgres call was never made.</p>
+      <span class="lbl">Underlying assumption</span>
+      <p>That "one container, many workers" and "many containers" are the same trust boundary for shared state.</p>
+      <span class="lbl">Early warning signs</span>
+      <ul class="warn"><li>Escalation/pin counts exceed distinct-session counts once replicas &gt; 1.</li><li>One session_id logged with conflicting pinned-tier decisions within a conversation, correlated with pod identity; pin-DB rows resetting after every scale-to-zero.</li></ul>
+    </div>
+
+  </div>
+
+  <footer>
+    Premortem generated 2026-07-23 20:12 · target: LLM load-balancer / task-aware router, go-real (Azure) transition ·
+    method: Gary Klein prospective-hindsight, 8 parallel investigators · 2 findings verified against source (obs_callback.py:561, dashboard.py:1810).
+  </footer>
+</div>
+</body>
+</html>
