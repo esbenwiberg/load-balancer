@@ -189,6 +189,12 @@ bicep_build_params() { # $1 = .bicepparam file
   if [ "$BICEP_KIND" = "az" ]; then az bicep build-params --file "$1" --stdout
   else bicep build-params "$1" --stdout; fi
 }
+# `az bicep` (CLI) prints a version-upgrade nag to stderr on EVERY invocation
+# ("WARNING: A new Bicep release is available: vX.Y.Z ..."). That is not a build
+# diagnostic — real bicep diagnostics are `path(line,col) : Error/Warning BCPnnnn`.
+# Strip the nag so the "any leftover output = fail" rule below only trips on
+# genuine diagnostics; without this a new upstream release blocks every commit.
+bicep_denag() { grep -vE '^WARNING: A new Bicep release is available' || true; }
 if [ -z "$BICEP_KIND" ]; then
   skip "bicep" "not installed — 'az bicep install' or https://aka.ms/bicep-install"
 else
@@ -203,9 +209,12 @@ else
   else
     BICEP_BAD=0
     for f in "${BC[@]}"; do
-      if out="$(bicep_build "$f" 2>&1 >/dev/null)"; then
-        # build succeeds on warnings; treat any diagnostic line as a hard fail so
-        # the IaC stays lint-clean (no accidental secure-default / unused params).
+      # capture the build's real exit code, then drop the CLI upgrade nag so only
+      # genuine diagnostics remain; treat any diagnostic line as a hard fail so
+      # the IaC stays lint-clean (no accidental secure-default / unused params).
+      out="$(bicep_build "$f" 2>&1 >/dev/null)"; rc=$?
+      out="$(printf '%s' "$out" | bicep_denag)"
+      if [ "$rc" -eq 0 ]; then
         if [ -n "$out" ]; then
           BICEP_BAD=1; fail "bicep build (diagnostics): $f"
           printf '%s\n' "$out" | sed 's/^/      /'
@@ -218,7 +227,9 @@ else
       fi
     done
     for f in "${BP[@]}"; do
-      if out="$(bicep_build_params "$f" 2>&1 >/dev/null)"; then
+      out="$(bicep_build_params "$f" 2>&1 >/dev/null)"; rc=$?
+      out="$(printf '%s' "$out" | bicep_denag)"
+      if [ "$rc" -eq 0 ]; then
         if [ -n "$out" ]; then
           BICEP_BAD=1; fail "bicep build-params (diagnostics): $f"
           printf '%s\n' "$out" | sed 's/^/      /'

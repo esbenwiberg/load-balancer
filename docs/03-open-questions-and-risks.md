@@ -57,9 +57,8 @@ cost once)?
 >    de-escalates — big-tier models tolerate a foreign-format transcript far better
 >    than small local ones, so downward moves are where risk-1 breakage actually bites.
 >    The escalation *trigger* (complexity threshold vs verify-then-escalate vs manual)
->    is deliberately NOT decided here — it is the remaining open sub-question, parked
->    in GOALS.md § Needs-a-human, to be designed against goal 21's accumulating
->    traffic-mix telemetry.
+>    was deliberately NOT decided here. **→ trigger DECIDED 2026-07-23: manual /
+>    client-signaled v1 — see the escalation-trigger decision block below.**
 >
 > Hard constraints carried over from the Fugu research: routing stays deterministic +
 > auditable (per-request records must prove which backend saw every prompt — the
@@ -94,6 +93,63 @@ cost once)?
 > policy (docs/12 §4 note + open decision 5) — telemetry-gated, adoptable
 > without Plano the proxy. This decision unblocks the policy-layer build goals
 > (GOALS.md 24–26).
+
+> **DECISION (2026-07-23) — escalation trigger: manual / client-signaled v1**,
+> with the automatic triggers as telemetry-gated follow-ups. Made at the
+> keyboard. The hybrid router (decision block above) reserves one upward-only
+> hop per session; goal 25 built the *mechanics* (pin replaced upward, exactly
+> once, no downward edge) behind a STUB `escalate` tag. This decides what fires
+> that hop for real. The four candidates, scored against the non-negotiable
+> constraints (deterministic + auditable; never buffer the stream behind a
+> verdict; governance candidate-set filter — [docs/12 §1](12-hybrid-router-spec.md)):
+>
+> 1. **Manual / client-signaled → CHOSEN as v1.** A namespaced tag
+>    `router:escalate` on the goal-22-verified carrier (`x-litellm-tags`, which
+>    reaches both logging surfaces on the pin — no new header plumbing to
+>    re-prove). Fits every constraint by construction (the client asked; it's
+>    on the record), needs no new infra (goal 25's mechanics stand), and is the
+>    only option decidable **today** — the automatic triggers below all need
+>    real traffic distributions to set a threshold or validate a verifier, and
+>    the harness has none (every byte is synthetic e2e traffic). Decisive
+>    second-order effect: **manual escalations ARE the eval set** the automatic
+>    triggers need — each one is a human-labeled "local wasn't enough here",
+>    the same measured-not-argued discipline already committed for the learned
+>    taster ([docs/12 §4](12-hybrid-router-spec.md), open decision 5). A coding
+>    agent stuck in a loop also knows it's stuck better than a request-shape
+>    heuristic guesses.
+> 2. **Complexity threshold (goal 21 bucket crosses a line) → SPECCED FOLLOW-UP,
+>    telemetry-gated.** Deterministic + auditable and zero-latency (classified
+>    pre-call from the request alone), but it's a *predictor*: it escalates on a
+>    guess about request shape *before* local gets a chance, and because the hop
+>    is upward-only + permanent, one heavy-looking turn exiles the whole session
+>    to Foundry forever — a large cost/governance consequence from a cheap
+>    heuristic with an arbitrary threshold no data backs yet. **Adoption gate:**
+>    v1's manual-escalation telemetry shows the bucket signal would have fired
+>    where humans did (precision/recall against the labeled set), not before.
+> 3. **Verify-then-escalate (Fugu/TRINITY Verifier) → REJECTED as primary.**
+>    Breaks two hard constraints at once: a verifier *model* judging local's
+>    answer is "the model said so" (fails auditability), and to verify local's
+>    output you must have it — i.e. buffer the stream (fails the cardinal rule).
+>    Fugu Ultra's 8–160s latency floor is the tombstone. The one survivable
+>    variant — a **structural, rule-based** post-hoc check applied on the *next*
+>    turn (tool call didn't parse, code didn't compile, test failed) — is kept
+>    as a possible later signal, not v1.
+> 4. **N-consecutive fallback-served turns (rotten pin — risk 7 + docs/12
+>    §6) → SEPARATE later signal.** This is a *health* signal, not a *difficulty*
+>    one: §6 already holds the pin through transient blips, so N-consecutive is
+>    just the documented "the pin is genuinely rotten" exception. Small blast
+>    radius, decided later on its own.
+>
+> **Folds in open decision 4 (streaming-latency override, risk 3):** it
+> evaporates for v1 — a manual trigger never auto-routes `heavy` traffic, so
+> there's no threshold-vs-TTFT tension to resolve until trigger #2 is on the
+> table.
+>
+> **Reversible + autonomy-friendly to build.** Nothing deploys from `main`; the
+> tag contract and telemetry gate are e2e-verifiable. This turns the former
+> § Needs-a-human blocker into a vetted build goal (GOALS.md): promote the
+> `escalate` stub to the first-class `router:escalate` contract + write the
+> telemetry gate that governs adopting trigger #2.
 
 ### 3. Spark interactive latency for big models
 A 30B-class model on a Spark is **single-digit tok/s for one user.** A coding agent
@@ -288,7 +344,8 @@ depend on a flaky component.
 - [x] Decide routing granularity: session-only (safe) vs allow-one-escalation (riskier).
       **→ DECIDED 2026-07-08: HYBRID — sticky sessions + free per-request stateless +
       one upward-only escalation hop; see the decision block after risk 2. Escalation
-      trigger still open (GOALS.md § Needs-a-human).**
+      trigger DECIDED 2026-07-23: manual / client-signaled v1 (automatic triggers
+      telemetry-gated) — see the escalation-trigger decision block after the engine block.**
 - [ ] Decide what "belongs" on a Spark vs always-Foundry (latency-driven, not just size).
 - [x] Evaluate LiteLLM-only vs Arch(`archgw`) for the routing layer.
       **→ DECIDED 2026-07-09: LiteLLM custom policy layer — see the engine decision
