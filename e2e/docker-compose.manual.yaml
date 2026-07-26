@@ -76,6 +76,9 @@ services:
     environment:
       DASH_PORT: "9300"
       DASH_HOST: "0.0.0.0"
+      # Goal 34: non-loopback bind => a read-auth token is required or it refuses
+      # to start. Open http://localhost:9300/?token=<t> to view. TEST token.
+      DASH_AUTH_TOKEN: "${DASH_AUTH_TOKEN:-manual-dashboard-token}"
     ports:
       - "9300:9300"
     healthcheck:

@@ -1034,6 +1034,54 @@ winner serves the stream: `fallback: true`, the 503 "why" and the winner's
 success on the same correlation id); the builder's edge cases (dedupe,
 stash miss, aborted streams) offline in `obs_callback_test.py`.
 
+## Dashboard read auth + safe-bind guard (goal 34)
+
+The dashboard exposes routing / identity / session / fleet **metadata** — an
+internal map of who called, which sessions pinned where, and the fleet's
+`api_base` URLs. The go-real premortem flagged it as "naked on a port". Goal 34
+makes "not naked" *possible* (it does **not** decide public exposure — that's
+the needs-a-human first-Azure-deploy exposure model; this just stops the port
+being wide open on a trusted network) with two controls, both gated on a single
+env knob `DASH_AUTH_TOKEN`:
+
+1. **Read auth.** When `DASH_AUTH_TOKEN` is set, the READ surface — `GET /api/*`
+   and the page (`GET /`) — requires the shared token. Accepted carriers:
+   `Authorization: Bearer <t>` (the canonical form, used by the e2e suite), an
+   `X-Dashboard-Token: <t>` header, a `?token=<t>` query (browser navigation),
+   or the `dash_token` cookie. A valid `?token=` page load *drops* that cookie
+   (`HttpOnly; SameSite=Strict`), so the page's own same-origin `/api/*` fetches
+   carry it without the human hand-setting a header. Missing/wrong token → `401`.
+   Comparison is constant-time (`hmac.compare_digest`).
+2. **Safe-bind guard.** The daemon **refuses to start** (exit 2) on a
+   non-loopback bind (e.g. the `0.0.0.0` the compose stacks set so a container
+   is reachable) *unless* a token is configured — so an exposed dashboard cannot
+   be naked by construction. A loopback bind (the `127.0.0.1` default) needs no
+   token. This *replaces* the pre-goal-34 warn-and-continue on `0.0.0.0`.
+
+**Scope — deliberately the READ surface only.** `/health` stays open (liveness;
+the compose healthcheck relies on it), and the record WRITE sink (`POST /records`
+from the gateway's `obs_callback`, `POST /__reset` for test isolation) keeps
+mockd's internal-daemon trust model. The premortem's finding is *metadata READ
+exposure*; locking the write side would mean distributing the token to the
+gateway (obs_callback) and is a deferrable follow-up, not this goal.
+
+**Default off = unchanged.** With `DASH_AUTH_TOKEN` unset, auth is disabled and
+the read surface behaves byte-for-byte as pre-goal-34 — except a `0.0.0.0` bind
+now refuses instead of warning (you must set a token or bind loopback). The
+`0.0.0.0` e2e / dev / manual compose stacks therefore set a **test** token
+in-network (same convention as `LITELLM_MASTER_KEY` — not a secret); `run.sh`
+and `dev_smoke.sh` read the matching default so the host-side reads carry it.
+
+Proof: `test_dashboard_requires_token_when_configured` (live 401-without /
+401-wrong / 200-with across `/api/records`, `/api/fleet`, `/`; `/health` open;
+the `X-Dashboard-Token`, `?token=`+cookie carriers; the cookie alone authorizing
+a subsequent read — and, by being UP with a token, the "0.0.0.0 + token starts"
+direction of the guard); the refuse-to-start half + the auth decision table
+offline in `dashboard_test.py` (`TestAuthGate`, `TestSafeBindGuard`,
+`TestSafeBindGuardSubprocess` — a real `python dashboard.py` on `0.0.0.0` with no
+token exits non-zero and binds nothing; on loopback it comes up and serves
+`/health`).
+
 ## What this is *not* (yet)
 
 - **Not durable.** All sinks are ephemeral (stdout ring / mockd + dashboard

@@ -99,8 +99,12 @@ fi
 # stack (mockd producer -> control-plane -> dashboard). Best-effort on the
 # endpoint being reachable; a real gap fails loudly.
 DASH_URL="${DASH_URL:-http://localhost:9300}"
+# Goal 34: the dev dashboard requires a read-auth token on /api/* (same default
+# the dev compose interpolates). Send it as a bearer on the fleet reads.
+DASH_AUTH_TOKEN="${DASH_AUTH_TOKEN:-dev-dashboard-token}"
+DASH_AUTH=(-H "Authorization: Bearer ${DASH_AUTH_TOKEN}")
 echo "--- [4/4] fleet view: control-plane heartbeats on the dashboard (goal 13) ---"
-FLEET_MODELS=$(curl -s "$DASH_URL/api/fleet" \
+FLEET_MODELS=$(curl -s "${DASH_AUTH[@]}" "$DASH_URL/api/fleet" \
   | python3 -c "import sys,json; d=json.load(sys.stdin); print(','.join(sorted(m['model'] for m in d.get('models',[]))) if d.get('available') else 'UNAVAILABLE')" 2>/dev/null)
 echo "  fleet models: ${FLEET_MODELS:-<none>}"
 # The workbenches beat on an interval; give a couple of retries in case the smoke
@@ -108,7 +112,7 @@ echo "  fleet models: ${FLEET_MODELS:-<none>}"
 for _ in 1 2 3 4 5; do
   [[ "$FLEET_MODELS" == *"qwen3-coder-a"* && "$FLEET_MODELS" == *"qwen3-coder-b"* && "$FLEET_MODELS" == *"claude-sonnet"* ]] && break
   sleep 2
-  FLEET_MODELS=$(curl -s "$DASH_URL/api/fleet" \
+  FLEET_MODELS=$(curl -s "${DASH_AUTH[@]}" "$DASH_URL/api/fleet" \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(','.join(sorted(m['model'] for m in d.get('models',[]))) if d.get('available') else 'UNAVAILABLE')" 2>/dev/null)
 done
 if [[ "$FLEET_MODELS" == *"qwen3-coder-a"* && "$FLEET_MODELS" == *"qwen3-coder-b"* && "$FLEET_MODELS" == *"claude-sonnet"* ]]; then

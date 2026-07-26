@@ -68,6 +68,11 @@ services:
     environment:
       DASH_PORT: "9300"
       DASH_HOST: "0.0.0.0"
+      # Goal 34: this is a non-loopback (0.0.0.0) bind, so the dashboard REFUSES
+      # to start without a read-auth token. Set it in-network here; run.sh exports
+      # the same default so the host-side pytest suite reads /api/* with it. This
+      # is a TEST token, NOT a secret (same convention as LITELLM_MASTER_KEY).
+      DASH_AUTH_TOKEN: "${DASH_AUTH_TOKEN:-dash-e2e-test-token}"
       # Goal 13: where the fleet view reads live state from. In-network address;
       # /api/fleet degrades gracefully if it's ever unreachable.
       CONTROL_PLANE_URL: "http://control-plane:9400"

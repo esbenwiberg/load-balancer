@@ -134,6 +134,11 @@ services:
     environment:
       DASH_PORT: "9300"
       DASH_HOST: "0.0.0.0"
+      # Goal 34: non-loopback bind => a read-auth token is required or the
+      # dashboard refuses to start. Open the page with http://localhost:9300/?token=<t>
+      # (it drops a cookie so the page's own fetches carry it); dev_smoke.sh reads
+      # /api/fleet with the same default. TEST token, not a secret.
+      DASH_AUTH_TOKEN: "${DASH_AUTH_TOKEN:-dev-dashboard-token}"
       # Goal 13 — read the live fleet from the control-plane and render it under
       # the Fleet section. In-network address; degrades to "fleet unavailable"
       # if the control-plane is ever down.

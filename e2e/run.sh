@@ -25,6 +25,10 @@ export GATEWAY_ENFORCE_URL="${GATEWAY_ENFORCE_URL:-http://localhost:4001}"  # go
 export GATEWAY_FAILCLOSED_URL="${GATEWAY_FAILCLOSED_URL:-http://localhost:4002}"  # goal-33 enforce + fail-closed governance
 export MOCKD_URL="${MOCKD_URL:-http://localhost:9100}"
 export DASH_URL="${DASH_URL:-http://localhost:9300}"   # goal-12 dashboard sink + data endpoint
+# Goal 34: the dashboard binds 0.0.0.0 in-container, so it requires a read-auth
+# token (or refuses to start). Same default the e2e compose interpolates, so the
+# host-side pytest suite reads /api/* with the matching token. TEST token.
+export DASH_AUTH_TOKEN="${DASH_AUTH_TOKEN:-dash-e2e-test-token}"
 export CONTROL_PLANE_URL="${CONTROL_PLANE_URL:-http://localhost:9400}"  # goal-13 fleet registry
 
 cleanup() {

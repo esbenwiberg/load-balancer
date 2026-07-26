@@ -264,9 +264,21 @@ is up and watch every prompt's route land live:
 
 ```bash
 ./run.sh --keep                                       # or the dev stack (below)
-open http://localhost:9300                            # the page
-curl -s localhost:9300/api/records | jq '.requests'   # per-request routing rows
+# The stacks bind 0.0.0.0, so the dashboard requires a read-auth token (goal 34).
+TOKEN=dash-e2e-test-token                              # e2e default; dev = dev-dashboard-token
+open "http://localhost:9300/?token=$TOKEN"            # the page (drops a cookie so its fetches carry it)
+curl -s -H "Authorization: Bearer $TOKEN" localhost:9300/api/records | jq '.requests'
 ```
+
+**Read auth + safe-bind (goal 34).** The dashboard serves routing/identity/
+session/fleet metadata, so when `DASH_AUTH_TOKEN` is set the read surface
+(`/api/*` + the page) requires it — as `Authorization: Bearer`, an
+`X-Dashboard-Token` header, a `?token=` query, or the `dash_token` cookie a
+`?token=` page load drops; `/health` and the record sink stay open. A
+non-loopback (`0.0.0.0`) bind **refuses to start** without a token, so the
+`0.0.0.0` compose stacks set a TEST token in-network (`run.sh`/`dev_smoke.sh`
+read the matching default). Unset → auth off, loopback binds free. Details:
+[docs/09](../docs/09-observability.md) "Dashboard read auth + safe-bind guard".
 
 It shows **Requests** (requested alias → served backend, `direct`/`fallback`
 badge, tokens, cost) and the **Attempt trail** (every backend tried + the error
@@ -282,7 +294,8 @@ registry ([goal 5](../docs/10-control-plane.md)) — the dashboard reads it
 server-side and re-serves it at its own `GET /api/fleet`:
 
 ```bash
-curl -s localhost:9300/api/fleet | jq '.models[] | {model, healthy, warm, in_flight}'
+curl -s -H "Authorization: Bearer $TOKEN" localhost:9300/api/fleet \
+  | jq '.models[] | {model, healthy, warm, in_flight}'
 ```
 
 In the **dev** stack each mockd workbench pushes real heartbeats
@@ -346,7 +359,7 @@ Topology (`docker-compose.dev.yaml`):
 | `workbench-a` | `:9101` | `workbench-a` | a Spark workbench slot (`qwen3-coder-a`) |
 | `workbench-b` | `:9102` | `workbench-b` | a second, distinct workbench slot (`qwen3-coder-b`) |
 | `foundry` | `:9103` | `mock-foundry` | the always-up fallback tier (`claude-sonnet` / `claude-opus` / `gpt`) |
-| `dashboard` | `:9300` | — | goals 12+13 viewer — routes (`/api/records`) + fleet (`/api/fleet`); open `http://localhost:9300` |
+| `dashboard` | `:9300` | — | goals 12+13 viewer — routes (`/api/records`) + fleet (`/api/fleet`); open `http://localhost:9300/?token=<DASH_AUTH_TOKEN>` (goal-34 read auth) |
 | `control-plane` | `:9400` | — | goal-5 fleet registry — each workbench heartbeats it; the dashboard renders it |
 | `db` | (internal) | — | Postgres — the virtual-key store |
 
