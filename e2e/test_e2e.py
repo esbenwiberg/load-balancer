@@ -3328,6 +3328,180 @@ def test_enforce_governance_is_the_sole_guard():
     assert "governance key-allowlist" in pol["reason"], pol
 
 
+# --- ENFORCE + FAIL-CLOSED governance — the go-real premortem fix (goal 33) ---
+# These hit a THIRD gateway (port 4002): ROUTER_POLICY=enforce AND
+# POLICY_GOVERNANCE_FAIL_CLOSED=1. The premortem's most-likely failure was "a
+# rule we wrote down is a control we enforce": an empty/absent model allowlist
+# (the ambiguous shape UserAPIKeyAuth.models arrives in, ESPECIALLY on the
+# Codex/Responses path) used to leave the foundry tier reachable under enforce.
+# With fail-closed on, such a key has exactly two safe outcomes — SERVED LOCALLY
+# (the policy rewrites its ask to the healthy local workbench) or CLEANLY
+# REFUSED (a 4xx when no local can serve) — NEVER routed to Foundry. Proven
+# across all three inbound protocols, because the empty-allowlist observation
+# was protocol-dependent.
+
+GATEWAY_FAILCLOSED = os.environ.get("GATEWAY_FAILCLOSED_URL", "http://localhost:4002")
+_FC_PROTOCOLS = ("chat", "responses", "messages")
+
+
+def _fc_path(protocol):
+    return {
+        "chat": "/v1/chat/completions",
+        "responses": "/v1/responses",
+        "messages": "/v1/messages",
+    }[protocol]
+
+
+def _fc_request(protocol, model, key, content, stream=False):
+    """One request to the fail-closed gateway on the given inbound protocol.
+    Returns the raw response (status NOT asserted — the refusal path is a 4xx)."""
+    headers = {"Authorization": "Bearer " + key}
+    if protocol == "messages":
+        headers["anthropic-version"] = "2023-06-01"
+    if protocol == "responses":
+        body = {"model": model, "input": [{"role": "user", "content": content}]}
+    else:
+        body = {"model": model, "messages": [{"role": "user", "content": content}]}
+    if protocol == "messages":
+        body["max_tokens"] = 64
+    if stream:
+        body["stream"] = True
+    return httpx.post(
+        GATEWAY_FAILCLOSED + _fc_path(protocol),
+        headers=headers,
+        json=body,
+        timeout=TIMEOUT,
+    )
+
+
+def _empty_allowlist_key(tag):
+    """Mint a key with an EMPTY model allowlist (models=[]) — the exact
+    ambiguous shape the premortem flagged: LiteLLM's auth reads it as
+    'unrestricted', so the request is authorized, but UserAPIKeyAuth.models
+    arrives empty and a real restriction that failed to load looks identical.
+    Fail-closed is what stops that ambiguity from opening Foundry."""
+    alias = _unique(tag)
+    key, _ = _generate_key(models=[], key_alias=alias, user_id=_unique("fc-user"))
+    return key, alias
+
+
+def _fc_enforced_row(data, alias):
+    """The newest enforced request row for `alias` on the fail-closed gateway."""
+    for rq in data.get("requests", []):
+        if rq.get("key_alias") != alias:
+            continue
+        pol = rq.get("policy") or {}
+        if pol.get("enforced"):
+            return rq
+    return None
+
+
+def _fc_stream_text(protocol, model, key, content):
+    """Drive a STREAMED request on the given protocol against the fail-closed
+    gateway and return the reassembled assistant text. Streaming is the real
+    coding-agent path (Claude Code / Codex both stream) and the uniform way to
+    read mockd's served_model stamp out of the body on all three surfaces —
+    the non-stream /v1/messages path returns empty content on this pin (the
+    documented anthropic-conversion quirk), so the served-locally proof
+    streams every protocol rather than special-casing one."""
+    headers = {"Authorization": "Bearer " + key}
+    if protocol == "messages":
+        headers["anthropic-version"] = "2023-06-01"
+    if protocol == "responses":
+        body = {"model": model, "input": [{"role": "user", "content": content}]}
+    else:
+        body = {"model": model, "messages": [{"role": "user", "content": content}]}
+    if protocol == "messages":
+        body["max_tokens"] = 128
+    body["stream"] = True
+
+    text = ""
+    with httpx.stream(
+        "POST",
+        GATEWAY_FAILCLOSED + _fc_path(protocol),
+        headers=headers,
+        json=body,
+        timeout=TIMEOUT,
+    ) as resp:
+        assert resp.status_code == 200, (protocol, resp.status_code, resp.read())
+        for line in resp.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            payload = line[len("data: ") :].strip()
+            if payload == "[DONE]":
+                continue
+            try:
+                ev = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if protocol == "chat":
+                for ch in ev.get("choices", []):
+                    text += (ch.get("delta") or {}).get("content") or ""
+            elif protocol == "messages":
+                if ev.get("type") == "content_block_delta":
+                    text += ev.get("delta", {}).get("text", "")
+            else:  # responses
+                if ev.get("type") == "response.output_text.delta":
+                    text += ev.get("delta", "") or ""
+    return text
+
+
+def test_failclosed_empty_allowlist_served_locally_all_three_protocols():
+    """The primary proof: an empty-allowlist key asking for a FOUNDRY alias
+    (claude-opus) is served by the healthy LOCAL workbench on every inbound
+    protocol — the governance filter rewrote the ask, so the caller never
+    reaches Foundry. The reassembled STREAM body carries mockd's served_model
+    stamp (the client-visible ground truth of who served); the routing record
+    corroborates the enforced decision (requested vs chosen + the fail-closed
+    governance verdict)."""
+    _beat("wb-fc", "qwen3-coder", warm=True, agent_capable=True, healthy=True)
+
+    for proto in _FC_PROTOCOLS:
+        key, alias = _empty_allowlist_key("fc-local-" + proto)
+        text = _fc_stream_text(
+            proto, "claude-opus", key, "fail-closed served-local " + proto
+        )
+        # Client-visible ground truth: the LOCAL workbench answered...
+        assert "served_model=qwen3-coder" in text, (proto, text)
+        # ...and emphatically NOT any foundry-tier backend.
+        for foundry in ("claude-opus", "claude-sonnet", "gpt"):
+            assert ("served_model=" + foundry) not in text, (proto, text)
+
+        # The record corroborates: enforced, the original ask stashed, the local
+        # substitute chosen, and the fail-closed governance verdict on-record.
+        data = _poll_dash(lambda d: _fc_enforced_row(d, alias) is not None)
+        row = _fc_enforced_row(data, alias)
+        assert row is not None, (proto, data.get("requests"))
+        pol = row["policy"]
+        assert pol["requested"] == "claude-opus", (proto, pol)  # the ask, stashed
+        assert pol["chosen"] == "qwen3-coder", (proto, pol)  # local substitute
+        assert pol["governance"] == "fail-closed-denied-restricted", (proto, pol)
+        assert not pol.get("refused"), (proto, pol)  # served, not refused
+
+
+def test_failclosed_refuses_cleanly_when_no_local_survivor_all_three_protocols():
+    """The other safe outcome: when NO local backend can serve (here the local
+    workbench heartbeats UNHEALTHY, so the health filter empties the pool),
+    fail-closed REFUSES the empty-allowlist key's foundry ask with a clean 4xx
+    on every protocol — it never falls through to Foundry. This is the case
+    that would otherwise re-open the hole (chosen=None used to degrade to the
+    client's original foundry ask)."""
+    # Local workbench present but UNHEALTHY ⇒ stripped by the health filter,
+    # foundry already stripped by governance ⇒ no candidate survives.
+    _beat("wb-fc", "qwen3-coder", warm=True, agent_capable=True, healthy=False)
+
+    for proto in _FC_PROTOCOLS:
+        key, _alias = _empty_allowlist_key("fc-refuse-" + proto)
+        r = _fc_request(proto, "claude-opus", key, "fail-closed refuse " + proto)
+        # Cleanly refused: a 4xx, NOT a 200 (served) and NOT a 5xx (crash).
+        assert 400 <= r.status_code < 500, (proto, r.status_code, r.text)
+        # It's OUR governance refusal, cited — not an incidental auth/parse 4xx.
+        assert "governance" in r.text.lower(), (proto, r.text)
+        # The clincher: no backend was ever reached, so no served_model stamp of
+        # ANY kind — least of all a foundry one.
+        assert "served_model=" not in r.text, (proto, r.text)
+
+
 # --- streamed requests as first-class routing records (goal 29) ---------------
 #
 # Research (probed live on the pinned v1.83.14, documented in docs/09): the

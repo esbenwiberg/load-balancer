@@ -198,3 +198,47 @@ services:
       # Same generous window as the shadow gateway (see its healthcheck note).
       retries: 12
       start_period: 60s
+
+  # --- ENFORCE + FAIL-CLOSED gateway (goal 33) ------------------------------
+  # A THIRD gateway, identical to the enforce one but for ONE added flag:
+  # POLICY_GOVERNANCE_FAIL_CLOSED=1. This is the go-real premortem fix under
+  # proof — with fail-closed on, a key with NO/empty model allowlist (the
+  # ambiguous shape UserAPIKeyAuth.models arrives in, esp. on the Codex/
+  # Responses path) may NOT be routed to a foundry-tier backend: the policy
+  # rewrites its ask to the healthy local workbench (served locally), or —
+  # when no local can serve — the pre-call hook raises a clean 403 (refused),
+  # NEVER falls through to Foundry. A separate container (not a knob-flip on
+  # the :4001 enforce gateway) so the goal-26 enforce tests keep running under
+  # the fail-OPEN default, unchanged — the "existing suite unchanged" contract
+  # holds by construction. Own container /tmp ⇒ its pins never bleed into the
+  # other gateways. Reads the SAME control-plane (registry health) with cache 0
+  # so a test's unhealthy heartbeat lands on the very next request (the way the
+  # refusal path is driven deterministically).
+  litellm-failclosed:
+    image: ghcr.io/berriai/litellm:v1.83.14-stable
+    container_name: litellm-e2e-failclosed
+    depends_on:
+      litellm:
+        condition: service_healthy
+    ports:
+      - "4002:4000"
+    volumes:
+      - ./litellm-config.e2e.yaml:/app/config.yaml:ro
+      - ./obs_callback.py:/app/obs_callback.py:ro
+    environment:
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-e2e-master-test-key}"
+      DATABASE_URL: "postgresql://litellm:litellm@db:5432/litellm"
+      OBS_WEBHOOK_URL: "http://mockd:9100/__observe,http://dashboard:9300/records"
+      CONTROL_PLANE_URL: "http://control-plane:9400"
+      POLICY_REGISTRY_CACHE_S: "0"
+      ROUTER_POLICY: "enforce"
+      # The two flags this container exists for: enforce (above) + fail-closed.
+      POLICY_GOVERNANCE_FAIL_CLOSED: "1"
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      # Same generous window as the shadow gateway (see its healthcheck note).
+      retries: 12
+      start_period: 60s

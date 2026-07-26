@@ -22,6 +22,7 @@ COMPOSE="docker compose -f docker-compose.e2e.yaml"
 export LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-sk-e2e-master-test-key}"
 export GATEWAY_URL="${GATEWAY_URL:-http://localhost:4000}"
 export GATEWAY_ENFORCE_URL="${GATEWAY_ENFORCE_URL:-http://localhost:4001}"  # goal-26 enforce-mode gateway
+export GATEWAY_FAILCLOSED_URL="${GATEWAY_FAILCLOSED_URL:-http://localhost:4002}"  # goal-33 enforce + fail-closed governance
 export MOCKD_URL="${MOCKD_URL:-http://localhost:9100}"
 export DASH_URL="${DASH_URL:-http://localhost:9300}"   # goal-12 dashboard sink + data endpoint
 export CONTROL_PLANE_URL="${CONTROL_PLANE_URL:-http://localhost:9400}"  # goal-13 fleet registry
@@ -73,6 +74,22 @@ for i in $(seq 1 60); do
   if [[ "$i" -eq 60 ]]; then
     echo "ERROR: enforce gateway did not become healthy" >&2
     $COMPOSE logs --tail=50 litellm-enforce >&2 || true
+    exit 1
+  fi
+  sleep 2
+done
+
+# The enforce + fail-closed gateway (goal 33) — proves an empty-allowlist key
+# never reaches Foundry under enforce. Same boot dependency as the enforce one.
+echo "--- waiting for fail-closed-gateway health ---"
+for i in $(seq 1 60); do
+  if curl -sf "$GATEWAY_FAILCLOSED_URL/health/liveliness" >/dev/null 2>&1; then
+    echo "fail-closed gateway healthy"
+    break
+  fi
+  if [[ "$i" -eq 60 ]]; then
+    echo "ERROR: fail-closed gateway did not become healthy" >&2
+    $COMPOSE logs --tail=50 litellm-failclosed >&2 || true
     exit 1
   fi
   sleep 2

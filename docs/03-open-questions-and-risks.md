@@ -328,7 +328,13 @@ Org policy: **no personal/customer data** to these models, and only for Context&
 Delegate / Projectum / Consit work. A transparent router means users may not realize *which*
 model/where their prompt lands. Sparks are local/private (good); Foundry is Azure (verify
 data-residency/retention terms). **If in doubt, reach out to DISCO.** Consider logging/
-guardrails so we can prove what went where.
+guardrails so we can prove what went where. **The control that EXISTS (goal 33):**
+backend-gating — under `ROUTER_POLICY=enforce` + `POLICY_GOVERNANCE_FAIL_CLOSED=1`, a key
+with no/empty model allowlist may NOT reach the Foundry tier (served locally or 403'd,
+proven across all three inbound protocols; see [docs/09](09-observability.md) "Governance
+fail-closed"). This gates *which backend* a key reaches, **not** *what is in the prompt* —
+there is NO content inspection / DLP. Get DISCO's sign-off against this control, not an
+assumed one, and state in writing which data classes may touch Foundry.
 
 ### 11. Observability & cost attribution
 We need per-request: chosen backend, why (routing decision), latency, tokens, fallback-hit.
