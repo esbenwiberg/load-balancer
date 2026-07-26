@@ -166,6 +166,32 @@ else
   fi
 fi
 
+# --- release-model tripwire (goal 35 — no deploy-from-main while open) -------
+# CLAUDE.md's auto-merge autonomy is valid ONLY while nothing deploys from main.
+# This makes that tripwire a CONTROL, not prose: release_model_gate.py FAILS if
+# any workflow auto-deploys on push to main while the committed RELEASE_MODEL
+# marker says DECISION=open. Offline, deterministic, stdlib — runs everywhere
+# check.sh runs (pre-commit, Stop, CI), so an unattended run physically cannot
+# go green into a world where main deploys. The unit test pins the LOGIC (both
+# directions + the push-to-main parser); the live run pins the REAL repo state.
+step "release-model tripwire (goal 35 — deploy-from-main gate)"
+if have python3; then
+  if python3 scripts/release_model_gate_test.py >/dev/null 2>&1; then
+    ok "release_model_gate_test.py"
+  else
+    fail "scripts/release_model_gate_test.py"
+    python3 scripts/release_model_gate_test.py 2>&1 | sed 's/^/      /' | tail -20
+  fi
+  if out="$(python3 scripts/release_model_gate.py 2>&1)"; then
+    ok "release-model gate (repo clean: no deploy-from-main while open)"
+  else
+    fail "release-model gate tripped"
+    printf '%s\n' "$out" | sed 's/^/      /'
+  fi
+else
+  skip "python3" "not installed"
+fi
+
 # --- Azure IaC: offline bicep build (goal 14 — no cloud calls, no creds) -----
 # The Azure IaC skeleton (deploy/azure/*.bicep) must compile offline. `bicep
 # build` transpiles Bicep -> ARM JSON purely locally: it makes NO cloud calls,

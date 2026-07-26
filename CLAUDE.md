@@ -20,7 +20,13 @@ especially when I'm away and can't answer questions:
 - **⚠️ Auto-merge is valid ONLY while nothing deploys from `main`.** Blast radius
   today is the repo (every merge is a revertible squash). The moment a real
   gateway serves traffic off `main`, STOP auto-merging — switch to draft-PR-only
-  and flag it to me. Treat this as a hard tripwire, not a preference.
+  and flag it to me. Treat this as a hard tripwire, not a preference. **This is
+  now a CONTROL, not just this prose (goal 35):** `scripts/release_model_gate.py`
+  (run by `scripts/check.sh`, so pre-commit + Stop + CI enforce it) HARD-FAILS if
+  any workflow auto-deploys on push to `main` while the committed `RELEASE_MODEL`
+  marker says `DECISION=open` — so a green run literally cannot land a
+  deploy-from-`main` world. Flipping `DECISION=decided` is a human act (see
+  `RELEASE_MODEL`); do it only alongside the release-model decision below.
 - **Decide and document, don't block.** For a *reversible* decision, make the
   reasonable call and record it in the PR body ("chose X over Y because…"). I may
   be unreachable — a blocked goal that could have proceeded is a failure.
