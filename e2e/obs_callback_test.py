@@ -490,6 +490,34 @@ class TestGovernanceFailClosed(unittest.TestCase):
         self.assertEqual(b["candidate_set"], [])
         self.assertIsNone(b["chosen"])
 
+    def test_governance_verdict_is_a_first_class_field(self):
+        # Goal 33: the verdict is on the block as a field, not just prose in
+        # `reason`, so enforcement acts on it deterministically. All four cases.
+        self.assertEqual(
+            _policy_stateless(
+                _CANDIDATES, None, "trivial", None, "absent", fail_closed=True
+            )["governance"],
+            "fail-closed-denied-restricted",
+        )
+        self.assertEqual(
+            _policy_stateless(
+                _CANDIDATES, ["*"], "trivial", None, "absent", fail_closed=True
+            )["governance"],
+            "wildcard",
+        )
+        self.assertEqual(
+            _policy_stateless(_CANDIDATES, ["claude-opus"], "trivial", None, "absent")[
+                "governance"
+            ],
+            "allowlisted",
+        )
+        self.assertEqual(
+            _policy_stateless(
+                _CANDIDATES, None, "trivial", None, "absent", fail_closed=False
+            )["governance"],
+            "open",
+        )
+
 
 # --- shadow sticky pins + escalation mechanics — the session arm (goal 25) ---
 # The e2e suite proves the live path (same-tag stickiness, the escalate tag,
@@ -784,6 +812,111 @@ class TestEnforcement(unittest.TestCase):
         self.assertEqual(out["chosen"], "qwen3-coder")
         self.assertEqual(out["actual"], "claude-sonnet")
         self.assertIs(out["agree"], False)  # the chain fired — visible
+
+
+class TestFailClosedEnforcementRefusal(unittest.TestCase):
+    """Goal 33 — the go-real fix. Under enforce + fail-closed, an empty-allowlist
+    key's restricted-tier ask has exactly two safe outcomes: SERVED LOCALLY (a
+    rewrite to a surviving local backend) or CLEANLY REFUSED — never a fall-
+    through to Foundry. These pin the decision in `_apply_enforcement`; the e2e
+    proves it live across all three inbound protocols."""
+
+    def test_served_locally_when_a_local_survivor_exists(self):
+        # Empty allowlist, fail-closed: foundry stripped, the healthy local
+        # backend survives ⇒ rewrite to it, NO refusal.
+        block = _policy_stateless(
+            _CANDIDATES, [], "trivial", None, "absent", fail_closed=True
+        )
+        data = {"model": "claude-opus"}
+        _apply_enforcement(block, data, _CANDIDATES)
+        self.assertNotIn("refused", block)
+        self.assertEqual(data["model"], "qwen3-coder")  # served locally
+
+    def test_refused_when_no_local_survivor_and_ask_is_restricted(self):
+        # Foundry-only universe: governance strips it all ⇒ chosen None. The
+        # ask is a restricted tier ⇒ REFUSE, and data is NOT rewritten to a
+        # foundry backend (the raise, in the hook, stops the request).
+        foundry_only = [c for c in _CANDIDATES if c["tier"] == "foundry"]
+        block = _policy_stateless(
+            foundry_only, None, "trivial", None, "absent", fail_closed=True
+        )
+        self.assertIsNone(block["chosen"])
+        data = {"model": "claude-opus"}
+        _apply_enforcement(block, data, foundry_only)
+        self.assertEqual(block["refused"]["tier"], "foundry")
+        self.assertEqual(block["refused"]["requested"], "claude-opus")
+        self.assertEqual(data["model"], "claude-opus")  # untouched, never rewritten
+
+    def test_local_ask_with_no_survivor_is_not_refused(self):
+        # Same no-survivor state, but the client asked for a LOCAL alias: that's
+        # an availability issue, not a governance breach. Enforcement must NOT
+        # manufacture a governance refusal — it degrades to the client's ask.
+        foundry_only = [c for c in _CANDIDATES if c["tier"] == "foundry"]
+        block = _policy_stateless(
+            foundry_only, None, "trivial", None, "absent", fail_closed=True
+        )
+        data = {"model": "qwen3-coder"}
+        _apply_enforcement(block, data, foundry_only)
+        self.assertNotIn("refused", block)
+
+    def test_explicit_allowlist_no_survivor_is_not_refused(self):
+        # An EXPLICITLY-authorized key whose allowlist filters to nothing is not
+        # the fail-closed-denied case — it degrades to the client's ask (the key
+        # was authorized; we just have no better opinion). Refusal is ONLY for
+        # the ambiguous empty-allowlist verdict.
+        block = _policy_stateless(
+            _CANDIDATES, ["no-such-model"], "trivial", None, "absent", fail_closed=True
+        )
+        self.assertIsNone(block["chosen"])
+        self.assertEqual(block["governance"], "allowlisted")
+        data = {"model": "claude-opus"}
+        _apply_enforcement(block, data, _CANDIDATES)
+        self.assertNotIn("refused", block)
+
+    def test_wildcard_is_never_refused(self):
+        # An explicit wildcard is an intentional "unrestricted" — it opens
+        # foundry even under fail-closed, so it is never the denied verdict.
+        block = _policy_stateless(
+            [c for c in _CANDIDATES if c["tier"] == "foundry"],
+            ["*"],
+            "trivial",
+            None,
+            "absent",
+            fail_closed=True,
+        )
+        data = {"model": "claude-opus"}
+        _apply_enforcement(block, data, _CANDIDATES)
+        self.assertNotIn("refused", block)
+
+    def test_session_arm_pin_miss_also_refuses(self):
+        # The session arm propagates the governance verdict, so a fail-closed
+        # pin-miss with no local survivor refuses exactly like the stateless
+        # arm. _policy_session reads the MODULE default, so patch it here.
+        import obs_callback as oc
+
+        foundry_only = [c for c in _CANDIDATES if c["tier"] == "foundry"]
+        prev = oc._GOVERNANCE_FAIL_CLOSED
+        oc._GOVERNANCE_FAIL_CLOSED = True
+        try:
+            pins = _store(ttl_s=100)
+            block = oc._policy_session(
+                pins,
+                "sess-fc",
+                False,
+                foundry_only,
+                [],
+                "trivial",
+                None,
+                "absent",
+                0.0,
+            )
+        finally:
+            oc._GOVERNANCE_FAIL_CLOSED = prev
+        self.assertIsNone(block["chosen"])
+        self.assertEqual(block["governance"], "fail-closed-denied-restricted")
+        data = {"model": "gpt"}
+        _apply_enforcement(block, data, foundry_only)
+        self.assertEqual(block["refused"]["tier"], "foundry")
 
 
 # --- Streamed delivered records (goal 29) ------------------------------------

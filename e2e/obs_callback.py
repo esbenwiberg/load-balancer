@@ -546,6 +546,12 @@ _GOVERNANCE_FAIL_CLOSED = os.environ.get(
 # Tiers that require an EXPLICIT grant under fail-closed (an absent allowlist
 # does NOT reach them). Local is always allowed — cheapest, non-sensitive.
 _RESTRICTED_TIERS = ("foundry",)
+# Governance verdict stamped on every stateless block (and propagated onto the
+# session block) so enforcement can act on the decision WITHOUT re-parsing the
+# reason string: "allowlisted" (explicit list), "wildcard" (explicit *),
+# "open" (absent allowlist, fail-OPEN — every tier kept) or the fail-closed
+# denial below. The denial is the one enforcement turns into a hard refusal.
+_GOV_FAIL_CLOSED_DENIED = "fail-closed-denied-restricted"
 # Complexity buckets that demand an agent_capable backend (docs/12 §4 step 2).
 _AGENT_BUCKETS = ("toolful", "agentic")
 
@@ -598,6 +604,7 @@ def _policy_stateless(
         before = len(pool)
         pool = [c for c in pool if c["model"] in allow]
         steps.append("governance key-allowlist %d->%d" % (before, len(pool)))
+        governance = "allowlisted"
     elif fc and not explicit_wildcard:
         # Absent/ambiguous allowlist under fail-closed: deny the restricted
         # tiers (an explicit wildcard would have set explicit_wildcard=True).
@@ -607,8 +614,12 @@ def _policy_stateless(
             "governance: no allowlist -> fail-closed %d->%d (restricted tiers denied)"
             % (before, len(pool))
         )
+        # The verdict enforcement turns into a REFUSAL when nothing else can
+        # serve the caller's restricted-tier ask (see _apply_enforcement).
+        governance = _GOV_FAIL_CLOSED_DENIED
     else:
         steps.append("governance: key unrestricted")
+        governance = "wildcard" if explicit_wildcard else "open"
 
     # 2. agent_capable gate — only toolful/agentic buckets demand it. The
     # verdict comes from the registry when the model is registered (any healthy
@@ -678,6 +689,9 @@ def _policy_stateless(
         "candidate_set": [c["model"] for c in pool],
         "chosen": chosen["model"] if chosen else None,
         "reason": "; ".join(steps),
+        # The governance verdict as a first-class field (not just prose in
+        # `reason`) so enforcement can act on it deterministically.
+        "governance": governance,
         # How the health signal was sourced — "live" or the degrade mode
         # ("absent"/"stale" ⇒ config-only candidates). The completion
         # condition's "the record says so".
@@ -914,12 +928,20 @@ def _policy_session(
     steps = []
     used_registry = None
     escalated_from = None
+    # The governance verdict of the LAST stateless evaluation this arm ran
+    # (pin miss or escalation); None on a pure pin hit, where no candidate
+    # evaluation happened. Propagated onto the block so _apply_enforcement
+    # refuses a fail-closed-denied session-turn exactly as it does a stateless
+    # one (a pinned backend was itself governance-filtered when it was chosen,
+    # so a pin hit is safe by construction — chosen is never None there).
+    governance = None
     pin = pins.get(key, now)
     pin_hit = pin is not None
     if pin is None:
         base = _policy_stateless(
             candidates, key_models, bucket, registry_models, registry_state
         )
+        governance = base.get("governance")
         used_registry = registry_state
         if base["chosen"] is None:
             steps.append("pin miss: no capable candidate to pin [%s]" % base["reason"])
@@ -973,6 +995,7 @@ def _policy_session(
                 base = _policy_stateless(
                     upward, key_models, bucket, registry_models, registry_state
                 )
+                governance = base.get("governance")
                 used_registry = registry_state
                 if base["chosen"]:
                     tier = _tier_of(candidates, base["chosen"])
@@ -1013,6 +1036,9 @@ def _policy_session(
         "escalated": bool(pin["escalated"]) if pin else False,
         "chosen": pin["backend"] if pin else None,
         "reason": "; ".join(steps),
+        # The governance verdict of the stateless evaluation this arm ran
+        # (None on a pure pin hit — see the note where it's initialised).
+        "governance": governance,
         # null on a pure pin hit: no candidate evaluation ran, so no health
         # signal was sourced — stamping "live" would be a lie.
         "registry": used_registry,
@@ -1058,10 +1084,13 @@ def _request_headers(data):
 _ROUTER_POLICY = os.environ.get("ROUTER_POLICY", "shadow").strip().lower()
 
 
-def _apply_enforcement(block, data):
+def _apply_enforcement(block, data, candidates=None):
     """Make the policy decision REAL: point data["model"] at the block's
     chosen backend, for both arms (the session arm's chosen is the pin, the
-    escalated pin included). Mutates block + data in place.
+    escalated pin included). Mutates block + data in place; RETURNS the block.
+    When the request must be cleanly REFUSED (rather than served or degraded),
+    stamps `block["refused"] = {requested, tier, reason}` — the caller lifts
+    that OUT of the pre-call hook's defensive try and raises a clean 4xx.
 
     Two research-mandated moves (docs/12 §7 goal-26 addendum):
       * STASH THE ORIGINAL ASK FIRST — post-rewrite, nothing downstream can
@@ -1076,18 +1105,43 @@ def _apply_enforcement(block, data):
         1), which is exactly why this function never needs its own check —
         pinned by the dedicated governance e2e test.
 
-    A block with no survivor (chosen None) rewrites nothing: the request
-    proceeds on the client's own ask — enforcement degrades to shadow for
-    that request, never to a failure. After the rewrite, LiteLLM's
-    availability-fallback applies to the CHOSEN model's chain (R4, verified),
-    so `actual` may still differ from `chosen` — that is the chain firing,
-    visible as agree:false with fallback:true on the record."""
+    No-survivor (chosen None), TWO cases — the go-real fail-closed fix (goal 33):
+      * Governance FAIL-CLOSED denied the restricted tier for this ambiguous
+        (no/empty allowlist) key AND the client's ask targets that restricted
+        tier ⇒ REFUSE. The whole point of fail-closed is that such a key never
+        reaches Foundry; degrading to the client's own (Foundry) ask would
+        re-open the exact hole. We could not substitute a local backend (none
+        survived health/agent-gate), so a clean refusal is the only safe move.
+      * Any other reason chosen is None (registry degraded, explicit allowlist
+        that filtered everything, a request the policy simply can't improve) ⇒
+        rewrites nothing, the request proceeds on the client's own ask —
+        enforcement degrades to shadow for that request, never to a failure.
+        The key was AUTHORIZED for its ask (LiteLLM's auth already allowed it);
+        we just have no better routing opinion.
+
+    After a rewrite, LiteLLM's availability-fallback applies to the CHOSEN
+    model's chain (R4, verified), so `actual` may still differ from `chosen` —
+    that is the chain firing, visible as agree:false with fallback:true on the
+    record."""
     requested = data.get("model") if isinstance(data, dict) else None
     block["enforced"] = True
     block["requested"] = requested
     chosen = block.get("chosen")
     if chosen and requested and chosen != requested:
         data["model"] = chosen
+        return block
+    # No rewrite happened (chosen is None, or already equals the ask). The
+    # only case that must not fall through: a fail-closed governance denial of
+    # the caller's restricted-tier ask with no local substitute available.
+    if (
+        block.get("governance") == _GOV_FAIL_CLOSED_DENIED
+        and _tier_of(candidates or [], requested) in _RESTRICTED_TIERS
+    ):
+        block["refused"] = {
+            "requested": requested,
+            "tier": _tier_of(candidates or [], requested),
+            "reason": block.get("reason"),
+        }
     return block
 
 
@@ -1425,6 +1479,13 @@ class RoutingRecorder(CustomLogger):
         # take the stateless arm (goal 24, unchanged). data["model"] is never
         # touched, the stream is never buffered, and any error degrades to "no
         # block" — the request path is sacred.
+        #
+        # ONE deliberate exception to "never fatal" (goal 33): a fail-closed
+        # governance REFUSAL. It is captured here but RAISED below, OUTSIDE
+        # this defensive try — a refusal swallowed by `except: pass` would let
+        # the original restricted ask fall through to Foundry, which is the
+        # very hole fail-closed exists to close.
+        refusal = None
         try:
             if isinstance(data, dict) and data.get(_CORRELATION_KEY):
                 candidates = _config_candidates()
@@ -1477,10 +1538,38 @@ class RoutingRecorder(CustomLogger):
                     # first). Under the default ROUTER_POLICY=shadow this
                     # branch never runs and data is untouched, as ever.
                     if _ROUTER_POLICY == "enforce":
-                        _apply_enforcement(block, data)
+                        _apply_enforcement(block, data, candidates)
+                        refusal = block.get("refused")
                     _policy_remember(data[_CORRELATION_KEY], block)
         except Exception:  # pragma: no cover - defensive
             pass
+        # The fail-closed refusal (goal 33), raised OUTSIDE the try so it
+        # actually reaches the client as a clean 4xx instead of being swallowed.
+        # Imported lazily: the offline fast tier stubs litellm and has no
+        # fastapi, and this path only runs inside a live proxy (enforce mode),
+        # where fastapi is always present. HTTPException is LiteLLM's own
+        # documented way for a pre-call hook to reject a request cleanly.
+        if refusal is not None:
+            from fastapi import HTTPException
+
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": {
+                        "message": (
+                            "governance: this key has no model allowlist and "
+                            "fail-closed is engaged, so it may not route to the "
+                            "restricted '%s' tier; no local backend was available "
+                            "to serve it, so the request is refused rather than "
+                            "sent to a governance-sensitive backend"
+                            % refusal.get("tier")
+                        ),
+                        "type": "governance_fail_closed_refusal",
+                        "code": "403",
+                        "param": "model",
+                    }
+                },
+            )
         # STREAMED delivered records (goal 29): stash what only ingress knows —
         # keyed by the correlation id, read back post-stream by the success
         # event. requested_model is read AFTER the enforcement branch above so

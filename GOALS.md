@@ -104,17 +104,6 @@ work that must precede any real deploy. Two premortem findings were already
 fixed in the goal-31 follow-up PR (governance fail-closed MODE +
 `DASH_HOST` safe default); 33–37 lock and extend them._
 
-- **33. Prove governance fail-closed end-to-end (lock the premortem fix).**
-  Completion condition: on `main`, an e2e proves that with
-  `POLICY_GOVERNANCE_FAIL_CLOSED=1` a key with NO/empty allowlist (as it
-  arrives on each of the three inbound protocols — chat / responses / messages,
-  esp. the Codex/Responses path where `UserAPIKeyAuth.models` was observed
-  empty) is NOT routed to a foundry-tier backend under `ROUTER_POLICY=enforce`
-  — it is served locally or cleanly refused, never Foundry. The MODE already
-  exists (fail-open default unchanged); this goal is the enforce-mode proof
-  across protocols that the mechanism actually closes the hole. Add the
-  enforce-mode container an env to run fail-closed (a third gateway, or param
-  the existing enforce one). Ship to PR → auto-merge if both gates green.
 - **34. Dashboard auth + safe-bind guard.** Completion condition: on `main`,
   the dashboard requires a bearer/shared-token (env `DASH_AUTH_TOKEN`) on
   `/api/*` and the page when the token is set, and REFUSES to start on a
@@ -166,7 +155,11 @@ decision is made.
 > checkmark comes from the one config where the go-real threats can't exist (one
 > container, mock Foundry, localhost, synthetic prompts). Before ANY real
 > deploy, the premortem's pre-launch checklist must hold: (1) governance fails
-> CLOSED and is proven under enforce (goal 33); (2) DISCO sign-off matches the
+> CLOSED and is proven under enforce (goal 33 ✅ — `POLICY_GOVERNANCE_FAIL_CLOSED`
+> + the enforce+fail-closed gateway on :4002; an empty-allowlist key is served
+> locally or cleanly 403'd across all three protocols, never Foundry — but note
+> prod still runs fail-OPEN by default: flipping the knob on is the provisioning
+> half of the go-real deploy); (2) DISCO sign-off matches the
 > control that ACTUALLY exists — backend-gating, Foundry default-deny — not an
 > assumed content-inspection/DLP; (3) the dashboard is not naked on a port (goal
 > 34) and never on public ingress; (4) the pin store is Postgres-backed or
@@ -268,6 +261,27 @@ decision is made.
    its condition literally holds on `main` — if in doubt, re-check it, don't
    trust the checkmark.
 
+- ✅ 33. Prove governance fail-closed end-to-end (lock the premortem fix) — the
+  premortem's "a rule ≠ a control" is now a control. `_apply_enforcement` no
+  longer degrades a no-survivor block to the client's ask when that ask targets
+  a restricted tier under a fail-closed denial: it REFUSES. The stateless block
+  gained a first-class `governance` verdict (`allowlisted|wildcard|open|
+  fail-closed-denied-restricted`, propagated onto the session block) so
+  enforcement acts on the decision, not on parsed prose; the refusal is stamped
+  on the block (`refused`) and RAISED as a clean `fastapi.HTTPException(403)`
+  OUTSIDE the pre-call hook's defensive `try` (a swallowed refusal would
+  re-open the hole), fastapi imported lazily so the offline tier is untouched.
+  Two safe outcomes, never a third: an empty-allowlist key asking for foundry
+  is served by the healthy local workbench (rewrite) or cleanly 403'd (no local
+  survivor) — never Foundry. Proof: a THIRD gateway (`litellm-e2e-failclosed`,
+  :4002, enforce + `POLICY_GOVERNANCE_FAIL_CLOSED=1`, own pin store — separate
+  so the goal-26 enforce suite keeps running fail-OPEN, unchanged) + 2 e2e
+  across all three inbound protocols (served-locally via reassembled stream
+  body; cleanly-refused via unhealthy-local heartbeat → 4xx citing governance,
+  no backend reached) + 7 offline tests (verdict field + the whole refusal
+  decision table incl. the session arm). Default stays fail-OPEN, byte-for-byte
+  unchanged (flipping the knob is the go-real provisioning decision). Docs:
+  docs/09 "Governance fail-closed". — PR #<pending> (2026-07)
 - ✅ 35. Make the auto-merge tripwire a technical gate, not prose — the
   CLAUDE.md tripwire ("auto-merge is valid ONLY while nothing deploys from
   `main`") is now a CONTROL, not prose. A committed root marker `RELEASE_MODEL`

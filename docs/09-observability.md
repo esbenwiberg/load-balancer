@@ -819,7 +819,10 @@ the pin does **not** move: the next healthy turn is served by the pinned
 backend again. A blip neither exiles a session nor burns its one escalation
 hop. A policy block with no survivor rewrites nothing — the request proceeds
 on the client's own ask, enforcement degrades to shadow for that request,
-never to a failure.
+never to a failure. (The one deliberate exception is a fail-closed governance
+denial — see "Governance fail-closed" below — where "proceed on the client's
+ask" would re-open the very hole fail-closed exists to close, so the request
+is refused instead.)
 
 **Governance under enforce — the policy is the SOLE guard.** LiteLLM checks
 the key's model allowlist only at auth time, against the requested model; a
@@ -837,6 +840,59 @@ construction. Dedicated tests: one-shot served by cheapest-capable with the
 triple on record; session pin + escalation actually serving; the
 503-fallback + pin-does-not-move + recovery story; streaming with proper
 terminators on chat//v1/messages//v1/responses; the governance guard.
+
+## Governance fail-closed — a rule made a control (goal 33)
+
+**The hole.** The go-real premortem's most-likely failure was *"a rule we wrote
+down is a control we enforce."* A key's model allowlist (`UserAPIKeyAuth.models`)
+arrives in an **ambiguous** shape: an absent/empty list means "unrestricted" to
+LiteLLM's auth, but a real restriction that failed to load looks *identical* —
+and the shape varies across the three inbound protocols (it was observed empty
+on the Codex/Responses path). Under `enforce` that ambiguity used to leave the
+**foundry** tier reachable: the policy's governance filter would strip foundry,
+but if *no local backend survived* (chosen `None`), `_apply_enforcement`
+degraded to the client's **original** ask — which was the foundry model. The
+rule ("empty allowlist ⇒ no Foundry") existed; the control did not.
+
+**The knob.** `POLICY_GOVERNANCE_FAIL_CLOSED` (default **off** — fail-OPEN,
+byte-for-byte unchanged: flipping it makes every real key carry an explicit
+allowlist or an admin wildcard, a provisioning decision that belongs with the
+go-real deploy). When **on**, an absent/empty allowlist no longer opens the
+restricted tiers; only an **explicit** wildcard (`*` / `all-proxy-models`) does.
+
+**The two safe outcomes, never a third.** The stateless block carries a
+first-class `governance` verdict — `allowlisted` | `wildcard` | `open` |
+`fail-closed-denied-restricted` — so enforcement acts on the decision without
+re-parsing prose. Under `enforce` + fail-closed, an empty-allowlist key asking
+for a restricted tier:
+
+1. **served locally** — a healthy local backend survives the filters, so the
+   ask is rewritten to it (the normal enforce rewrite); or
+2. **cleanly refused** — no local survivor (e.g. the workbench is unhealthy, or
+   an agentic request needs a capability only foundry has). Rather than fall
+   through to Foundry, the pre-call hook raises a clean **403** citing the
+   governance refusal. The refusal is captured on the block (`refused`) and
+   **raised OUTSIDE** the hook's defensive `try` — a refusal swallowed by
+   `except: pass` would silently re-open the hole. `fastapi.HTTPException` is
+   imported lazily (the offline fast tier stubs litellm and has no fastapi; the
+   raise only runs inside a live enforce-mode proxy).
+
+Never a fall-through to Foundry. An explicitly-authorized key whose allowlist
+happens to filter to nothing is **not** refused — it was authorized, so it
+degrades to its own ask as before; refusal is only for the ambiguous
+empty-allowlist verdict.
+
+**E2e coverage.** A THIRD gateway container (`litellm-e2e-failclosed`, port
+4002, `ROUTER_POLICY=enforce` **+** `POLICY_GOVERNANCE_FAIL_CLOSED=1`, own pin
+store) — a separate container so the goal-26 enforce tests keep running under
+the fail-OPEN default, unchanged. Two tests prove the mechanism across **all
+three** inbound protocols: served-locally (empty-allowlist key + healthy local
+⇒ the reassembled stream body shows `served_model=qwen3-coder`, never a foundry
+stamp; record shows the fail-closed verdict) and cleanly-refused (local
+heartbeats unhealthy ⇒ 4xx citing governance, no backend ever reached). Offline:
+the `governance` verdict field and the `_apply_enforcement` refusal decision
+(served-local, refuse-on-restricted-ask, don't-refuse-a-local-ask,
+don't-refuse-an-authorized-key, wildcard-never-refused, session-arm-too).
 
 ## Dashboard v3 — stats per model / user / session / backend (goal 27)
 
