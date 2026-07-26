@@ -123,12 +123,6 @@ fixed in the goal-31 follow-up PR (governance fail-closed MODE +
   401 without; loopback bind → no token required. No public exposure decided
   here (that's the needs-a-human exposure model) — this just makes "not naked
   on a port" possible. Ship to PR → auto-merge if both gates green.
-- **35. Make the auto-merge tripwire a technical gate, not prose.** Completion
-  condition: on `main`, `scripts/check.sh` (and CI) FAIL if a deploy-from-`main`
-  workflow/marker exists while the release-model decision is still open — so an
-  unattended run cannot auto-merge into a world where `main` deploys. Offline,
-  deterministic (grep the workflows + a committed `RELEASE_MODEL` marker file).
-  Ship to PR → auto-merge if both gates green.
 - **36. Postgres-backed pin store (docs/12 §3 replica-time promotion).**
   Completion condition: on `main`, behind a knob (`POLICY_PIN_BACKEND=sqlite|
   postgres`, default sqlite unchanged), the pin store can use the existing
@@ -177,7 +171,8 @@ decision is made.
 > assumed content-inspection/DLP; (3) the dashboard is not naked on a port (goal
 > 34) and never on public ingress; (4) the pin store is Postgres-backed or
 > replicas pinned to 1 (goal 36); (5) no deploy-from-`main` until the release
-> model is decided AND a technical gate enforces the tripwire (goal 35), a spend
+> model is decided AND a technical gate enforces the tripwire (goal 35 ✅ — `RELEASE_MODEL` +
+> `release_model_gate.py`, `DECISION=open` blocks deploy-from-main), a spend
 > push-alert is live (goal 37), and prompt-caching is verified or escalation
 > re-priced. The single hidden assumption to kill: *"a rule we wrote down is a
 > control we enforce."*
@@ -250,6 +245,10 @@ decision is made.
   vacation autonomy with it. Decide *in advance*: manual promotion, a release
   branch, or tagged deploys. *(Decision 2026-07: fine as-is for now — nothing
   deploys, it's all testing. Revisit at the first real deploy, not before.)*
+  **Now enforced (goal 35):** `RELEASE_MODEL` is committed as `DECISION=open`
+  and `scripts/release_model_gate.py` HARD-FAILS the build if a workflow
+  auto-deploys on push to `main` while open. Making this decision = a human
+  flips `DECISION=decided` in the SAME change that records the chosen model.
 - **Real-Foundry traffic through the hosted balancer** — *(build phase: nothing
   is live and nothing routes to Foundry during unattended runs — mock/synthetic
   only, per the CLAUDE.md guardrail.)* When the balancer goes live for real
@@ -269,6 +268,29 @@ decision is made.
    its condition literally holds on `main` — if in doubt, re-check it, don't
    trust the checkmark.
 
+- ✅ 35. Make the auto-merge tripwire a technical gate, not prose — the
+  CLAUDE.md tripwire ("auto-merge is valid ONLY while nothing deploys from
+  `main`") is now a CONTROL, not prose. A committed root marker `RELEASE_MODEL`
+  carries `DECISION=open|decided` (default `open` — release model is still
+  needs-a-human); `scripts/release_model_gate.py` (pure stdlib, offline,
+  deterministic — no YAML dep, no network) HARD-FAILS when `DECISION=open` AND
+  any `.github/workflows/*.y{a,}ml` would AUTOMATICALLY deploy from `main` —
+  i.e. has BOTH a push-to-main trigger AND a deploy-action token. Wired into
+  `scripts/check.sh` fast tier, so pre-commit + Stop hook + CI (which just calls
+  `check.sh --full`) all enforce it — an unattended run physically cannot go
+  green into a deploy-from-main world. **Design: heuristic + fail-closed + NO
+  bypass marker** — to catch an UNDECLARED deploy workflow (the real threat: a
+  future run adds one) detection must infer deploy-ness (an opt-in "I deploy"
+  flag is just another skippable prose rule), and when a push trigger's branch
+  scope can't be PROVEN to exclude main (globs, branches-ignore) it assumes main
+  (fail-closed). CI's `pull_request:[main]` (no deploy token) stays green;
+  tags-only / `workflow_dispatch` deploys are a human act, intentionally out of
+  the AUTOMATIC tripwire (still need the human decision per CLAUDE.md). 36
+  offline unit tests (decision parse, the whole push-to-main parser incl. the
+  CI-shape non-trip, both end-to-end directions, real-repo-is-clean); live proof
+  in the PR that open+deploy→exit 1, decided+deploy→exit 0, real repo→exit 0.
+  Docs: `RELEASE_MODEL` header, CLAUDE.md tripwire bullet, GOALS.md go-real
+  gate. — PR #<pending> (2026-07)
 - ✅ 31. Promote the escalation stub to the first-class `router:escalate`
   contract + write the trigger-2 telemetry gate — the manual/client-signaled
   trigger (decided 2026-07-23) is now a supported contract: `obs_callback`

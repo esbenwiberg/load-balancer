@@ -1,0 +1,37 @@
+# RELEASE_MODEL — the deploy-from-main tripwire state (goal 35).
+#
+# This file is a TECHNICAL GATE, not prose. `scripts/release_model_gate.py`
+# (run by scripts/check.sh, so pre-commit + Stop hook + CI all enforce it)
+# reads the DECISION below and FAILS the build if any GitHub Actions workflow
+# would AUTOMATICALLY deploy as a consequence of code reaching `main` while the
+# decision is still "open".
+#
+# WHY THIS EXISTS
+#   CLAUDE.md's auto-merge autonomy is valid ONLY while nothing deploys from
+#   `main` (blast radius = the repo, every merge a revertible squash). The
+#   moment a real gateway serves traffic off `main`, auto-merge must stop —
+#   otherwise an unattended run could squash-merge itself straight into a live
+#   deploy. That tripwire used to live only as prose in CLAUDE.md; a prose rule
+#   is not a control (2026-07-23 go-real premortem). This marker + gate make it
+#   a control: an unattended run physically cannot go green while a
+#   deploy-from-main workflow exists and the release model is undecided.
+#
+# DECISION values:
+#   open     — the release model is NOT yet decided (needs-a-human, see GOALS.md
+#              "Release model BEFORE anything deploys from main"). While open, no
+#              workflow may auto-deploy from main. THIS IS THE SAFE DEFAULT.
+#   decided  — a human has chosen the release model (manual promotion / release
+#              branch / tagged deploy) and recorded it. Only then may a
+#              deploy-from-main workflow land green.
+#
+# TO CLOSE THE DECISION (a human act — do NOT let an unattended run flip this):
+#   1. decide the release model with a human and record it in docs + the PR body,
+#   2. set DECISION=decided below,
+#   3. and STOP auto-merging from CLAUDE.md's contract the moment main deploys.
+#
+# Scope: the gate fires on AUTOMATIC deploy-on-push-to-main (the trigger that
+# kills auto-merge). Manual (workflow_dispatch) / tag / release deploys are a
+# human pulling the trigger and are intentionally out of the AUTOMATIC tripwire
+# — but they are themselves a release model, so per CLAUDE.md they still require
+# this decision to be closed by a human first.
+DECISION=open
