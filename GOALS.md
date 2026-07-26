@@ -102,16 +102,9 @@ first-class contract + trigger-2 telemetry gate — see § Done). The
 opened a hardening batch (33–37) below — the "make a rule an actual control"
 work that must precede any real deploy. Two premortem findings were already
 fixed in the goal-31 follow-up PR (governance fail-closed MODE +
-`DASH_HOST` safe default); 33–37 lock and extend them._
+`DASH_HOST` safe default); 33–37 lock and extend them. **33, 34 and 35 are
+done** (see § Done); 36 and 37 remain._
 
-- **34. Dashboard auth + safe-bind guard.** Completion condition: on `main`,
-  the dashboard requires a bearer/shared-token (env `DASH_AUTH_TOKEN`) on
-  `/api/*` and the page when the token is set, and REFUSES to start on a
-  non-loopback bind unless a token is configured (the `0.0.0.0` compose stacks
-  set the token in-network). Synthetic e2e + offline: token present → 200 with,
-  401 without; loopback bind → no token required. No public exposure decided
-  here (that's the needs-a-human exposure model) — this just makes "not naked
-  on a port" possible. Ship to PR → auto-merge if both gates green.
 - **36. Postgres-backed pin store (docs/12 §3 replica-time promotion).**
   Completion condition: on `main`, behind a knob (`POLICY_PIN_BACKEND=sqlite|
   postgres`, default sqlite unchanged), the pin store can use the existing
@@ -162,7 +155,10 @@ decision is made.
 > half of the go-real deploy); (2) DISCO sign-off matches the
 > control that ACTUALLY exists — backend-gating, Foundry default-deny — not an
 > assumed content-inspection/DLP; (3) the dashboard is not naked on a port (goal
-> 34) and never on public ingress; (4) the pin store is Postgres-backed or
+> 34 ✅ — `DASH_AUTH_TOKEN` gates the read surface `/api/*` + the page, and a
+> non-loopback bind REFUSES to start without a token; the `0.0.0.0` compose
+> stacks set it in-network) and never on public ingress; (4) the pin store is
+> Postgres-backed or
 > replicas pinned to 1 (goal 36); (5) no deploy-from-`main` until the release
 > model is decided AND a technical gate enforces the tripwire (goal 35 ✅ — `RELEASE_MODEL` +
 > `release_model_gate.py`, `DECISION=open` blocks deploy-from-main), a spend
@@ -218,7 +214,8 @@ decision is made.
   Creds + security + outward-facing. *(Noted for later — build phase is
   local/test only, nothing hosted yet. Decide the release model first ⤵)*
   **⚠️ Premortem:** the dashboard (:9300) exposes routing/identity/session/fleet
-  metadata and had NO auth (goal 34 adds it) — it must never share the gateway's
+  metadata and had NO auth (goal 34 ✅ added `DASH_AUTH_TOKEN` on the read
+  surface + a refuse-to-start-if-naked bind guard) — it must never share the gateway's
   public ingress. `api_base` URLs + health in the fleet view are an internal
   attack map. Verify with an external port scan of the deployed endpoint that
   :9300 is unreachable. Keys are a spend-cap not a breach-alarm: add secret
@@ -261,6 +258,31 @@ decision is made.
    its condition literally holds on `main` — if in doubt, re-check it, don't
    trust the checkmark.
 
+- ✅ 34. Dashboard auth + safe-bind guard — the go-real premortem's "naked on a
+  port" is now closeable. Gated on one knob `DASH_AUTH_TOKEN`: (a) READ AUTH —
+  when set, `GET /api/*` and the page (`GET /`) require the shared token via
+  `Authorization: Bearer`, an `X-Dashboard-Token` header, a `?token=` query
+  (browser nav, which then drops an `HttpOnly; SameSite=Strict` `dash_token`
+  cookie so the page's own same-origin fetches carry it), or that cookie;
+  missing/wrong → 401, constant-time compare (`hmac.compare_digest`). (b)
+  SAFE-BIND GUARD — the daemon REFUSES to start (exit 2) on a non-loopback bind
+  unless a token is configured, replacing the pre-goal-34 warn-and-continue; a
+  loopback bind needs no token. Scope is deliberately the READ surface: `/health`
+  stays open (liveness) and the WRITE sink (`POST /records`, `POST /__reset`)
+  keeps mockd's internal-daemon trust model (locking it would mean distributing
+  the token to obs_callback — a deferrable follow-up). Default (unset) =
+  byte-for-byte pre-goal-34, except a `0.0.0.0` bind now refuses instead of
+  warning. The `0.0.0.0` e2e/dev/manual compose stacks set a TEST token
+  in-network (same convention as `LITELLM_MASTER_KEY`); `run.sh` + `dev_smoke.sh`
+  read the matching default. Proof: `test_dashboard_requires_token_when_configured`
+  (live 401-without / 401-wrong / 200-with across `/api/records`, `/api/fleet`,
+  `/`; `/health` open; every carrier incl. the cookie flow — and the live
+  0.0.0.0-with-token dashboard proves the "starts" direction of the guard) + 20
+  offline tests (`TestAuthGate`, `TestSafeBindGuard`, `TestSafeBindGuardSubprocess`
+  — a real process refuses on 0.0.0.0/no-token and starts on loopback). Docs:
+  docs/09 "Dashboard read auth + safe-bind guard". No public exposure decided
+  here (that stays the needs-a-human first-Azure-deploy exposure model). — PR
+  #<pending> (2026-07)
 - ✅ 33. Prove governance fail-closed end-to-end (lock the premortem fix) — the
   premortem's "a rule ≠ a control" is now a control. `_apply_enforcement` no
   longer degrades a no-survivor block to the client's ask when that ask targets

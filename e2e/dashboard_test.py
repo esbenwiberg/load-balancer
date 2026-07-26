@@ -14,6 +14,7 @@ Run:  python3 dashboard_test.py        (also pytest-discoverable)
 from __future__ import annotations
 
 import json
+import sys
 import unittest
 from unittest import mock
 
@@ -1281,6 +1282,156 @@ class TestReceivedAtStamp(unittest.TestCase):
     def test_request_row_carries_received_at(self):
         row = dashboard._requests_view([_delivered(received_at=42.0)])[0]
         self.assertEqual(row["received_at"], 42.0)
+
+
+class TestAuthGate(unittest.TestCase):
+    """The read-auth decision (goal 34): `_authorized` + `_bearer`, pure and
+    offline. Proves 'token present -> allowed, absent/wrong -> denied' and that
+    an UNSET token disables auth entirely (byte-for-byte pre-goal-34)."""
+
+    TOKEN = "s3cr3t-token"
+
+    def test_no_token_configured_allows_everything(self):
+        # Auth disabled: even a bare request is allowed (unchanged behaviour).
+        self.assertTrue(dashboard._authorized("", auth_header=""))
+        self.assertTrue(dashboard._authorized("", query_token="anything"))
+
+    def test_bearer_header_authorizes(self):
+        self.assertTrue(
+            dashboard._authorized(self.TOKEN, auth_header="Bearer " + self.TOKEN)
+        )
+
+    def test_bearer_scheme_is_case_insensitive(self):
+        self.assertTrue(
+            dashboard._authorized(self.TOKEN, auth_header="bearer " + self.TOKEN)
+        )
+
+    def test_x_dashboard_token_header_authorizes(self):
+        self.assertTrue(dashboard._authorized(self.TOKEN, x_token=self.TOKEN))
+
+    def test_query_token_authorizes(self):
+        self.assertTrue(dashboard._authorized(self.TOKEN, query_token=self.TOKEN))
+
+    def test_cookie_token_authorizes(self):
+        self.assertTrue(dashboard._authorized(self.TOKEN, cookie_token=self.TOKEN))
+
+    def test_missing_token_is_denied(self):
+        self.assertFalse(dashboard._authorized(self.TOKEN))
+
+    def test_wrong_token_is_denied(self):
+        self.assertFalse(dashboard._authorized(self.TOKEN, auth_header="Bearer nope"))
+        self.assertFalse(dashboard._authorized(self.TOKEN, x_token="nope"))
+        self.assertFalse(dashboard._authorized(self.TOKEN, query_token="nope"))
+
+    def test_non_bearer_authorization_is_ignored(self):
+        # A Basic auth header carrying the token verbatim must NOT authorize —
+        # only the Bearer scheme is honoured on that header.
+        self.assertFalse(
+            dashboard._authorized(self.TOKEN, auth_header="Basic " + self.TOKEN)
+        )
+
+    def test_bearer_extractor(self):
+        self.assertEqual(dashboard._bearer("Bearer abc"), "abc")
+        self.assertEqual(dashboard._bearer("bearer  abc "), "abc")
+        self.assertEqual(dashboard._bearer("Basic abc"), "")
+        self.assertEqual(dashboard._bearer(""), "")
+        self.assertEqual(dashboard._bearer("Bearer"), "")
+
+
+class TestSafeBindGuard(unittest.TestCase):
+    """The refuse-to-start decision (goal 34): a non-loopback bind with no token
+    is refused; loopback binds and any bind WITH a token start. Pure/offline."""
+
+    def test_loopback_no_token_starts(self):
+        for host in ("127.0.0.1", "localhost", "::1", "", "LOCALHOST"):
+            refuse, _ = dashboard._should_refuse_start(host, "")
+            self.assertFalse(refuse, "loopback %r must start without a token" % host)
+
+    def test_non_loopback_no_token_refuses(self):
+        refuse, msg = dashboard._should_refuse_start("0.0.0.0", "")
+        self.assertTrue(refuse)
+        self.assertIn("DASH_AUTH_TOKEN", msg)
+
+    def test_non_loopback_with_token_starts(self):
+        refuse, _ = dashboard._should_refuse_start("0.0.0.0", "a-token")
+        self.assertFalse(refuse)
+
+    def test_loopback_with_token_starts(self):
+        refuse, _ = dashboard._should_refuse_start("127.0.0.1", "a-token")
+        self.assertFalse(refuse)
+
+
+class TestSafeBindGuardSubprocess(unittest.TestCase):
+    """Prove the guard actually GATES the process, not just a helper: a real
+    `python dashboard.py` on a non-loopback bind with no token exits non-zero
+    and binds nothing; the same on loopback comes up and serves /health."""
+
+    def _run(self, env_overrides, wait_health_url=None):
+        import os as _os
+        import subprocess
+        import time as _time
+        import urllib.request as _u
+
+        env = dict(_os.environ)
+        env.pop("DASH_AUTH_TOKEN", None)
+        env.update(env_overrides)
+        here = _os.path.dirname(_os.path.abspath(dashboard.__file__))
+        proc = subprocess.Popen(
+            [sys.executable, "dashboard.py"],
+            cwd=here,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if wait_health_url is None:
+            # Expect a fast, clean refusal (it exits before binding anything).
+            try:
+                out, err = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out, err = proc.communicate()
+                self.fail("process did not exit (expected refuse-to-start)")
+            return proc.returncode, (out + err).decode(errors="replace")
+        # Expect it to come up: poll /health, then tear down.
+        try:
+            last = None
+            for _ in range(50):
+                try:
+                    with _u.urlopen(wait_health_url, timeout=1) as r:
+                        if r.status == 200:
+                            return 0, "healthy"
+                except Exception as e:  # noqa: BLE001
+                    last = e
+                if proc.poll() is not None:
+                    out, err = proc.communicate()
+                    self.fail(
+                        "process exited early: rc=%s %s"
+                        % (proc.returncode, (out + err).decode(errors="replace"))
+                    )
+                _time.sleep(0.2)
+            self.fail("dashboard did not become healthy: %s" % last)
+        finally:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+
+    def test_non_loopback_no_token_process_refuses(self):
+        rc, output = self._run({"DASH_HOST": "0.0.0.0", "DASH_PORT": "0"})
+        self.assertNotEqual(rc, 0, "expected non-zero exit; got 0. output=%s" % output)
+        self.assertIn("DASH_AUTH_TOKEN", output)
+
+    def test_loopback_no_token_process_starts(self):
+        # Bind an ephemeral-ish high port on loopback; prove /health serves,
+        # then the runner tears it down. No token required.
+        port = "9387"
+        rc, _ = self._run(
+            {"DASH_HOST": "127.0.0.1", "DASH_PORT": port},
+            wait_health_url="http://127.0.0.1:%s/health" % port,
+        )
+        self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":

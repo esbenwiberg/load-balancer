@@ -40,6 +40,16 @@ KEY = os.environ.get("LITELLM_MASTER_KEY", "sk-e2e-master-test-key")
 AUTH = {"Authorization": "Bearer " + KEY}
 TIMEOUT = 30.0
 
+# Goal 34: the dashboard binds 0.0.0.0 in-container and so requires a read-auth
+# token on /api/* and the page. run.sh + the e2e compose set the SAME default;
+# when it's set, every dashboard READ below carries it. Empty (a stack without
+# the token) => no header, unchanged behaviour.
+DASH_TOKEN = os.environ.get("DASH_AUTH_TOKEN", "")
+
+
+def _dash_headers():
+    return {"Authorization": "Bearer " + DASH_TOKEN} if DASH_TOKEN else {}
+
 
 @pytest.fixture(autouse=True)
 def _reset_mockd():
@@ -1208,7 +1218,7 @@ def test_streamed_llm_call_carries_ttft():
 
 def _dash_api():
     """The dashboard's data endpoint — what the read-only page fetches."""
-    r = httpx.get(DASH + "/api/records", timeout=TIMEOUT)
+    r = httpx.get(DASH + "/api/records", headers=_dash_headers(), timeout=TIMEOUT)
     assert r.status_code == 200, r.text
     return r.json()
 
@@ -1811,7 +1821,7 @@ def test_dashboard_page_renders():
     Not a headless-browser test — we assert the HTML is served and references the
     /api/records fetch, so the served page and the asserted data endpoint can't
     silently drift apart."""
-    r = httpx.get(DASH + "/", timeout=TIMEOUT)
+    r = httpx.get(DASH + "/", headers=_dash_headers(), timeout=TIMEOUT)
     assert r.status_code == 200, r.text
     assert "text/html" in r.headers.get("content-type", ""), r.headers
     body = r.text
@@ -1822,6 +1832,72 @@ def test_dashboard_page_renders():
     assert "Fleet" in body, "dashboard page must render a Fleet section"
     # Goal 15: the page renders the identity ("who asked") — per-key rollup.
     assert "Per key" in body, "dashboard page must render a per-key rollup section"
+
+
+# --- dashboard read auth + safe-bind (goal 34) -------------------------------
+#
+# The dashboard exposes routing/identity/session/fleet METADATA. When
+# DASH_AUTH_TOKEN is set (the e2e/dev/manual 0.0.0.0 stacks set it — a
+# non-loopback bind REFUSES to start without it), the READ surface (/api/* and
+# the page) requires the token; /health stays open (liveness). The refuse-to-
+# start half is proven offline (dashboard_test.py TestSafeBindGuard*); this
+# proves the live 401-without / 200-with behaviour against the running 0.0.0.0
+# dashboard — which, by virtue of being UP with a token, also proves the
+# "0.0.0.0 + token starts" direction of the guard.
+def test_dashboard_requires_token_when_configured():
+    if not DASH_TOKEN:
+        pytest.skip("no DASH_AUTH_TOKEN on this stack — auth disabled by design")
+    good = {"Authorization": "Bearer " + DASH_TOKEN}
+    bad = {"Authorization": "Bearer not-the-token"}
+
+    # /health is OPEN — no token needed (the compose healthcheck relies on it).
+    assert httpx.get(DASH + "/health", timeout=TIMEOUT).status_code == 200
+
+    for path in ("/api/records", "/api/fleet", "/"):
+        # No token -> 401.
+        r = httpx.get(DASH + path, timeout=TIMEOUT)
+        assert r.status_code == 401, "%s must 401 without a token: %s" % (
+            path,
+            r.status_code,
+        )
+        # Wrong token -> 401.
+        r = httpx.get(DASH + path, headers=bad, timeout=TIMEOUT)
+        assert r.status_code == 401, "%s must 401 with a wrong token: %s" % (
+            path,
+            r.status_code,
+        )
+        # Correct token -> 200.
+        r = httpx.get(DASH + path, headers=good, timeout=TIMEOUT)
+        assert r.status_code == 200, "%s must 200 with the token: %s\n%s" % (
+            path,
+            r.status_code,
+            r.text,
+        )
+
+    # The token is also accepted as an X-Dashboard-Token header and a ?token=
+    # query (the browser-navigation carrier), and a valid ?token= page load
+    # drops the dash_token cookie so the page's own fetches carry it.
+    assert (
+        httpx.get(
+            DASH + "/api/records",
+            headers={"X-Dashboard-Token": DASH_TOKEN},
+            timeout=TIMEOUT,
+        ).status_code
+        == 200
+    )
+    r = httpx.get(DASH + "/?token=" + DASH_TOKEN, timeout=TIMEOUT)
+    assert r.status_code == 200, r.text
+    setck = r.headers.get("set-cookie", "")
+    assert "dash_token=" in setck, "page must drop the dash_token cookie: %r" % setck
+    # And that cookie alone then authorizes an /api read (the same-origin fetch).
+    assert (
+        httpx.get(
+            DASH + "/api/records",
+            headers={"Cookie": "dash_token=" + DASH_TOKEN},
+            timeout=TIMEOUT,
+        ).status_code
+        == 200
+    )
 
 
 # --- identity in routing records: WHO asked? (goal 15) -----------------------
@@ -1938,7 +2014,7 @@ def test_dashboard_shows_minted_key_identity():
 def _dash_fleet():
     """The dashboard's fleet data endpoint — a server-side read of the
     control-plane registry, and what the Fleet section renders."""
-    r = httpx.get(DASH + "/api/fleet", timeout=TIMEOUT)
+    r = httpx.get(DASH + "/api/fleet", headers=_dash_headers(), timeout=TIMEOUT)
     assert r.status_code == 200, r.text
     return r.json()
 

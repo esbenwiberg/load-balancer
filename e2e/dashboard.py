@@ -92,22 +92,41 @@ HTTP surface:
   POST /__reset                               # clear all records (test isolation)
   GET  /health                                # 200 (liveness)
 
-The sink is unauthenticated — like mockd, this is a TEST/DEV daemon; bind it to
-localhost / an internal compose network only. The bind default is therefore
-`127.0.0.1` (safe by default); a non-loopback bind (e.g. the `0.0.0.0` the
-compose stacks set explicitly, so a container is reachable) is honoured but
-prints a loud warning, because the records expose routing/identity/session/
-fleet METADATA to anyone who can reach the port. It must NEVER be on public
-ingress without an auth layer in front (see GOALS.md — dashboard auth goal).
+READ AUTH + SAFE-BIND GUARD (goal 34). The read surface exposes routing/
+identity/session/fleet METADATA, so two controls make "not naked on a port"
+possible (no PUBLIC exposure is decided here — that's the needs-a-human exposure
+model; this just stops the port being wide open on a trusted network):
+  * When `DASH_AUTH_TOKEN` is set, the READ surface — `GET /api/*` and the page
+    (`GET /`) — requires that shared token, presented as `Authorization:
+    Bearer <t>`, an `X-Dashboard-Token: <t>` header, a `?token=<t>` query
+    (browser navigation, which then drops a `dash_token` cookie so the page's
+    own fetches carry it), or that cookie. Missing/wrong token => 401. `/health`
+    stays open (liveness probes) and the record WRITE sink (`POST /records`,
+    `POST /__reset`) keeps mockd's internal-daemon trust model — the goal-34
+    control is scoped to the metadata READ surface the premortem flagged;
+    locking the write side down would mean distributing the token to the gateway
+    (obs_callback) and is a deferrable follow-up.
+  * The daemon REFUSES to start on a non-loopback bind (e.g. the `0.0.0.0` the
+    compose stacks set so a container is reachable) UNLESS a token is configured
+    — so an exposed dashboard cannot be naked by construction. The `0.0.0.0`
+    compose stacks therefore set `DASH_AUTH_TOKEN` in-network. A loopback bind
+    (the `127.0.0.1` default) needs no token.
+When `DASH_AUTH_TOKEN` is UNSET the behaviour is byte-for-byte pre-goal-34: no
+auth, loopback binds free, non-loopback binds refused (was: warned) — you must
+either bind loopback or set a token. It must NEVER be on public ingress even
+with the token (see GOALS.md — first-Azure-deploy exposure model).
 """
 
 from __future__ import annotations
 
+import hmac
+import http.cookies
 import json
 import os
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1707,6 +1726,77 @@ setInterval(tick, 2000);
 """
 
 
+# --- read auth + safe-bind guard (goal 34) ----------------------------------
+# Loopback binds need no token; anything else exposes metadata to whoever can
+# reach the port, so a non-loopback bind must carry a token or refuse to start.
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "")
+# Where a browser / client may present the shared token. The Authorization
+# Bearer form is the one the goal names; the others make the human + same-origin
+# page flow work without hand-setting a header on every navigation.
+_AUTH_COOKIE = "dash_token"
+_AUTH_QUERY = "token"
+
+
+def _auth_token() -> str:
+    """The configured shared token, or "" when auth is DISABLED (the default —
+    byte-for-byte pre-goal-34)."""
+    return os.environ.get("DASH_AUTH_TOKEN", "").strip()
+
+
+def _bearer(auth_header: str) -> str:
+    """Extract the token from an `Authorization: Bearer <t>` header (case-
+    insensitive scheme), or "" if it isn't a bearer header."""
+    if not auth_header:
+        return ""
+    parts = auth_header.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1].strip()
+    return ""
+
+
+def _authorized(
+    token: str,
+    *,
+    auth_header: str = "",
+    x_token: str = "",
+    query_token: str = "",
+    cookie_token: str = "",
+) -> bool:
+    """Is this request allowed to read the protected surface?
+
+    When no token is configured, auth is DISABLED — everything is allowed
+    (unchanged pre-goal-34 behaviour). When a token IS set, the request must
+    present it via ANY accepted carrier. Comparison is constant-time
+    (`hmac.compare_digest`) so a wrong token can't be recovered a character at a
+    time by timing the response."""
+    if not token:
+        return True
+    for cand in (_bearer(auth_header), x_token, query_token, cookie_token):
+        if cand and hmac.compare_digest(cand, token):
+            return True
+    return False
+
+
+def _should_refuse_start(host: str, token: str) -> tuple:
+    """Safe-bind guard: return (refuse: bool, message: str).
+
+    A non-loopback bind with NO token configured is refused — an exposed
+    dashboard must not be naked on a port. Loopback binds are always fine (no
+    token required); a configured token always permits any bind. Pure so the
+    decision is unit-testable without spawning a server."""
+    if host.strip().lower() in _LOOPBACK_HOSTS:
+        return (False, "")
+    if token:
+        return (False, "")
+    return (
+        True,
+        "refusing to start: DASH_HOST=%s is a non-loopback bind but "
+        "DASH_AUTH_TOKEN is not set — the dashboard serves UNAUTHENTICATED "
+        "routing/identity/session/fleet metadata. Set DASH_AUTH_TOKEN (the "
+        "compose stacks do, in-network) or bind loopback (DASH_HOST=127.0.0.1)." % host,
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -1721,7 +1811,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _html(self, code, text):
+    def _html(self, code, text, set_cookie=None):
         body = text.encode()
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1729,9 +1819,58 @@ class Handler(BaseHTTPRequestHandler):
         # upgrade must show on the next load, not after a hard refresh
         # (observed live: a stale pre-v4 page served from browser cache).
         self.send_header("Cache-Control", "no-store")
+        # Goal 34: after a valid `?token=` page load, drop the token as a cookie
+        # so the page's same-origin /api/* fetches carry it automatically (the
+        # human never has to hand-set an Authorization header).
+        if set_cookie:
+            self.send_header("Set-Cookie", set_cookie)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _client_tokens(self) -> dict:
+        """Pull every accepted token carrier off this request for `_authorized`:
+        the Authorization/X-Dashboard-Token headers, a `?token=` query param, and
+        the `dash_token` cookie. Malformed inputs degrade to "" (never raise)."""
+        query_token = ""
+        if "?" in self.path:
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1])
+            vals = qs.get(_AUTH_QUERY)
+            if vals:
+                query_token = vals[0]
+        cookie_token = ""
+        raw = self.headers.get("Cookie")
+        if raw:
+            try:
+                jar = http.cookies.SimpleCookie()
+                jar.load(raw)
+                if _AUTH_COOKIE in jar:
+                    cookie_token = jar[_AUTH_COOKIE].value
+            except Exception:  # noqa: BLE001 — a bad cookie is just "no token"
+                cookie_token = ""
+        return {
+            "auth_header": self.headers.get("Authorization", ""),
+            "x_token": self.headers.get("X-Dashboard-Token", ""),
+            "query_token": query_token,
+            "cookie_token": cookie_token,
+        }
+
+    def _require_auth(self) -> bool:
+        """Gate the READ surface (goal 34). Returns True if the request may
+        proceed; otherwise sends a 401 and returns False. A no-op (always True)
+        when DASH_AUTH_TOKEN is unset — auth disabled, unchanged behaviour."""
+        if _authorized(_auth_token(), **self._client_tokens()):
+            return True
+        self._json(
+            401,
+            {
+                "error": "unauthorized",
+                "detail": "dashboard requires DASH_AUTH_TOKEN via "
+                "'Authorization: Bearer <token>', an 'X-Dashboard-Token' header, "
+                "a '?token=<token>' query, or the dash_token cookie",
+            },
+        )
+        return False
 
     def _read_body(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -1742,10 +1881,14 @@ class Handler(BaseHTTPRequestHandler):
             return {}
 
     def do_GET(self):
+        # Liveness stays open (goal 34): the compose healthcheck hits it and it
+        # carries no metadata. Everything else below is behind the read auth.
         if self.path.startswith("/health"):
             return self._json(200, {"status": "ok", "daemon": "dashboard"})
         # The DATA ENDPOINT the UI fetches and the e2e assertion covers.
         if self.path.startswith("/api/records"):
+            if not self._require_auth():
+                return
             recs = RECORDS.all()
             requests = _requests_view(recs)
             # Goal 28: one fleet read per payload so the backend rollup can
@@ -1791,12 +1934,32 @@ class Handler(BaseHTTPRequestHandler):
         # covers: a server-side read of the control-plane registry. Always 200,
         # even when the control-plane is down (available:false in the body).
         if self.path.startswith("/api/fleet"):
+            if not self._require_auth():
+                return
             return self._json(200, _fetch_fleet())
         # Query strings tolerated (e.g. a cache-busting /?x) — route on the
         # bare path (goal 30; observed live: GET /?v4 404'd).
         path = self.path.split("?", 1)[0]
         if path == "/" or path.startswith("/index") or path.startswith("/dashboard"):
-            return self._html(200, _PAGE)
+            if not self._require_auth():
+                return
+            # Goal 34: if the token arrived via `?token=`, echo it back as a
+            # cookie so the page's subsequent same-origin /api/* fetches carry
+            # it without the human touching a header. Only when it actually
+            # matches (never reflect an arbitrary query value into a cookie).
+            token = _auth_token()
+            toks = self._client_tokens()
+            set_cookie = None
+            if (
+                token
+                and toks["query_token"]
+                and hmac.compare_digest(toks["query_token"], token)
+            ):
+                set_cookie = "%s=%s; Path=/; HttpOnly; SameSite=Strict" % (
+                    _AUTH_COOKIE,
+                    token,
+                )
+            return self._html(200, _PAGE, set_cookie=set_cookie)
         return self._json(404, {"error": "not found: " + self.path})
 
     def do_POST(self):
@@ -1810,11 +1973,6 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found: " + self.path})
 
 
-# Loopback binds need no warning; anything else exposes unauthenticated
-# metadata to whoever can reach the port.
-_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "")
-
-
 def main():
     port = int(os.environ.get("DASH_PORT", "9300"))
     # Safe by default: bind loopback unless a host is set EXPLICITLY (the
@@ -1823,12 +1981,17 @@ def main():
     # expose the sink on all interfaces (the go-real premortem's dashboard
     # finding — the old 0.0.0.0 default contradicted the docstring).
     host = os.environ.get("DASH_HOST", "127.0.0.1")
-    if host.strip().lower() not in _LOOPBACK_HOSTS:
+    token = _auth_token()
+    # Safe-bind guard (goal 34): a non-loopback bind with no token REFUSES to
+    # start — an exposed dashboard cannot be naked by construction.
+    refuse, why = _should_refuse_start(host, token)
+    if refuse:
+        print("ERROR: " + why, file=sys.stderr)
+        sys.exit(2)
+    if token:
         print(
-            "WARNING: dashboard bound to %s — it serves UNAUTHENTICATED "
-            "routing/identity/session/fleet metadata. Keep it on a trusted "
-            "network only; NEVER on public ingress without an auth layer "
-            "(GOALS.md dashboard-auth goal)." % host
+            "dashboard READ auth ENABLED (DASH_AUTH_TOKEN set) — /api/* and the "
+            "page require the token. NEVER put this on public ingress even so."
         )
     server = ThreadingHTTPServer((host, port), Handler)
     print(
