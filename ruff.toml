@@ -2,11 +2,19 @@
 # agree on what "lint-clean" and "format-clean" mean — the definition of green
 # must not drift with ruff's built-in defaults between versions.
 #
-# Rule selection is left at ruff's default (E4/E7/E9 + F): the pyflakes +
-# pycodestyle-error set. Deliberately conservative — this gate is a floor, not
-# a style crusade. Widen it in its own PR if we want more.
+# Rule selection is PINNED to E4/E7/E9 + F (the pyflakes + pycodestyle-error
+# set). This used to rely on "ruff's default", but ruff 0.16.0 BROADENED its
+# default set (adding SIM/BLE/I/UP/PERF/RUF/… ⇒ 207 new findings across files we
+# didn't touch), which turned CI red on every PR under an unpinned
+# `pip install ruff`. Relying on the moving default contradicted the header
+# above, so the set is now explicit and version-independent. Deliberately
+# conservative — this gate is a floor, not a style crusade. Widen it in its own
+# PR (add rule codes to `select`) if we want more.
 
 target-version = "py311"
 
 # The e2e tooling venv is checked-out-adjacent, not code we own.
 extend-exclude = [".venv-e2e", ".venv", "venv"]
+
+[lint]
+select = ["E4", "E7", "E9", "F"]
